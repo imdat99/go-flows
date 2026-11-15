@@ -53,7 +53,7 @@ func TestConformance(t *testing.T) {
 			t.Helper()
 			time.Sleep(d)
 		},
-		TTL: time.Second, // generous: 40 parallel cases share one Postgres
+		TTL: 1500 * time.Millisecond, // generous: about 50 parallel cases share one Postgres
 	})
 }
 

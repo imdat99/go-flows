@@ -149,3 +149,115 @@ func testTerminalWithNilConsumed(t *testing.T, h Harness) {
 		t.Fatalf("terminal completion with nil Consumed and a pending signal: %v", err)
 	}
 }
+
+// Terminate ends an execution by force, even while a worker holds it: the
+// holder's writes fail, tasks and pending events are dropped, and the
+// parent learns of it.
+func testTerminate(t *testing.T, h Harness) {
+	s := h.New(t)
+	if err := s.Terminate(ctx, "missing", "x"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown: %v", err)
+	}
+	mustCreate(t, s, "parent")
+	pt := claimOne(t, s, owner, h.TTL)
+	started(t, s, pt, &store.Completion{Children: []store.NewExecution{{InstanceID: "child", Workflow: "cw", Version: 1, Queue: queue, ParentSched: 1}}})
+	ct := claimOne(t, s, owner, h.TTL)
+	leases, err := s.CompleteWorkflowTask(ctx, ct.Lease, &store.Completion{
+		History:    []history.Event{{Seq: 1, Type: history.ExecutionStarted}},
+		Consumed:   pendingIDs(ct),
+		Activities: []store.NewActivityTask{{ScheduleID: 1, Name: "a", Queue: queue, ClaimFor: h.TTL}},
+		KeepFor:    h.TTL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Terminate(ctx, "child", "operator said so"); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := s.GetExecution(ctx, "child")
+	if e.Status != store.StatusTerminated || e.Err != "operator said so" || e.EndedAt.IsZero() {
+		t.Fatalf("terminated execution %+v", e)
+	}
+	hist, _ := s.LoadHistory(ctx, e.ID, 0)
+	if n := len(hist); n != 2 || hist[1].Type != history.ExecutionTerminated || hist[1].Seq != 2 {
+		t.Fatalf("history %+v", hist)
+	}
+	if _, err := s.ResumeWorkflowTask(ctx, ct.Lease, h.TTL); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("holder's lease survived: %v", err)
+	}
+	if _, err := s.CompleteActivityTask(ctx, leases[0], store.ActivityResult{Event: history.Event{Type: history.ActivityCompleted}}); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("activity of a terminated execution: %v", err)
+	}
+	if err := s.Terminate(ctx, "child", "again"); !errors.Is(err, store.ErrNotActive) {
+		t.Fatalf("terminate twice: %v", err)
+	}
+	ptask := claimOne(t, s, owner, h.TTL)
+	ev := ptask.Pending[0].Event
+	if ev.Type != history.ChildFailed || ev.ErrKinds != store.KindTerminated || ev.ScheduleID != 1 {
+		t.Fatalf("parent notification %+v", ev)
+	}
+}
+
+// GW-13: an activity the workflow canceled is reported by RenewLeases so
+// its worker cancels it; its outcome is still recorded.
+func testActivityCancel(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "i1")
+	task := claimOne(t, s, owner, h.TTL)
+	leases, err := s.CompleteWorkflowTask(ctx, task.Lease, &store.Completion{
+		History:    []history.Event{{Seq: 1, Type: history.ExecutionStarted}},
+		Consumed:   pendingIDs(task),
+		Activities: []store.NewActivityTask{{ScheduleID: 1, Name: "a", Queue: queue, ClaimFor: h.TTL}, {ScheduleID: 2, Name: "a", Queue: queue, ClaimFor: h.TTL}},
+		KeepFor:    h.TTL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _ := s.RenewLeases(ctx, owner, nil, leases, h.TTL)
+	if len(r.CanceledActivities) != 0 {
+		t.Fatalf("canceled before any request: %+v", r)
+	}
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, &store.Completion{
+		History:            []history.Event{{Seq: 2, Type: history.ActivityCancelRequested, ScheduleID: 2}},
+		CanceledActivities: []int32{2},
+		KeepFor:            h.TTL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r, err = s.RenewLeases(ctx, owner, nil, leases, h.TTL)
+	if err != nil || len(r.CanceledActivities) != 1 || r.CanceledActivities[0] != leases[1].ID || len(r.LostActivities) != 0 {
+		t.Fatalf("renewal after cancel %+v %v", r, err)
+	}
+	res := store.ActivityResult{Event: history.Event{Type: history.ActivityFailed, Err: "canceled", Uncertain: true}, Resume: &task.Lease, ResumeFor: h.TTL}
+	next, err := s.CompleteActivityTask(ctx, leases[1], res)
+	if err != nil || next == nil || len(next.Pending) != 1 || !next.Pending[0].Event.Uncertain {
+		t.Fatalf("outcome of a canceled activity: %+v %v", next, err)
+	}
+}
+
+// A task canceled while it waits for a retry is claimed with
+// CancelRequested, so its worker does not run it again.
+func testCancelBeforeRetry(t *testing.T, h Harness) {
+	s := h.New(t)
+	scheduleActivity(t, s, h, "i1", store.NewActivityTask{ScheduleID: 1, Name: "a", Queue: queue})
+	a := claimActivity(t, s, owner, h.TTL)[0]
+	if a.CancelRequested {
+		t.Fatal("fresh task claimed as canceled")
+	}
+	if err := s.RetryActivityTask(ctx, a.Lease, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Signal(ctx, "i1", "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	tk := claimOne(t, s, owner, h.TTL)
+	complete(t, s, tk, store.Completion{
+		History:            []history.Event{{Type: history.ActivityCancelRequested, ScheduleID: 1}},
+		Consumed:           pendingIDs(tk),
+		CanceledActivities: []int32{1},
+	})
+	again := claimActivity(t, s, other, h.TTL)
+	if len(again) != 1 || !again[0].CancelRequested {
+		t.Fatalf("claim after cancel: %+v", again)
+	}
+}

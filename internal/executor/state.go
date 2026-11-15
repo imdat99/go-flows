@@ -221,20 +221,13 @@ func (st *State) finishWith(out []byte, err error) {
 			event: history.Event{Type: history.ExecutionCanceled, Err: err.Error()},
 		}
 	default:
-		msg, kinds := ErrorText(err), ErrorKinds(err)
+		msg, kinds := st.ex.opts.errorText(err), st.ex.opts.errorKinds(err)
 		st.end = &ending{
 			status: store.StatusFailed, err: msg, kinds: kinds,
 			event: history.Event{Type: history.ExecutionFailed, Err: msg, ErrKinds: kinds},
 		}
 	}
 }
-
-// ErrorText and ErrorKinds turn a workflow error into its recorded form.
-// The public API replaces them to add sentinel kinds and safe text.
-var (
-	ErrorText  = func(err error) string { return err.Error() }
-	ErrorKinds = func(error) string { return "" }
-)
 
 func (st *State) signal(name string) *coro.Channel[[]byte] {
 	ch, ok := st.signals[name]

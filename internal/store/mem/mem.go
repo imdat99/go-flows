@@ -81,9 +81,10 @@ type pending struct {
 
 type activityTask struct {
 	store.ActivityTask
-	visibleAt   time.Time
-	lockedUntil time.Time
-	created     int64
+	visibleAt       time.Time
+	lockedUntil     time.Time
+	created         int64
+	cancelRequested bool
 }
 
 var (
@@ -298,14 +299,7 @@ func (s *Store) CompleteWorkflowTask(_ context.Context, l store.Lease, c *store.
 	}
 	leases := s.createActivities(e, l.Owner, c.Activities, now)
 	s.createChildren(e, c.Children, now)
-	for _, id := range c.ChildCancels {
-		if cid, ok := s.latest[id]; ok {
-			if ch := s.executions[cid]; ch.Status.Active() && ch.ParentID == e.ID {
-				s.addPending(ch, history.Event{Type: history.ExecutionCancelRequested}, now)
-				s.hint(store.WorkflowWork, ch.Queue)
-			}
-		}
-	}
+	s.cancelRequests(e, c, now)
 
 	if c.Status != "" && c.Status != e.Status {
 		e.Status = c.Status
@@ -330,6 +324,23 @@ func (s *Store) CompleteWorkflowTask(_ context.Context, l store.Lease, c *store.
 		e.stickyOwner, e.stickyUntil = l.Owner, now.Add(c.StickyFor)
 	}
 	return leases, nil
+}
+
+// cancelRequests marks canceled activities and asks children to cancel.
+func (s *Store) cancelRequests(e *execution, c *store.Completion, now time.Time) {
+	for _, t := range s.tasks {
+		if t.ExecutionID == e.ID && !t.Compensate && slices.Contains(c.CanceledActivities, t.ScheduleID) {
+			t.cancelRequested = true
+		}
+	}
+	for _, id := range c.ChildCancels {
+		if cid, ok := s.latest[id]; ok {
+			if ch := s.executions[cid]; ch.Status.Active() && ch.ParentID == e.ID {
+				s.addPending(ch, history.Event{Type: history.ExecutionCancelRequested}, now)
+				s.hint(store.WorkflowWork, ch.Queue)
+			}
+		}
+	}
 }
 
 // validate checks c before anything changes: a completion applies
@@ -542,6 +553,7 @@ func (s *Store) ClaimActivityTasks(_ context.Context, owner string, queues []str
 		t.lockedUntil = now.Add(ttl)
 		at := t.ActivityTask
 		at.Input = clone(at.Input)
+		at.CancelRequested = t.cancelRequested
 		out = append(out, at)
 	}
 	return out, nil
@@ -679,6 +691,9 @@ func (s *Store) RenewLeases(_ context.Context, owner string, workflows, activiti
 			continue
 		}
 		t.lockedUntil = now.Add(ttl)
+		if t.cancelRequested {
+			r.CanceledActivities = append(r.CanceledActivities, l.ID)
+		}
 	}
 	return r, nil
 }
@@ -737,4 +752,30 @@ func (s *Store) hint(kind store.WorkKind, queue string) {
 	for _, w := range s.watchers {
 		w(kind, queue)
 	}
+}
+
+// Terminate implements store.Store.
+func (s *Store) Terminate(_ context.Context, instanceID, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.latest[instanceID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	e := s.executions[id]
+	if !e.Status.Active() {
+		return store.ErrNotActive
+	}
+	now := s.clock.Now()
+	seq := int64(1)
+	if n := len(e.history); n > 0 {
+		seq = e.history[n-1].Seq + 1
+	}
+	e.history = append(e.history, history.Event{Seq: seq, Type: history.ExecutionTerminated, Err: reason})
+	e.Status = store.StatusTerminated
+	// The holder's lease is gone: a new version fences its writes.
+	e.lease = store.Lease{ID: e.ID, Version: e.lease.Version + 1}
+	e.lockedUntil, e.stickyOwner, e.stickyUntil = time.Time{}, "", time.Time{}
+	s.end(e, &store.Completion{Status: store.StatusTerminated, Err: reason}, now)
+	return nil
 }

@@ -66,12 +66,31 @@ type Options struct {
 	// StuckTimeout bounds how long workflow code may run without yielding
 	// (coro.DefaultStuckTimeout when 0).
 	StuckTimeout time.Duration
+	// ErrorText and ErrorKinds turn a workflow's error into its recorded
+	// form (storage-safe text; comma-separated sentinel kinds). Defaults:
+	// err.Error() and no kinds.
+	ErrorText, ErrorKinds func(error) string
+}
+
+func (o *Options) errorText(err error) string {
+	if o.ErrorText != nil {
+		return o.ErrorText(err)
+	}
+	return err.Error()
+}
+
+func (o *Options) errorKinds(err error) string {
+	if o.ErrorKinds != nil {
+		return o.ErrorKinds(err)
+	}
+	return ""
 }
 
 // Executor holds the replayed state of one execution between its tasks
 // (the sticky cache keeps it). Not safe for concurrent use.
 type Executor struct {
 	wf    Workflow
+	opts  Options
 	sched *coro.Scheduler
 	st    *State
 
@@ -93,7 +112,7 @@ var errBroken = errors.New("executor: unusable after an error")
 
 // New returns an executor for one execution of wf.
 func New(wf Workflow, executionID int64, opts Options) *Executor {
-	e := &Executor{wf: wf, executionID: executionID, sched: coro.NewScheduler(opts.StuckTimeout)}
+	e := &Executor{wf: wf, opts: opts, executionID: executionID, sched: coro.NewScheduler(opts.StuckTimeout)}
 	e.st = newState(e)
 	return e
 }
@@ -312,6 +331,8 @@ func sideTables(c *store.Completion, ev *history.Event, cmd *command.Command) {
 		})
 	case history.ChildCancelRequested:
 		c.ChildCancels = append(c.ChildCancels, cmd.Ref)
+	case history.ActivityCancelRequested:
+		c.CanceledActivities = append(c.CanceledActivities, cmd.ID)
 	}
 }
 

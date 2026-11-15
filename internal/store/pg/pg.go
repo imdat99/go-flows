@@ -635,6 +635,12 @@ const cancelChildren = `
 	)
 	SELECT ` + notifyW + "queue) FROM t"
 
+// cancelActivities marks the tasks of activities the workflow canceled;
+// RenewLeases reports them to the workers running them.
+const cancelActivities = `
+	UPDATE flows.activity_task SET cancel_requested = true
+	WHERE execution_id = $1 AND schedule_id = ANY($2::int[]) AND NOT compensate`
+
 // updateRunning closes a task that leaves the execution active: $2 last
 // seq (0: unchanged), $3 status (empty: unchanged), $4 keep-for, $5
 // sticky-for, $6 owner, $7/$8 the reason of a park (needs_attention).
@@ -853,6 +859,9 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 	if len(c.ChildCancels) > 0 {
 		queue(cancelChildren, l.ID, c.ChildCancels)
 	}
+	if len(c.CanceledActivities) > 0 {
+		queue(cancelActivities, l.ID, c.CanceledActivities)
+	}
 	if !ending {
 		queue(updateRunning, l.ID, lastSeq, string(c.Status), micros(c.KeepFor), micros(c.StickyFor), l.Owner, c.Err, c.ErrKinds)
 		return
@@ -935,7 +944,7 @@ const claimActivities = `
 	    visible_at = now() + $4 * interval '1 microsecond'
 	FROM c WHERE t.id = c.id
 	RETURNING t.id, t.lease_version, t.execution_id, t.instance_id, t.schedule_id, t.name, t.queue,
-	          t.input, t.compensate, t.attempt`
+	          t.input, t.compensate, t.attempt, t.cancel_requested`
 
 // ClaimActivityTasks implements store.Store.
 func (s *Store) ClaimActivityTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.ActivityTask, error) {
@@ -950,7 +959,7 @@ func (s *Store) ClaimActivityTasks(ctx context.Context, owner string, queues []s
 		for rows.Next() {
 			var t store.ActivityTask
 			if err := rows.Scan(&t.Lease.ID, &t.Lease.Version, &t.ExecutionID, &t.InstanceID, &t.ScheduleID,
-				&t.Name, &t.Queue, &t.Input, &t.Compensate, &t.Attempt); err != nil {
+				&t.Name, &t.Queue, &t.Input, &t.Compensate, &t.Attempt, &t.CancelRequested); err != nil {
 				return err
 			}
 			t.Lease.Owner = owner

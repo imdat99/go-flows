@@ -114,11 +114,16 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
 ### P3 — Executor và worker
 - [x] **T3.1** ⚡ Executor replay và catch-up trên runtime P1; so khớp loại, tên, `arg_hash`, thời lượng timer; replay ngắn hơn lịch sử → non-determinism (GW-11). Bench `BenchmarkReplay`.
   - T3.1: `BenchmarkReplay` (cache lạnh, 302 event): **732 → 129 alloc** (chỉ còn khoảng 0.43 alloc mỗi event; mỗi command là 1 struct, hook qua interface, waiter đầu tiên lưu inline), khoảng 0.8–0.9 µs mỗi event. Review: lần 1 không đạt (`SideEffect` làm lệch thứ tự lệnh khi replay; workflow kết thúc sớm không bị phát hiện; `Execute` sau khi đã xong; executor không bị đánh dấu hỏng; `Watch` hai lần). Lần 2 đạt có điều kiện (replay chia batch giữa một task). Lần 3 đạt; hồi quy hiệu năng khi giữ phần đuôi đã sửa.
-- [ ] **T3.2** Non-determinism, workflow chưa đăng ký, version lạ → park `needs_attention` hoặc bàn giao, không fail (GW-11, GW-12).
-- [ ] **T3.3** ⚡ Cache sticky: mutex theo instance, khoá cache theo `(exec, seq, lease_version)`, evict khi có lỗi, giới hạn theo byte (GW-9).
-- [ ] **T3.4** Worker/dispatcher: slot, `recover` ở mọi biên, Stop bàn giao trong một transaction.
-- [ ] **T3.5** ⚡ Thực thi eager: activity chạy tại chỗ và workflow task chạy tiếp ngay. Bench round trip mỗi activity.
-- [ ] **T3.6** Huỷ activity qua heartbeat và context; terminate (GW-13).
+- [x] **T3.2** Non-determinism, workflow chưa đăng ký, version lạ → park `needs_attention` hoặc bàn giao, không fail (GW-11, GW-12).
+- [x] **T3.3** ⚡ Cache sticky: mutex theo instance, khoá cache theo `(exec, seq, lease_version)`, evict khi có lỗi, giới hạn theo byte (GW-9).
+- [x] **T3.4** Worker/dispatcher: slot, `recover` ở mọi biên, Stop bàn giao trong một transaction.
+- [x] **T3.5** ⚡ Thực thi eager: activity chạy tại chỗ và workflow task chạy tiếp ngay. Bench round trip mỗi activity.
+- [x] **T3.6** Huỷ activity qua heartbeat và context; terminate (GW-13).
+
+  - T3.2–T3.6: worker (`internal/worker`). Gồm poller có backoff và hint, driver theo từng execution (vòng eager, cửa sổ eager, chuyển phần còn lại cho recorder khi nhả lease), heartbeat gộp có kiểm tra version lease, cache theo kiểu checkout, retry phía engine, huỷ activity, Terminate (store và migration `00002`), Stop êm.
+    - Mục "giới hạn theo byte" của T3.3 chưa làm: cache mới giới hạn theo số lượng.
+    - `BenchmarkActivityRun` (Postgres, eager, 10 activity): khoảng 1090 alloc mỗi lần chạy; khoảng 5.5 ms mỗi activity khi `synchronous_commit=off`. **Chưa đạt mục tiêu ≤ 80 alloc**, chuyển sang T8.2.
+    - Review: lần 1 không đạt (hạn chờ của Stop làm hỏng workflow; báo cáo lease cũ huỷ nhầm lease mới; nhả lease mà không giải phóng slot; resume lỗi làm rò lease; Compensate bị bỏ; renewedAt sai; huỷ khi đang chờ retry; Terminate dễ gãy; panic). Lần 2 không đạt (attempt thành công sau hạn chờ bị bỏ). Lần 3 đạt.
 
 ### P4 — API công khai
 - [ ] **T4.1** ⚡ `DefineWorkflow`/`DefineActivity` generic, đặt tên tường minh, trùng tên thì panic, kiểm tra tên (GW-12); `jsonSlot`.
@@ -148,6 +153,11 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
 
 ### P8 — Chất lượng và phát hành
 - [ ] **T8.1** Port `test/chaos`: SIGKILL, SIGSTOP, 3 instance, `assertOnce`.
+- [ ] **T8.2** (bổ sung từ P3) Giảm alloc của vòng eager trên Postgres xuống gần mục tiêu ≤ 80 mỗi lần chạy 10 activity:
+    - gộp các câu lệnh trong batch (fence + history + xoá pending; resume);
+    - tự ghi Bind/Execute thay cho `pgconn.Batch`, vì pgconn không cho tái dùng batch;
+    - theo dõi context kiểu `Interrupt` của saga;
+    - tuỳ chọn một commit mỗi activity (tương tự `AsyncStepStart`).
 - [ ] **T8.2** Benchmark đầy đủ so với saga và go-workflows, viết `docs/benchmarks.md`, bật perf gate trong CI.
 - [ ] **T8.3** Tài liệu song ngữ: concepts, guarantees, operations, patterns.
 - [ ] **T8.4** Review tổng thể toàn repo bằng subagent (đọc lạnh), sửa các phát hiện.

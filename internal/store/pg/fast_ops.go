@@ -21,6 +21,7 @@ var (
 	nInsertActs     = stmtName(insertActivities)
 	nInsertChild    = stmtName(insertChild)
 	nCancelChildren = stmtName(cancelChildren)
+	nCancelActs     = stmtName(cancelActivities)
 	nUpdateRunning  = stmtName(updateRunning)
 	nEndExecution   = stmtName(endExecution)
 	nContinueAsNew  = stmtName(continueAsNew)
@@ -163,6 +164,12 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 		fb.stmt(cancelChildren, nCancelChildren, func() {
 			fb.Int(l.ID)
 			fb.Strs(len(c.ChildCancels), func(i int) string { return c.ChildCancels[i] })
+		})
+	}
+	if len(c.CanceledActivities) > 0 {
+		fb.stmt(cancelActivities, nCancelActs, func() {
+			fb.Int(l.ID)
+			fb.Ints(len(c.CanceledActivities), func(i int) int64 { return int64(c.CanceledActivities[i]) })
 		})
 	}
 	s.endFast(fb, l, c, ending, lastSeq)

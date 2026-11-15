@@ -29,3 +29,11 @@ BenchmarkEagerActivity B/op <= 11264
 # internal/executor (T3.1): cold replay of a 100-activity history (302
 # events): measured 130 allocs (~0.43 per event), ~750 ns/event.
 BenchmarkReplay allocs/op <= 140
+
+# internal/worker (T3.5): end to end on Postgres, eager execution, one op =
+# a 10-activity workflow (start, run, end; includes polling, heartbeat,
+# goroutines). Measured ~1090 allocs/op, ~150 KiB/op; ~5.5 ms/activity with
+# synchronous_commit=off (fsync-bound ~14 ms otherwise). The plan's target
+# (<= 80 allocs/run) is NOT met yet: ~10 pipelined statements per activity
+# cost ~5 allocs each inside pgconn (see TASKS.md T8.2).
+BenchmarkActivityRun allocs/op <= 1200

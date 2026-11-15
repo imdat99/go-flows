@@ -188,6 +188,10 @@ type Completion struct {
 	// ChildCancels are cancel requests for children of this execution (by
 	// instance id); ids that are not active children are ignored.
 	ChildCancels []string
+	// CanceledActivities are schedule ids of activities whose context the
+	// workflow canceled: their tasks are marked, and RenewLeases reports
+	// them so the worker running them cancels them (GW-13).
+	CanceledActivities []int32
 	// Status is the execution's status after the task. A non-active status
 	// ends the execution (Output, Err, ErrKinds apply). With
 	// StatusNeedsAttention, Err and ErrKinds record the reason.
@@ -233,6 +237,10 @@ type ActivityTask struct {
 	Input       []byte
 	Compensate  bool
 	Attempt     int32 // 1 for the first attempt
+	// CancelRequested reports that the workflow canceled the activity
+	// before this attempt: the worker records the cancel instead of running
+	// it.
+	CancelRequested bool
 }
 
 // ActivityResult ends an activity task: Event (ActivityCompleted or
@@ -316,6 +324,13 @@ type Store interface {
 	// locked elsewhere are skipped, so concurrent purges split the work.
 	PurgeEnded(ctx context.Context, olderThan time.Duration, limit int) (int, error)
 
+	// Terminate ends the active execution of an instance id by force:
+	// ExecutionTerminated is appended to its history, no workflow code or
+	// compensation runs, its pending events and tasks are dropped, its
+	// parent is notified, and any lease on it is lost (the holder's writes
+	// fail). ErrNotFound / ErrNotActive as Signal.
+	Terminate(ctx context.Context, instanceID, reason string) error
+
 	// Signal delivers a SignalReceived event to the active execution of an
 	// instance id: ErrNotFound if the id is unknown, ErrNotActive if its
 	// latest execution ended.
@@ -363,6 +378,9 @@ func ChildOutcome(child Execution) history.Event {
 type Renewal struct {
 	LostWorkflows, BusyWorkflows   []int64
 	LostActivities, BusyActivities []int64
+	// CanceledActivities were renewed but the workflow canceled them: the
+	// worker cancels their context (their outcome is still recorded).
+	CanceledActivities []int64
 }
 
 // WorkKind tells what kind of task a Watch hint is about.

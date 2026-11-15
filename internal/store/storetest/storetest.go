@@ -95,6 +95,9 @@ func Run(t *testing.T, h Harness) {
 		{"KeptLeaseHolderDies", testKeptLeaseHolderDies},
 		{"GW3_TerminalWithNilConsumed", testTerminalWithNilConsumed},
 		{"WatchHints", testWatch},
+		{"Terminate", testTerminate},
+		{"GW13_ActivityCancelReachesItsWorker", testActivityCancel},
+		{"GW13_CancelBeforeRetry", testCancelBeforeRetry},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
