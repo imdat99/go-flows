@@ -337,6 +337,18 @@ func (s *Store) validate(e *execution, c *store.Completion) error {
 	if c.Status != "" && !c.Status.Active() && (len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Children) > 0) {
 		return store.ErrInvalidCompletion // they would be dropped at once
 	}
+	if s.duplicateActivity(e, c.Activities) {
+		return store.ErrInvalidCompletion
+	}
+	if c.Status != "" && !c.Status.Active() && c.Status != store.StatusContinued && undelivered(e, c.Consumed) {
+		return store.ErrPendingEvents
+	}
+	return nil
+}
+
+// duplicateActivity reports two activity tasks for one (schedule id,
+// compensate) of e, among acts and the existing ones.
+func (s *Store) duplicateActivity(e *execution, acts []store.NewActivityTask) bool {
 	type key struct {
 		sched int32
 		comp  bool
@@ -347,22 +359,25 @@ func (s *Store) validate(e *execution, c *store.Completion) error {
 			seen[key{t.ScheduleID, t.Compensate}] = true
 		}
 	}
-	for _, a := range c.Activities {
+	for _, a := range acts {
 		k := key{a.ScheduleID, a.Compensate}
 		if seen[k] {
-			return store.ErrInvalidCompletion
+			return true
 		}
 		seen[k] = true
 	}
-	if c.Status != "" && !c.Status.Active() && c.Status != store.StatusContinued {
-		for _, p := range e.pending {
-			if (p.ev.Type == history.SignalReceived || p.ev.Type == history.ExecutionCancelRequested) &&
-				!slices.Contains(c.Consumed, p.id) {
-				return store.ErrPendingEvents
-			}
+	return false
+}
+
+// undelivered reports pending signals or cancel requests not in consumed.
+func undelivered(e *execution, consumed []int64) bool {
+	for _, p := range e.pending {
+		if (p.ev.Type == history.SignalReceived || p.ev.Type == history.ExecutionCancelRequested) &&
+			!slices.Contains(consumed, p.id) {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 func (s *Store) createActivities(e *execution, owner string, acts []store.NewActivityTask, now time.Time) []store.Lease {
