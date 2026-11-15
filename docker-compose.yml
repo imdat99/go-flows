@@ -1,0 +1,20 @@
+# Postgres for manual runs and for the tests (make up). Test binaries of every
+# package share this server: each test gets its own database (internal/testdb).
+# Port 5433 so it can run next to the saga repository's compose (5432).
+# Default durability (fsync, synchronous_commit on): benchmarks must see the
+# real commit cost.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: flows
+      POSTGRES_PASSWORD: flows
+      POSTGRES_DB: flows
+    # go test runs packages in parallel against this one server.
+    command: ["postgres", "-c", "max_connections=500"]
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flows"]
+      interval: 2s
+      retries: 20

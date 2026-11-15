@@ -1,0 +1,9 @@
+# Perf budget checked by `make benchgate` (internal/tools/benchgate).
+# One rule per line: <benchmark> <unit> <op> <limit>; medians of -count runs.
+# Allocation counts are near deterministic: keep their limits tight and lower
+# them when a change improves them. A rule whose benchmark is missing fails.
+#
+# Targets (TASKS.md, Performance):
+#   BenchmarkActivityRun   allocs/op <= 80 (10 activities), B/op <= 8192
+#   BenchmarkScheduler     allocs/op 0 in steady state
+# Rules are added by the task that introduces each benchmark.
