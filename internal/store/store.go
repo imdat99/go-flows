@@ -279,8 +279,9 @@ type Store interface {
 	// stickiness; the execution is claimable again after delay.
 	ReleaseWorkflowTask(ctx context.Context, l Lease, delay time.Duration) error
 	// ResumeWorkflowTask returns the next workflow task under a lease kept
-	// with Completion.KeepFor, extended by ttl: the visible pending events
-	// (possibly none) and the store time.
+	// with Completion.KeepFor: the visible pending events (possibly none)
+	// and the store time. The lease then has at least ttl/2 left (it is
+	// extended to ttl only when less is left, to spare a write).
 	ResumeWorkflowTask(ctx context.Context, l Lease, ttl time.Duration) (WorkflowTask, error)
 
 	// ClaimActivityTasks claims up to limit visible, unclaimed (or expired)

@@ -1,6 +1,7 @@
 package storetest
 
 import (
+	"errors"
 	"slices"
 	"testing"
 
@@ -102,5 +103,49 @@ func testPurgeEnded(t *testing.T, h Harness) {
 	}
 	if _, err := s.GetExecution(ctx, "active"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The holder of a kept lease dies after its eager activity completed: once
+// the lease expires, another owner claims the execution with the result.
+func testKeptLeaseHolderDies(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "i1")
+	task := claimOne(t, s, owner, h.TTL)
+	leases, err := s.CompleteWorkflowTask(ctx, task.Lease, &store.Completion{
+		History:    []history.Event{{Seq: 1, Type: history.ExecutionStarted}},
+		Consumed:   pendingIDs(task),
+		Activities: []store.NewActivityTask{{ScheduleID: 1, Name: "a", Queue: queue, ClaimFor: h.TTL}},
+		KeepFor:    h.TTL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CompleteActivityTask(ctx, leases[0], store.ActivityResult{Event: history.Event{Type: history.ActivityCompleted}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := claim(t, s, other, h.TTL); len(got) != 0 {
+		t.Fatal("claimed while the kept lease is live")
+	}
+	h.Advance(t, s, h.TTL+h.TTL/2)
+	got := claimOne(t, s, other, h.TTL)
+	if !slices.Equal(pendingTypes(got), []history.Type{history.ActivityCompleted}) {
+		t.Fatalf("pending %v", pendingTypes(got))
+	}
+}
+
+// GW-3: a terminal completion of a resumed task that delivered nothing
+// (Consumed nil) is still rejected while a signal is pending.
+func testTerminalWithNilConsumed(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "i1")
+	task := claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{KeepFor: h.TTL})
+	if err := s.Signal(ctx, "i1", "late", nil); err != nil {
+		t.Fatal(err)
+	}
+	c := store.Completion{History: []history.Event{{Seq: 2, Type: history.ExecutionCompleted}}, Status: store.StatusCompleted}
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, &c); !errors.Is(err, store.ErrPendingEvents) {
+		t.Fatalf("terminal completion with nil Consumed and a pending signal: %v", err)
 	}
 }

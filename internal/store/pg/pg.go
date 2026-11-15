@@ -33,12 +33,13 @@ import (
 //     pending.
 type Store struct {
 	pool *pgxpool.Pool
+	fast bool // hot paths on pgconn (fast.go)
 }
 
 var _ store.Store = (*Store)(nil)
 
 // New returns a store on pool (migrated with Migrate).
-func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool, fast: fastPathEnabled(pool)} }
 
 const (
 	codeLeaseLost    = "22012"
@@ -76,8 +77,19 @@ func mapErr(err error) error {
 	return err
 }
 
+// nonNil returns s, or an empty slice for nil: pgx sends a nil slice as
+// NULL, and "x <> ALL(NULL)" is NULL, not true.
+func nonNil[T any](s []T) []T {
+	if s == nil {
+		return []T{}
+	}
+	return s
+}
+
 // retry runs fn again when Postgres aborted it for a deadlock or a
-// serialization failure, after a short randomized backoff. fn must be
+// serialization failure, or when a prepared statement went stale (after a
+// migration the connection is closed and the next one prepares afresh),
+// after a short randomized backoff. fn must be
 // all-or-nothing (one batch or one statement): a retry starts from scratch.
 //
 // Known deadlock: a parent cancelling a child (parent row, then child row)
@@ -90,7 +102,7 @@ func retry(ctx context.Context, fn func() error) error {
 		if err = fn(); err == nil {
 			return nil
 		}
-		if s := sqlState(err); s != codeDeadlock && s != codeSerializable {
+		if s := sqlState(err); s != codeDeadlock && s != codeSerializable && !staleStatement(err) {
 			return err
 		}
 		backoff := time.Duration(1+rand.IntN(5<<attempt)) * time.Millisecond //nolint:gosec // jitter, not security
@@ -416,31 +428,58 @@ func (s *Store) ExtendWorkflowTask(ctx context.Context, l store.Lease, ttl time.
 }
 
 // ReleaseWorkflowTask implements store.Store.
+//
+// The fence locks the row first, so that releaseWorkflow computes ready_at
+// from a snapshot taken after the lock: it includes every event delivered
+// before, and later deliveries wait for the lock (see wakeForTask). A
+// single UPDATE would compute it from a snapshot taken before waiting for
+// the lock and could miss one, leaving the execution unclaimable.
 func (s *Store) ReleaseWorkflowTask(ctx context.Context, l store.Lease, delay time.Duration) error {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE flows.execution
-		SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL,
-		    not_before = CASE WHEN $4 > 0 THEN now() + $4 * interval '1 microsecond' END
-		WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''`,
-		l.ID, l.Owner, l.Version, micros(delay))
-	if err != nil {
+	err := retry(ctx, func() error {
+		b := &pgx.Batch{}
+		b.Queue(fence, l.ID, l.Owner, l.Version, int64(0), false)
+		b.Queue(releaseWorkflow, l.ID, micros(delay))
+		br := s.pool.SendBatch(ctx, b)
+		defer br.Close()
+		var seq int64
+		if err := br.QueryRow().Scan(&seq); err != nil {
+			return err
+		}
+		if _, err := br.Exec(); err != nil {
+			return err
+		}
+		return br.Close()
+	})
+	if err = mapErr(err); err != nil && !errors.Is(err, store.ErrLeaseLost) {
 		return fmt.Errorf("release workflow task: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return store.ErrLeaseLost
-	}
-	return nil
+	return err
 }
 
-// resumeWorkflow extends a kept lease; resumePending reads the visible
-// pending events of that execution if the lease is still held (same
-// implicit transaction: it sees the extension).
+const releaseWorkflow = `
+	UPDATE flows.execution
+	SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL,
+	    ready_at = (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
+	    not_before = CASE WHEN $2::bigint > 0 THEN now() + $2::bigint * interval '1 microsecond' END
+	WHERE id = $1`
+
+// resumeExtend extends a kept lease, but only when less than half of ttl
+// is left: in the eager loop the lease was just set by the completion, and
+// skipping the write avoids a non-HOT update of the execution row (it is in
+// indexes through ready_at). resumeWorkflow then reads the execution if the
+// lease is still held, and resumePending its visible pending events.
 const (
-	resumeWorkflow = `
-		UPDATE flows.execution SET locked_until = now() + $4 * interval '1 microsecond'
+	resumeExtend = `
+		UPDATE flows.execution
+		SET locked_until = now() + $4::bigint * interval '1 microsecond',
+		    ready_at = least(ready_at, now() + $4::bigint * interval '1 microsecond')
 		WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''
-		  AND status IN ('running', 'compensating')
-		RETURNING ` + executionColumns + `, lease_version, last_seq, now()`
+		  AND locked_until < now() + ($4::bigint / 2) * interval '1 microsecond'`
+	resumeWorkflow = `
+		SELECT ` + executionColumns + `, lease_version, last_seq, now()
+		FROM flows.execution
+		WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''
+		  AND status IN ('running', 'compensating')`
 	resumePending = `
 		SELECT p.id, p.execution_id, ` + pendingColumnsP + `
 		FROM flows.pending_event p
@@ -451,13 +490,17 @@ const (
 )
 
 func queueResume(b *pgx.Batch, l store.Lease, ttl time.Duration) {
-	b.Queue(resumeWorkflow, l.ID, l.Owner, l.Version, micros(ttl))
+	b.Queue(resumeExtend, l.ID, l.Owner, l.Version, micros(ttl))
+	b.Queue(resumeWorkflow, l.ID, l.Owner, l.Version)
 	b.Queue(resumePending, l.ID, l.Owner, l.Version)
 }
 
 // readResume reads the results of queueResume; ok is false when the lease
 // was lost.
 func readResume(br pgx.BatchResults, owner string) (store.WorkflowTask, bool, error) {
+	if _, err := br.Exec(); err != nil {
+		return store.WorkflowTask{}, false, err
+	}
 	tasks, err := readTasks(br, owner)
 	if err != nil {
 		return store.WorkflowTask{}, false, err
@@ -598,7 +641,10 @@ const updateRunning = `
 	UPDATE flows.execution e
 	SET last_seq = CASE WHEN $2::bigint > 0 THEN $2::bigint ELSE e.last_seq END,
 	    status = v.status,
-	    ready_at = (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
+	    ready_at = CASE WHEN v.keep
+	        THEN least((SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
+	                   now() + $4 * interval '1 microsecond')
+	        ELSE (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1) END,
 	    owner_id = CASE WHEN v.keep THEN e.owner_id ELSE '' END,
 	    locked_until = CASE WHEN v.keep THEN now() + $4 * interval '1 microsecond' END,
 	    sticky_owner = CASE WHEN NOT v.keep AND $5::bigint > 0 THEN $6 ELSE '' END,
@@ -703,11 +749,16 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 	terminal := ending && c.Status != store.StatusContinued
 	var claimed map[actKey]int64
 	err := retry(ctx, func() error {
+		if s.fast {
+			var err error
+			claimed, err = s.completeFast(ctx, l, c, ending, terminal, prevSeq, lastSeq)
+			return err
+		}
 		b := &pgx.Batch{}
 		b.Queue(fence, l.ID, l.Owner, l.Version, prevSeq, len(c.History) > 0)
 		sh := completionShape{activityAt: -1}
 		if terminal {
-			b.Queue(noUndelivered, l.ID, c.Consumed)
+			b.Queue(noUndelivered, l.ID, nonNil(c.Consumed)) // NULL would disable the check
 			sh.statements++
 		}
 		s.queueCompletion(b, l, c, ending, lastSeq, &sh)
@@ -760,7 +811,7 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		queue(insertHistory, a.args(l.ID)...)
 	}
 	if len(c.Consumed) > 0 || len(c.CanceledTimers) > 0 {
-		queue(deletePending, l.ID, c.Consumed, c.CanceledTimers)
+		queue(deletePending, l.ID, nonNil(c.Consumed), nonNil(c.CanceledTimers))
 	}
 	if len(c.Timers) > 0 {
 		var a eventArgs
@@ -931,14 +982,29 @@ func (s *Store) RetryActivityTask(ctx context.Context, l store.Lease, delay time
 	return nil
 }
 
-// Delivering an activity result locks the execution row first (wakeForTask)
-// and the task row second (finishTask), the same order as a workflow task
-// completion (execution, then its tasks with SKIP LOCKED), so the two never
-// deadlock. finishTask raises 22012 when the lease is lost, rolling back the
-// wake-up.
+// Delivering an activity result wakes the execution (wakeForTask). The
+// UPDATE always takes the row lock, so it waits for a holder that is
+// releasing the lease, then sees the released row: a wake-up is never lost.
+// While the execution is leased it leaves ready_at as it is (an unchanged
+// indexed column keeps the update HOT, so it stays cheap): the holder
+// recomputes ready_at when it releases the lease, in a statement that
+// starts after it holds the row lock (after a fence), so its snapshot
+// includes every result delivered before; while a lease is kept, ready_at
+// stays at or before its expiry (claims, keeps and extensions maintain
+// this), so an execution whose holder died is claimable once the lease
+// expires.
+//
+// Lock order: wakeForTask locks the execution row before finishTask locks
+// the task row, as a workflow task completion does (execution, then its
+// tasks). finishTask's pending insert only takes a key share lock on the
+// execution, which never conflicts with a completion's row lock, so the two
+// never deadlock. finishTask raises 22012 when the lease is lost, rolling
+// back the wake-up.
 const (
 	wakeForTask = `
-		UPDATE flows.execution SET ready_at = least(coalesce(ready_at, now()), now())
+		UPDATE flows.execution
+		SET ready_at = CASE WHEN locked_until > now() THEN ready_at
+		                    ELSE least(coalesce(ready_at, now()), now()) END
 		WHERE id = (SELECT execution_id FROM flows.activity_task WHERE id = $1)
 		  AND status IN ` + activeStatuses
 	finishTask = `
@@ -965,6 +1031,11 @@ func (s *Store) CompleteActivityTask(ctx context.Context, l store.Lease, r store
 	var task *store.WorkflowTask
 	err := retry(ctx, func() error {
 		task = nil
+		if s.fast {
+			var err error
+			task, err = s.completeActivityFast(ctx, l, &r)
+			return err
+		}
 		b := &pgx.Batch{}
 		b.Queue(wakeForTask, l.ID)
 		b.Queue(finishTask, l.ID, l.Owner, l.Version, int16(ev.Type), ev.Payload, ev.CompData,
@@ -1054,6 +1125,9 @@ func (s *Store) deliver(ctx context.Context, instanceID string, typ history.Type
 	}
 	return fmt.Errorf("deliver %v: instance kept continuing as new", typ)
 }
+
+// FastPath reports whether the hot paths run on pgconn (see fast.go).
+func (s *Store) FastPath() bool { return s.fast }
 
 // Pool returns the store's connection pool.
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }

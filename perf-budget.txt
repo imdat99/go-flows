@@ -18,3 +18,10 @@ BenchmarkChannelPingPong allocs/op <= 0
 # internal/command, internal/history (T1.3/T1.4)
 BenchmarkCommitActivity allocs/op <= 0
 BenchmarkHashArgs allocs/op <= 0
+
+# internal/store/pg (T2.8): eager loop, store side, one activity per op
+# (complete workflow task + complete activity with resume: 2 round trips).
+# Fast path measured 52 allocs, 9.9 KiB (pgx path: 311, 20.4 KiB).
+# Latency is fsync-bound (~11.7 ms on the dev box, 2 commits): no rule.
+BenchmarkEagerActivity allocs/op <= 56
+BenchmarkEagerActivity B/op <= 11264
