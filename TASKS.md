@@ -233,8 +233,18 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
   - Review: lần 1 không đạt (H1 tính uncertain qua các lần retry; M2 `Unstick` chỉ xử lý theo cache; M3–M4 độ tin cậy của test bàn giao; L5–L9). Lần 2 đạt; đã sửa M (Unstick chỉ đụng các execution còn sticky) và L2/L3/L5.
 
 ### P6 — Sub-workflow và ContinueAsNew
-- [ ] **T6.1** Child workflow: tạo, kết quả, huỷ theo cây, nhắm theo `instance_id`.
-- [ ] **T6.2** ContinueAsNew: chuyển signal và pending một cách nguyên tử, cache evict đúng (GW-3).
+- [x] **T6.1** Child workflow: tạo, kết quả, huỷ theo cây, nhắm theo `instance_id`.
+- [x] **T6.2** ContinueAsNew: chuyển signal và pending một cách nguyên tử, cache evict đúng (GW-3).
+
+  - T6.1–T6.2:
+    - **Huỷ theo cây:** execution kết thúc (trừ continue-as-new) hoặc bị terminate thì gửi yêu cầu huỷ cho các child còn chạy (`cancelChildrenOf`; migration `00006` thêm index `parent_id`). Child được địa chỉ hoá theo instance id.
+    - **GW-3, mất tin khi continue-as-new:** signal đã giao vào channel nhưng workflow chưa đọc, và cancel đã áp dụng nhưng workflow chưa xử lý, đều bị mất khi continue-as-new. Sửa: thêm `Completion.Carry` (executor tính ở cuối task từ `sigLog`, log này được compact). Store giao chúng cho execution mới trước các pending chưa giao.
+    - Gộp phần kiểm tra completion vào `store.ValidShape`; bỏ được một map/completion trên pg.
+    - **Còn mở (thấp):**
+      - Child được tạo trong đúng task mà cha kết thúc thì bị bỏ (giống activity).
+      - Cha kết thúc đúng lúc child kết thúc thì có thể deadlock; được retry sau `deadlock_timeout` (đã ghi chú).
+      - Trên mem, `cancelChildrenOf` quét toàn bộ execution.
+    - **Review:** lần 1 không đạt (H1 cancel bị mất khi continue-as-new; M1 index không được dùng; M2 `sigLog` không giới hạn; M3 deadlock). Lần 2 đạt.
 - [ ] **T6.3** Compensation lồng nhau: cha hoàn tác thì child hoàn tác.
 
 ### P7 — Công cụ

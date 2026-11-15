@@ -27,7 +27,9 @@ var (
 	nEndExecution   = stmtName(endExecution)
 	nContinueAsNew  = stmtName(continueAsNew)
 	nCarryPending   = stmtName(carryPending)
+	nCarrySignals   = stmtName(carrySignals)
 	nDropEnded      = stmtName(dropEnded)
+	nCancelChildOf  = stmtName(cancelChildrenOf)
 	nNotifyParent   = stmtName(notifyParent)
 	nWakeForTask    = stmtName(wakeForTask)
 	nFinishTask     = stmtName(finishTask)
@@ -244,9 +246,20 @@ func (s *Store) endFast(fb *fastBatch, l store.Lease, c *store.Completion, endin
 			fb.Str(n.Queue)
 			fb.Bytes(n.Input)
 		})
+		if n := len(c.Carry); n > 0 {
+			fb.stmt(carrySignals, nCarrySignals, func() {
+				fb.Int(l.ID)
+				fb.Ints(n, func(i int) int64 { return int64(c.Carry[i].Type) })
+				fb.Strs(n, func(i int) string { return c.Carry[i].Name })
+				fb.Blobs(n, func(i int) []byte { return c.Carry[i].Payload })
+			})
+		}
 		fb.stmt(carryPending, nCarryPending, func() { fb.Int(l.ID) })
 	}
 	fb.stmt(dropEnded, nDropEnded, func() { fb.Int(l.ID) })
+	if c.Status != store.StatusContinued {
+		fb.stmt(cancelChildrenOf, nCancelChildOf, func() { fb.Int(l.ID) })
+	}
 	if c.Status != store.StatusContinued {
 		ev := store.ChildOutcome(store.Execution{Status: c.Status, Output: c.Output, Err: c.Err, ErrKinds: c.ErrKinds})
 		fb.stmt(notifyParent, nNotifyParent, func() {

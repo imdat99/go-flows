@@ -207,8 +207,15 @@ type Completion struct {
 	// ContinueAsNew, when set with Status == StatusContinued, creates the
 	// next execution of the same instance id. Undelivered signals and cancel
 	// requests move to it. Unfired timers, activity tasks and the link to
-	// running children do not: their outcomes are dropped.
+	// running children do not: their outcomes are dropped, and the children
+	// run on. Any other end asks the active children to cancel (cancel by
+	// tree), as Terminate does.
 	ContinueAsNew *NewExecution
+	// Carry are signals the workflow received but had not read, and a
+	// cancel request it received, when it continued as new
+	// (SignalReceived, ExecutionCancelRequested): they are delivered to the
+	// next execution first, before the undelivered ones (GW-3).
+	Carry []history.Event
 	// Locks are business locks to take (LockRequested events). Each gets a
 	// pending answer for this execution, visible at once: LockAcquired when
 	// the lock is free, expired, or already held by this execution (then
@@ -292,6 +299,64 @@ type ActivityResult struct {
 	// to run next (eager execution).
 	Resume    *Lease
 	ResumeFor time.Duration
+}
+
+// ValidShape reports whether a completion is consistent in itself (see
+// ErrInvalidCompletion): history sequence numbers that follow each other,
+// continue-as-new fields only with StatusContinued, nothing to create in an
+// ending completion, positive lock TTLs, one task per (schedule id, kind).
+func ValidShape(c *Completion) bool {
+	for i := 1; i < len(c.History); i++ {
+		if c.History[i].Seq != c.History[i-1].Seq+1 {
+			return false
+		}
+	}
+	if c.ContinueAsNew != nil && c.Status != StatusContinued || len(c.Carry) > 0 && c.ContinueAsNew == nil {
+		return false
+	}
+	for _, ev := range c.Carry {
+		if ev.Type != history.SignalReceived && ev.Type != history.ExecutionCancelRequested {
+			return false
+		}
+	}
+	ending := c.Status != "" && !c.Status.Active()
+	if ending && (len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Children) > 0 || len(c.Locks) > 0) {
+		return false // they would be dropped at once
+	}
+	for _, k := range c.Locks {
+		if k.TTL <= 0 {
+			return false
+		}
+	}
+	return !duplicateTasks(c.Activities)
+}
+
+// duplicateTasks reports two tasks for one (schedule id, kind): a scan for
+// the usual few, a set beyond.
+func duplicateTasks(acts []NewActivityTask) bool {
+	if len(acts) <= 16 {
+		for i, a := range acts {
+			for _, b := range acts[:i] {
+				if a.ScheduleID == b.ScheduleID && a.Compensate == b.Compensate {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	type key struct {
+		sched int32
+		comp  bool
+	}
+	seen := make(map[key]bool, len(acts))
+	for _, a := range acts {
+		k := key{a.ScheduleID, a.Compensate}
+		if seen[k] {
+			return true
+		}
+		seen[k] = true
+	}
+	return false
 }
 
 // ValidResult reports whether t can end an activity task (ActivityResult).

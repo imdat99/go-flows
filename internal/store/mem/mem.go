@@ -395,22 +395,8 @@ func (s *Store) validate(e *execution, c *store.Completion) error {
 	if n := len(e.history); n > 0 {
 		last = e.history[n-1].Seq
 	}
-	for _, ev := range c.History {
-		if ev.Seq != last+1 {
-			return store.ErrInvalidCompletion
-		}
-		last = ev.Seq
-	}
-	if c.ContinueAsNew != nil && c.Status != store.StatusContinued {
+	if !store.ValidShape(c) || len(c.History) > 0 && c.History[0].Seq != last+1 {
 		return store.ErrInvalidCompletion
-	}
-	if c.Status != "" && !c.Status.Active() && (len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Children) > 0 || len(c.Locks) > 0) {
-		return store.ErrInvalidCompletion // they would be dropped at once
-	}
-	for _, l := range c.Locks {
-		if l.TTL <= 0 {
-			return store.ErrInvalidCompletion
-		}
 	}
 	if s.duplicateActivity(e, c.Activities) {
 		return store.ErrInvalidCompletion
@@ -512,10 +498,16 @@ func (s *Store) end(e *execution, c *store.Completion, now time.Time) {
 	if e.ParentID != 0 && e.Status != store.StatusContinued {
 		s.notifyParent(e, now)
 	}
+	if e.Status != store.StatusContinued {
+		s.cancelChildrenOf(e.ID, now)
+	}
 	if c.ContinueAsNew != nil {
 		next := *c.ContinueAsNew
 		next.InstanceID, next.ParentID, next.ParentSched = e.InstanceID, e.ParentID, e.ParentSched
 		n := s.create(next, now)
+		for _, ev := range c.Carry {
+			s.addPending(n, history.Event{Type: ev.Type, Name: ev.Name, Payload: clone(ev.Payload)}, now)
+		}
 		for _, p := range carried {
 			s.addPending(n, p.ev, now)
 		}
@@ -756,6 +748,16 @@ func (s *Store) Unstick(_ context.Context, owner string) error {
 		}
 	}
 	return nil
+}
+
+// cancelChildrenOf asks the active children of execution id to cancel.
+func (s *Store) cancelChildrenOf(id int64, now time.Time) {
+	for _, ch := range s.executions {
+		if ch.ParentID == id && ch.Status.Active() {
+			s.addPending(ch, history.Event{Type: history.ExecutionCancelRequested}, now)
+			s.hint(store.WorkflowWork, ch.Queue)
+		}
+	}
 }
 
 // ReopenCompensation implements store.Store.

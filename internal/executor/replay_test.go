@@ -2,6 +2,7 @@ package executor_test
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -303,5 +304,136 @@ func TestLockReplay(t *testing.T) {
 	}
 	if last.Status != store.StatusFailed || !strings.Contains(last.Err, "lock lost") {
 		t.Fatalf("after LockLost: %s %q", last.Status, last.Err)
+	}
+}
+
+// GW-3 (T6.2): continue-as-new carries the signals delivered but not read,
+// in arrival order across names, including those delivered in the same task
+// after the workflow decided to continue.
+func TestContinueAsNewCarriesUnreadSignals(t *testing.T) {
+	wf := executor.Workflow{Name: "wf", Version: 1, Run: func(ctx coro.Context, _ []byte) ([]byte, error) {
+		st := executor.FromContext(ctx)
+		ch := st.SignalChannel("n")
+		for range 2 {
+			ch.Receive(ctx)
+		}
+		return nil, &executor.ContinueAsNewError{Input: []byte("x")}
+	}}
+	ex := executor.New(wf, 1, executor.Options{})
+	defer ex.Close()
+	task := &store.WorkflowTask{Now: time.Unix(1, 0), Pending: []store.PendingEvent{{ID: 1, Event: startEvent()}}}
+	for i, name := range []string{"n", "m", "n", "n", "m"} {
+		task.Pending = append(task.Pending, store.PendingEvent{ID: int64(i + 2), Event: history.Event{
+			Type: history.SignalReceived, Name: name, Payload: []byte{byte('0' + i)},
+		}})
+	}
+	c, err := ex.Execute(task)
+	if err != nil || c.Status != store.StatusContinued {
+		t.Fatalf("%v %s", err, c.Status)
+	}
+	var got []string
+	for _, ev := range c.Carry {
+		got = append(got, ev.Name+string(ev.Payload))
+	}
+	// n0 and n2 were read; m1, n3, m4 were not.
+	if strings.Join(got, ",") != "m1,n3,m4" {
+		t.Fatalf("carried %v", got)
+	}
+}
+
+// GW-3 (review of T6.2): a cancel request the workflow did not act on
+// before continuing as new goes on with the unread signals.
+func TestContinueAsNewCarriesCancel(t *testing.T) {
+	wf := executor.Workflow{Name: "wf", Version: 1, Run: func(ctx coro.Context, _ []byte) ([]byte, error) {
+		executor.FromContext(ctx).SignalChannel("n").Receive(ctx)
+		return nil, &executor.ContinueAsNewError{Input: []byte("x")}
+	}}
+	ex := executor.New(wf, 1, executor.Options{})
+	defer ex.Close()
+	c, err := ex.Execute(&store.WorkflowTask{Now: time.Unix(1, 0), Pending: []store.PendingEvent{
+		{ID: 1, Event: startEvent()},
+		{ID: 2, Event: history.Event{Type: history.SignalReceived, Name: "n", Payload: []byte("0")}},
+		{ID: 3, Event: history.Event{Type: history.SignalReceived, Name: "n", Payload: []byte("1")}},
+		{ID: 4, Event: history.Event{Type: history.ExecutionCancelRequested}},
+	}})
+	if err != nil || c.Status != store.StatusContinued {
+		t.Fatalf("%v %s", err, c.Status)
+	}
+	if len(c.Carry) != 2 || c.Carry[0].Type != history.SignalReceived || string(c.Carry[0].Payload) != "1" ||
+		c.Carry[1].Type != history.ExecutionCancelRequested {
+		t.Fatalf("carry %+v", c.Carry)
+	}
+}
+
+// The carry is the same when the executor was rebuilt from history (cold
+// replay): the delivery log is rebuilt by replaying the signals.
+func TestContinueAsNewCarryAfterReplay(t *testing.T) {
+	wf := executor.Workflow{Name: "wf", Version: 1, Run: func(ctx coro.Context, _ []byte) ([]byte, error) {
+		st := executor.FromContext(ctx)
+		st.SignalChannel("go").Receive(ctx)
+		st.SignalChannel("n").Receive(ctx)
+		return nil, &executor.ContinueAsNewError{Input: []byte("x")}
+	}}
+	live := executor.New(wf, 1, executor.Options{})
+	defer live.Close()
+	first := &store.WorkflowTask{Now: time.Unix(1, 0), Pending: []store.PendingEvent{{ID: 1, Event: startEvent()}}}
+	for i := range 3 {
+		first.Pending = append(first.Pending, store.PendingEvent{ID: int64(i + 2), Event: history.Event{
+			Type: history.SignalReceived, Name: "n", Payload: []byte{byte('0' + i)},
+		}})
+	}
+	c, err := live.Execute(first)
+	if err != nil || c.Status != "" {
+		t.Fatalf("%v %s", err, c.Status)
+	}
+	cold := executor.New(wf, 1, executor.Options{})
+	defer cold.Close()
+	if err := cold.Replay(c.History); err != nil {
+		t.Fatal(err)
+	}
+	c, err = cold.Execute(&store.WorkflowTask{LastSeq: cold.LastSeq(), Now: time.Unix(2, 0), Pending: []store.PendingEvent{
+		{ID: 9, Event: history.Event{Type: history.SignalReceived, Name: "go"}},
+	}})
+	if err != nil || c.Status != store.StatusContinued {
+		t.Fatalf("%v %s", err, c.Status)
+	}
+	var got []string
+	for _, ev := range c.Carry {
+		got = append(got, ev.Name+string(ev.Payload))
+	}
+	if strings.Join(got, ",") != "n1,n2" {
+		t.Fatalf("carried %v", got)
+	}
+}
+
+// The delivery log is compacted while one name stays unread (review of
+// T6.2): the carry is still right after many tasks.
+func TestCarryAfterSignalLogCompaction(t *testing.T) {
+	wf := executor.Workflow{Name: "wf", Version: 1, Run: func(ctx coro.Context, _ []byte) ([]byte, error) {
+		st := executor.FromContext(ctx)
+		for range 100 {
+			st.SignalChannel("n").Receive(ctx)
+		}
+		return nil, &executor.ContinueAsNewError{Input: []byte("x")}
+	}}
+	ex := executor.New(wf, 1, executor.Options{})
+	defer ex.Close()
+	task := &store.WorkflowTask{Now: time.Unix(1, 0), Pending: []store.PendingEvent{
+		{ID: 1, Event: startEvent()},
+		{ID: 2, Event: history.Event{Type: history.SignalReceived, Name: "debug", Payload: []byte("d")}},
+	}}
+	var c *store.Completion
+	for i := range 100 {
+		task.Pending = append(task.Pending, store.PendingEvent{ID: int64(i + 10), Event: history.Event{
+			Type: history.SignalReceived, Name: "n", Payload: []byte(strconv.Itoa(i)),
+		}})
+		var err error
+		if c, err = ex.Execute(task); err != nil {
+			t.Fatal(err)
+		}
+		task = &store.WorkflowTask{LastSeq: ex.LastSeq(), Now: time.Unix(int64(i+2), 0)}
+	}
+	if c.Status != store.StatusContinued || len(c.Carry) != 1 || c.Carry[0].Name != "debug" {
+		t.Fatalf("%s carry %+v", c.Status, c.Carry)
 	}
 }

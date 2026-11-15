@@ -68,6 +68,53 @@ type State struct {
 	// sides holds the recorded side effect values of the history being
 	// replayed, by schedule id.
 	sides map[int32][]byte
+	// sigLog lists the signals delivered to the channels, in arrival order,
+	// while some may be unread: continue-as-new carries the unread ones.
+	sigLog []history.Event
+}
+
+// unreadSignals returns the signals delivered but not received yet, in
+// arrival order: each channel's unread values are its latest deliveries.
+func (st *State) unreadSignals() []history.Event {
+	left := make(map[string]int, len(st.signals))
+	total := 0
+	for name, ch := range st.signals {
+		if n := ch.Len(); n > 0 {
+			left[name] = n
+			total += n
+		}
+	}
+	if total == 0 {
+		return nil
+	}
+	out := make([]history.Event, total)
+	for i := len(st.sigLog) - 1; i >= 0 && total > 0; i-- {
+		ev := st.sigLog[i]
+		if left[ev.Name] > 0 {
+			left[ev.Name]--
+			total--
+			out[total] = history.Event{Type: history.SignalReceived, Name: ev.Name, Payload: ev.Payload}
+		}
+	}
+	return out
+}
+
+// trimSignals keeps the signal log to the unread deliveries (amortized: it
+// compacts once the log is twice as long as what is unread).
+func (st *State) trimSignals() {
+	if len(st.sigLog) < 32 {
+		return
+	}
+	unread := 0
+	for _, ch := range st.signals {
+		unread += ch.Len()
+	}
+	if len(st.sigLog) <= 2*unread {
+		return
+	}
+	kept := st.unreadSignals()
+	clear(st.sigLog)
+	st.sigLog = append(st.sigLog[:0], kept...)
 }
 
 // call is an issued command with the future its outcome resolves. Each

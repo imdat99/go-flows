@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -251,6 +252,10 @@ func (s *Store) ReopenCompensation(ctx context.Context, instanceID string) error
 	return store.ErrNotActive
 }
 
+// cancelChildrenOfLatest is cancelChildrenOf for the latest execution of
+// instance id $1 (Terminate).
+var cancelChildrenOfLatest = strings.Replace(cancelChildrenOf, "x.parent_id = $1", "x.parent_id = "+latestOf, 1)
+
 // notifyTerminated delivers ChildFailed (terminated) to the active parent
 // of the latest execution of $1.
 const notifyTerminated = `
@@ -278,6 +283,7 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 				k AS (DELETE FROM flows.lock WHERE execution_id = `+latestOf+`)
 				DELETE FROM flows.activity_task WHERE execution_id = `+latestOf, instanceID)
 			b.Queue(notifyTerminated, instanceID, ev.Err, ev.ErrKinds)
+			b.Queue(cancelChildrenOfLatest, instanceID)
 			send := func(sb interface {
 				SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
 			},
@@ -288,7 +294,7 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 				if err := br.QueryRow().Scan(&id); err != nil {
 					return 0, err
 				}
-				for range 2 {
+				for range 3 {
 					if _, err := br.Exec(); err != nil {
 						return 0, err
 					}

@@ -145,10 +145,13 @@ func nonNil[T any](s []T) []T {
 // after a short randomized backoff. fn must be
 // all-or-nothing (one batch or one statement): a retry starts from scratch.
 //
-// Known deadlock: a parent cancelling a child (parent row, then child row)
-// while that child ends and notifies the parent (child row, then parent
-// row). Postgres detects it after deadlock_timeout (1s by default) and the
-// retry succeeds; it is rare and only costs latency.
+// Known deadlock: a parent cancelling a child (parent row, then child row:
+// a ChildCancels request, or cancelChildrenOf when the parent ends) while
+// that child ends and notifies the parent (child row, then parent row).
+// Postgres detects it after deadlock_timeout (1s by default) and the retry
+// succeeds. It costs latency on a cancel by tree whose child ends at the
+// same moment; avoiding it would need SKIP LOCKED on the child rows, which
+// risks a lost wake-up of a child completing concurrently.
 func retry(ctx context.Context, fn func() error) error {
 	var err error
 	for attempt := range maxRetries {
@@ -811,6 +814,17 @@ const (
 		INSERT INTO flows.pending_event (execution_id, visible_at, type, name, version, queue, payload)
 		SELECT id, now(), ` + typeStarted + `, $2, $3, $4, $5 FROM ins
 		RETURNING ` + notifyW + "$4)"
+	// carrySignals gives the new execution the events the old one received
+	// but had not acted on ($2 types, $3 names, $4 payloads, in order),
+	// before carryPending's (store.Completion.Carry).
+	carrySignals = `
+		INSERT INTO flows.pending_event (execution_id, visible_at, type, name, payload)
+		SELECT n.id, now(), u.type, u.name, u.payload
+		FROM unnest($2::smallint[], $3::text[], $4::bytea[]) WITH ORDINALITY AS u(type, name, payload, ord),
+		     (SELECT id FROM flows.execution
+		      WHERE instance_id = (SELECT instance_id FROM flows.execution WHERE id = $1)
+		        AND status = 'running' ORDER BY id DESC LIMIT 1) n
+		ORDER BY u.ord`
 	// carryPending copies the undelivered signals and cancel requests, in
 	// order, to the new execution (after its start event); dropEnded then
 	// deletes the originals.
@@ -835,6 +849,18 @@ const (
 		WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = $1),
 		     k AS (DELETE FROM flows.lock WHERE execution_id = $1)
 		DELETE FROM flows.activity_task WHERE execution_id = $1`
+	// cancelChildrenOf asks the active children of an ended execution $1 to
+	// cancel (cancel by tree).
+	cancelChildrenOf = `
+		WITH ch AS (
+			UPDATE flows.execution x SET ready_at = least(coalesce(x.ready_at, now()), now())
+			WHERE x.parent_id = $1 AND x.parent_id <> 0 AND x.status IN ` + activeStatuses + `
+			RETURNING x.id, x.queue, x.status <> 'needs_attention' AND (x.locked_until IS NULL OR x.locked_until <= now()) AS free
+		), ins AS (
+			INSERT INTO flows.pending_event (execution_id, visible_at, type)
+			SELECT id, now(), ` + typeCancelRequested + ` FROM ch
+		)
+		SELECT ` + notifyW + "queue) FROM ch WHERE free"
 	// notifyParent delivers the child's outcome ($2..$7) to its active
 	// parent.
 	notifyParent = `
@@ -852,34 +878,8 @@ const (
 )
 
 func validateCompletion(c *store.Completion) error {
-	for i := 1; i < len(c.History); i++ {
-		if c.History[i].Seq != c.History[i-1].Seq+1 {
-			return store.ErrInvalidCompletion
-		}
-	}
-	if c.ContinueAsNew != nil && c.Status != store.StatusContinued {
+	if !store.ValidShape(c) {
 		return store.ErrInvalidCompletion
-	}
-	ending := c.Status != "" && !c.Status.Active()
-	if ending && (len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Children) > 0 || len(c.Locks) > 0) {
-		return store.ErrInvalidCompletion
-	}
-	for _, k := range c.Locks {
-		if k.TTL <= 0 {
-			return store.ErrInvalidCompletion
-		}
-	}
-	type key struct {
-		sched int32
-		comp  bool
-	}
-	seen := make(map[key]bool, len(c.Activities))
-	for _, a := range c.Activities {
-		k := key{a.ScheduleID, a.Compensate}
-		if seen[k] {
-			return store.ErrInvalidCompletion
-		}
-		seen[k] = true
 	}
 	return nil
 }
@@ -1020,9 +1020,20 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 	if c.ContinueAsNew != nil {
 		n := c.ContinueAsNew
 		queue(continueAsNew, l.ID, n.Workflow, n.Version, n.Queue, n.Input)
+		if len(c.Carry) > 0 {
+			types := make([]int16, len(c.Carry))
+			names, payloads := make([]string, len(c.Carry)), make([][]byte, len(c.Carry))
+			for i, ev := range c.Carry {
+				types[i], names[i], payloads[i] = int16(ev.Type), ev.Name, ev.Payload
+			}
+			queue(carrySignals, l.ID, types, names, payloads)
+		}
 		queue(carryPending, l.ID)
 	}
 	queue(dropEnded, l.ID)
+	if c.Status != store.StatusContinued {
+		queue(cancelChildrenOf, l.ID)
+	}
 	if c.Status != store.StatusContinued {
 		ev := store.ChildOutcome(store.Execution{Status: c.Status, Output: c.Output, Err: c.Err, ErrKinds: c.ErrKinds})
 		queue(notifyParent, l.ID, int16(ev.Type), ev.Payload, ev.Err, ev.ErrKinds)

@@ -335,3 +335,132 @@ func testUncertainAcrossAttempts(t *testing.T, h Harness) {
 		}
 	}
 }
+
+// T6.1: an execution that ends (not by continue-as-new) or is terminated
+// asks its active children to cancel; ended children are left alone.
+func testEndCancelsChildren(t *testing.T, h Harness) {
+	s := h.New(t)
+	for _, parent := range []string{"p-end", "p-term"} {
+		mustCreate(t, s, parent)
+		task := claimOne(t, s, owner, h.TTL)
+		started(t, s, task, &store.Completion{Children: []store.NewExecution{
+			{InstanceID: parent + "-c1", Workflow: "cw", Version: 1, Queue: queue, ParentSched: 1},
+			{InstanceID: parent + "-c2", Workflow: "cw", Version: 1, Queue: queue, ParentSched: 2},
+		}})
+		// Both children start; c2 ends at once.
+		kids := claim(t, s, owner, h.TTL)
+		if len(kids) != 2 {
+			t.Fatalf("children %+v", kids)
+		}
+		for _, ct := range kids {
+			c := &store.Completion{
+				History:  []history.Event{{Seq: 1, Type: history.ExecutionStarted}},
+				Consumed: pendingIDs(ct),
+			}
+			if ct.Execution.InstanceID == parent+"-c2" {
+				c.History = append(c.History, history.Event{Seq: 2, Type: history.ExecutionCompleted})
+				c.Status = store.StatusCompleted
+			}
+			if _, err := s.CompleteWorkflowTask(ctx, ct.Lease, c); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pt := claimOne(t, s, owner, h.TTL) // c2's outcome
+		if parent == "p-end" {
+			if _, err := s.CompleteWorkflowTask(ctx, pt.Lease, &store.Completion{
+				History:  []history.Event{{Seq: 2, Type: pt.Pending[0].Event.Type, ScheduleID: 2}, {Seq: 3, Type: history.ExecutionCompleted}},
+				Consumed: pendingIDs(pt), Status: store.StatusCompleted,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			if _, err := s.CompleteWorkflowTask(ctx, pt.Lease, &store.Completion{
+				History:  []history.Event{{Seq: 2, Type: pt.Pending[0].Event.Type, ScheduleID: 2}},
+				Consumed: pendingIDs(pt),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Terminate(ctx, parent, "x"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ct := claimOne(t, s, owner, h.TTL)
+		if ct.Execution.InstanceID != parent+"-c1" || len(ct.Pending) != 1 || ct.Pending[0].Event.Type != history.ExecutionCancelRequested {
+			t.Fatalf("%s: child after the parent ended: %+v", parent, ct)
+		}
+		if _, err := s.CompleteWorkflowTask(ctx, ct.Lease, &store.Completion{
+			History:  []history.Event{{Seq: 2, Type: history.ExecutionCancelRequested}, {Seq: 3, Type: history.ExecutionCanceled}},
+			Consumed: pendingIDs(ct), Status: store.StatusCanceled,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// GW-3 (T6.2): signals the workflow received but had not read go to the
+// next execution first, then the undelivered ones, in order.
+func testContinueAsNewCarriesUnread(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "i1")
+	task := claimOne(t, s, owner, h.TTL)
+	if err := s.Signal(ctx, "i1", "s", []byte("3")); err != nil { // undelivered
+		t.Fatal(err)
+	}
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, &store.Completion{
+		History: []history.Event{
+			{Seq: 1, Type: history.ExecutionStarted}, {Seq: 2, Type: history.ExecutionContinuedAsNew},
+		},
+		Consumed: pendingIDs(task), Status: store.StatusContinued,
+		ContinueAsNew: &store.NewExecution{Workflow: "wf", Version: 1, Queue: queue},
+		Carry: []history.Event{
+			{Type: history.SignalReceived, Name: "s", Payload: []byte("1")},
+			{Type: history.SignalReceived, Name: "t", Payload: []byte("2")},
+			{Type: history.ExecutionCancelRequested},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	next := claimOne(t, s, owner, h.TTL)
+	var got []string
+	for _, p := range next.Pending[1:] {
+		got = append(got, p.Event.Type.String()+":"+p.Event.Name+string(p.Event.Payload))
+	}
+	if next.Pending[0].Event.Type != history.ExecutionStarted || !slices.Equal(got, []string{
+		"SignalReceived:s1", "SignalReceived:t2", "ExecutionCancelRequested:", "SignalReceived:s3",
+	}) {
+		t.Fatalf("next execution got %v", got)
+	}
+	// Carry without continue-as-new is invalid.
+	if _, err := s.CompleteWorkflowTask(ctx, next.Lease, &store.Completion{Carry: []history.Event{{Type: history.SignalReceived}}}); !errors.Is(err, store.ErrInvalidCompletion) {
+		t.Fatalf("carry alone: %v", err)
+	}
+}
+
+// T6.2: continue-as-new leaves the children running (detached).
+func testContinueAsNewLeavesChildren(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "p")
+	task := claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{Children: []store.NewExecution{{InstanceID: "kid", Workflow: "cw", Version: 1, Queue: queue, ParentSched: 1}}})
+	kid := claimOne(t, s, owner, h.TTL)
+	started(t, s, kid, nil)
+	if err := s.Signal(ctx, "p", "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	pt := claimOne(t, s, owner, h.TTL)
+	if _, err := s.CompleteWorkflowTask(ctx, pt.Lease, &store.Completion{
+		History:  []history.Event{{Seq: 2, Type: history.SignalReceived, Name: "x"}, {Seq: 3, Type: history.ExecutionContinuedAsNew}},
+		Consumed: pendingIDs(pt), Status: store.StatusContinued,
+		ContinueAsNew: &store.NewExecution{Workflow: "wf", Version: 1, Queue: queue},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range claim(t, s, owner, h.TTL) {
+		if task.Execution.InstanceID == "kid" {
+			t.Fatalf("the kid got %+v", task.Pending)
+		}
+	}
+	if e, _ := s.GetExecution(ctx, "kid"); e.Status != store.StatusRunning {
+		t.Fatalf("kid %s", e.Status)
+	}
+}

@@ -299,7 +299,17 @@ func (e *Executor) Execute(task *store.WorkflowTask) (c *store.Completion, err e
 	if st.end != nil && !wasFinished { // this task recorded the end
 		c.Status, c.Output, c.Err, c.ErrKinds = st.end.status, st.end.output, st.end.err, st.end.kinds
 		c.ContinueAsNew = st.end.next
+		if c.Status == store.StatusContinued {
+			// GW-3: signals delivered to the workflow (this task included,
+			// after it decided to continue) but not read go on, and so does
+			// a cancel request it did not act on.
+			c.Carry = st.unreadSignals()
+			if st.root.Err() != nil {
+				c.Carry = append(c.Carry, history.Event{Type: history.ExecutionCancelRequested})
+			}
+		}
 	}
+	st.trimSignals()
 	return c, nil
 }
 
@@ -413,6 +423,7 @@ func (e *Executor) apply(ev *history.Event) error {
 		st.startMain(ev.Queue, ev.Payload)
 	case history.SignalReceived:
 		_, _ = st.signal(ev.Name).TrySend(ev.Payload) // unbounded and never closed: cannot fail
+		st.sigLog = append(st.sigLog, history.Event{Name: ev.Name, Payload: ev.Payload})
 	case history.ExecutionCancelRequested:
 		st.cancelRoot()
 	case history.LockLost:

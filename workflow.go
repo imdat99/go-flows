@@ -138,8 +138,10 @@ func (w *Workflow[I, O]) Child(c Ctx, instanceID string, in I) *Future[O] {
 
 // ContinueAsNew ends the running execution and starts the next one of the
 // same instance with in (return its error from the workflow function): a
-// long-lived workflow keeps its history short this way. Undelivered signals
-// move to the next execution.
+// long-lived workflow keeps its history short this way. Signals not read
+// yet (delivered or not) move to the next execution, in order; children the
+// execution started run on, detached from it. Any other end asks running
+// children to cancel.
 func ContinueAsNew[I any](c Ctx, in I) error {
 	b, err := newCodec[I]().encode(in)
 	if err != nil {
