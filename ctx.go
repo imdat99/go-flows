@@ -312,3 +312,33 @@ func Await[T any](c Ctx, name string, timeout time.Duration) (T, error) {
 	)
 	return v, err
 }
+
+// WaitGroup waits for coroutines started with Go, deterministically (a
+// sync.WaitGroup would block the workflow). The zero value is ready, and it
+// can be reused once its counter reached zero and its waiters returned (as
+// with sync.WaitGroup, an Add from zero while a Wait is returning makes it
+// wait again). A negative counter panics, failing the workflow.
+type WaitGroup struct{ wg coro.WaitGroup }
+
+// Add adds n to the counter.
+func (w *WaitGroup) Add(n int) {
+	if err := w.wg.Add(n); err != nil {
+		panic(Permanent(fmt.Errorf("flows: WaitGroup.Add(%d): %w", n, err)))
+	}
+}
+
+// Done decrements the counter.
+func (w *WaitGroup) Done() {
+	if err := w.wg.Done(); err != nil {
+		panic(Permanent(fmt.Errorf("flows: WaitGroup.Done: %w", err)))
+	}
+}
+
+// Wait waits until the counter is zero (nil), or c is canceled first
+// (ErrCanceled; the coroutines run on).
+func (w *WaitGroup) Wait(c Ctx) error {
+	if w.wg.WaitCtx(c.inner()) {
+		return nil
+	}
+	return c.Err()
+}

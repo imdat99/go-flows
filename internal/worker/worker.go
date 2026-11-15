@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/imdat99/go-flows/internal/executor"
@@ -169,7 +170,18 @@ type Worker struct {
 	pollers    sync.WaitGroup // pollers and watch
 	beat       sync.WaitGroup // heartbeat
 	tasks      sync.WaitGroup // in-flight tasks
-	started    bool
+	// detached counts the recorders of detached eager outcomes (driver
+	// detach): the only tasks that hold no slot (Busy).
+	detached atomic.Int64
+	started  bool
+}
+
+// Busy reports whether the worker is claiming or running anything (a test
+// driver of virtual time waits for it to be idle before moving the clock).
+// Every task holds a slot for its whole life (claims take them first),
+// except detached recorders, counted apart.
+func (w *Worker) Busy() bool {
+	return len(w.wfSlots) > 0 || len(w.actSlots) > 0 || w.detached.Load() > 0
 }
 
 // New returns a stopped worker.

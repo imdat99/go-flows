@@ -261,7 +261,20 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
     - Review: lần 1 không đạt (H1 child mở lại treo vì việc nó bỏ lại; M1 purge xoá mất child). Lần 2 đạt.
 
 ### P7 — Công cụ
-- [ ] **T7.1** `flowtest`: store bộ nhớ, đồng hồ ảo tất định, mock activity, phát hiện future còn treo (GW-17). Test các kịch bản #494, #481, #436, #377.
+- [x] **T7.1** `flowtest`: store bộ nhớ, đồng hồ ảo tất định, mock activity, phát hiện future còn treo (GW-17). Test các kịch bản #494, #481, #436, #377.
+  - T7.1: package `flowtest` chạy engine thật trên store bộ nhớ với đồng hồ ảo.
+    - **Thời gian ảo:** chỉ nhảy khi engine rảnh (`worker.Busy` và `mem.Store.Wake(owner, queues)`), tới mốc kế tiếp. Không có gì chạy theo đồng hồ thật, nên tránh được #494 và #481. Workflow không thể kết thúc thì trả về `ErrBlocked` ngay.
+    - **Mock:** theo từng tester (`OnActivity`, `OnCompensator`), dùng chung code dựng runner với `DefineActivity`; đi qua `internal/bridge`.
+    - **Future còn treo:** báo các activity và child chưa được await (#436).
+    - **Tiện ích:** `SignalAfter`, `Advance`, `Settle`, `EventTypes`.
+    - **API mới:** `flows.WaitGroup` (dùng lại được, `Wait` tôn trọng cancel).
+    - **Test:** `TestGW17_494/481/436/377_*`, hàng đợi không ai phục vụ, thời gian đứng yên khi activity chạy, mock compensator.
+    - **Bench:** `BenchmarkFanOut` 16/64/256: khoảng 5/6–10/10–18 ms, gần tuyến tính (#377).
+    - **Còn mở (thấp):**
+      - `Wake` quét toàn bộ execution;
+      - activity chờ cancel do timer của workflow gửi thì không thể kết thúc được (đã ghi trong tài liệu, kèm `ErrNeverIdle`);
+      - **T8:** test conformance pg `LockRenewal` dùng sleep thật, từng flake một lần khi máy tải nặng; cần làm chắc lại.
+    - **Review:** lần 1 không đạt (H1 alloc/task trên đường nóng; H2 test #494 và #481 không tái hiện lỗi; M2 hàng đợi không ai phục vụ treo 30s; M3/M4 mock; M6 WaitGroup). Lần 2 không đạt (`Wait` bỏ qua cancel). Lần 3 đạt.
 - [ ] **T7.2** Port `analyzer` theo API mới.
 - [ ] **T7.3** ⚡ OpenTelemetry tracing và metrics (tắt thì không tốn alloc).
 

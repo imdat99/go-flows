@@ -456,3 +456,58 @@ func TestZeroCtxPanicsWithErrNotInWorkflow(t *testing.T) {
 		}()
 	}
 }
+
+// A WaitGroup can be reused once its counter reached zero; Wait at zero
+// returns nil.
+var reuseWG = DefineWorkflow("test.reuse-wg", 1, func(c Ctx, _ int) (int, error) {
+	var wg WaitGroup
+	n := 0
+	for range 2 {
+		wg.Add(1)
+		Go(c, func(Ctx) { n++; wg.Done() })
+		if err := wg.Wait(c); err != nil {
+			return 0, err
+		}
+		if err := Sleep(c, time.Millisecond); err != nil {
+			return 0, err
+		}
+	}
+	return n, wg.Wait(c)
+})
+
+func TestWaitGroupReuse(t *testing.T) {
+	e := testEngine(t)
+	if n, err := reuseWG.Run(waitCtx(t), e, "reuse-wg", 0); err != nil || n != 2 {
+		t.Fatalf("%d %v", n, err)
+	}
+}
+
+// WaitGroup.Wait returns ErrCanceled when the workflow is canceled first.
+var cancelWG = DefineWorkflow("test.cancel-wg", 1, func(c Ctx, _ int) (string, error) {
+	var wg WaitGroup
+	wg.Add(1)
+	dc, _ := Disconnected(c)
+	Go(dc, func(c Ctx) {
+		defer wg.Done()
+		_ = Sleep(c, time.Hour)
+	})
+	if err := wg.Wait(c); errors.Is(err, ErrCanceled) {
+		return "canceled", nil
+	}
+	return "not canceled", nil
+})
+
+func TestWaitGroupWaitHonorsCancel(t *testing.T) {
+	e := testEngine(t)
+	h, err := cancelWG.Start(bg, e, "cancel-wg", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return historyHas(e, "cancel-wg", "TimerScheduled") })
+	if err := e.Cancel(bg, "cancel-wg"); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := h.Wait(waitCtx(t)); err != nil || out != "canceled" {
+		t.Fatalf("%q %v", out, err)
+	}
+}

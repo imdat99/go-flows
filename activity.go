@@ -89,6 +89,7 @@ type Activity[I, O, C any] struct {
 	queue string
 	in    codec[I]
 	out   codec[O]
+	cfg   activityConfig
 }
 
 // DefineActivity defines an activity called name (stable: it is recorded).
@@ -101,10 +102,21 @@ func DefineActivity[I, O, C any](name string, invoke InvokeFunc[I, O, C], compen
 	for _, o := range opts {
 		o(&cfg)
 	}
-	a := &Activity[I, O, C]{name: name, queue: cfg.queue, in: newCodec[I](), out: newCodec[O]()}
-	comp := newCodec[C]()
-	run := &worker.Activity{
-		Retry: cfg.retry, Timeout: cfg.timeout,
+	a := &Activity[I, O, C]{name: name, queue: cfg.queue, in: newCodec[I](), out: newCodec[O](), cfg: cfg}
+	var compensator *worker.Activity
+	if compensate != nil {
+		compensator = a.compensator(compensate)
+	}
+	registerActivity(name, a.invoker(invoke, compensate != nil), compensator)
+	return a
+}
+
+// invoker runs invoke for an activity task; withComp stores its
+// compensation data.
+func (a *Activity[I, O, C]) invoker(invoke InvokeFunc[I, O, C], withComp bool) *worker.Activity {
+	name, comp := a.name, newCodec[C]()
+	return &worker.Activity{
+		Retry: a.cfg.retry, Timeout: a.cfg.timeout,
 		Run: func(ctx context.Context, t *store.ActivityTask) ([]byte, []byte, error) {
 			in, err := a.in.decode(t.Input)
 			if err != nil {
@@ -115,7 +127,7 @@ func DefineActivity[I, O, C any](name string, invoke InvokeFunc[I, O, C], compen
 				err = fmt.Errorf("%w: %w", ErrTimeout, err)
 			}
 			var cb []byte
-			if compensate != nil { // without a compensator nothing is stored
+			if withComp { // without a compensator nothing is stored
 				var cerr error
 				if cb, cerr = comp.encode(c); cerr != nil {
 					if err != nil {
@@ -136,24 +148,24 @@ func DefineActivity[I, O, C any](name string, invoke InvokeFunc[I, O, C], compen
 			return ob, cb, nil
 		},
 	}
-	var compensator *worker.Activity
-	if compensate != nil {
-		compensator = &worker.Activity{
-			Retry: cfg.compRetry, Timeout: cfg.timeout,
-			Run: func(ctx context.Context, t *store.ActivityTask) ([]byte, []byte, error) {
-				c, err := comp.decode(t.Input)
-				if err != nil {
-					return nil, nil, Permanent(fmt.Errorf("decode compensation data of %s: %w", name, err))
-				}
-				if t.Uncertain {
-					ctx = context.WithValue(ctx, uncertainKey{}, true)
-				}
-				return nil, nil, compensate(ctx, activityKey(t), c)
-			},
-		}
+}
+
+// compensator runs compensate for a compensation task.
+func (a *Activity[I, O, C]) compensator(compensate CompensateFunc[C]) *worker.Activity {
+	name, comp := a.name, newCodec[C]()
+	return &worker.Activity{
+		Retry: a.cfg.compRetry, Timeout: a.cfg.timeout,
+		Run: func(ctx context.Context, t *store.ActivityTask) ([]byte, []byte, error) {
+			c, err := comp.decode(t.Input)
+			if err != nil {
+				return nil, nil, Permanent(fmt.Errorf("decode compensation data of %s: %w", name, err))
+			}
+			if t.Uncertain {
+				ctx = context.WithValue(ctx, uncertainKey{}, true)
+			}
+			return nil, nil, compensate(ctx, activityKey(t), c)
+		},
 	}
-	registerActivity(name, run, compensator)
-	return a
 }
 
 // Name returns the activity's name.

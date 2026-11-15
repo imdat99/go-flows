@@ -14,10 +14,11 @@ type WaitGroup struct {
 	done Future[struct{}]
 }
 
-// Add adds delta to the counter.
+// Add adds delta to the counter. A group whose counter reached zero is
+// reused by adding to it again (its earlier waiters were released).
 func (wg *WaitGroup) Add(delta int) error {
-	if wg.done.set && delta > 0 {
-		return ErrGroupMisuse
+	if wg.done.set && delta > 0 && wg.n == 0 {
+		wg.done = Future[struct{}]{}
 	}
 	wg.n += delta
 	if wg.n < 0 {
@@ -36,6 +37,24 @@ func (wg *WaitGroup) Done() error {
 		wg.done.Set(struct{}{}, nil)
 	}
 	return nil
+}
+
+// Count returns the counter.
+func (wg *WaitGroup) Count() int { return wg.n }
+
+// WaitCtx blocks until the counter is zero (true) or ctx is canceled
+// first (false).
+func (wg *WaitGroup) WaitCtx(ctx Context) bool {
+	if wg.n == 0 {
+		return true
+	}
+	done := false
+	cases := []Case{OnFuture(&wg.done, func(Context, struct{}, error) { done = true })}
+	if d := ctx.Done(); d != nil {
+		cases = append(cases, OnReceive(d, func(Context, struct{}, bool) {}))
+	}
+	Select(ctx, cases...)
+	return done
 }
 
 // Wait blocks until the counter is zero.

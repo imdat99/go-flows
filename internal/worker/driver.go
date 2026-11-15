@@ -136,7 +136,9 @@ func (d *driver) detach() {
 	}
 	n, results, w := d.inflight, d.results, d.w
 	d.inflight = 0
+	w.detached.Add(1) // before the driver releases its slot
 	w.tasks.Go(func() {
+		defer w.detached.Add(-1)
 		for range n {
 			r := <-results
 			if _, _, err := w.record(context.WithoutCancel(w.taskCtx()), &r.task, r.outcome, nil); err != nil {

@@ -74,6 +74,10 @@ func New(pool *pgxpool.Pool, opts Options) (*Engine, error) {
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error { return pg.Migrate(ctx, pool) }
 
 func newEngine(st store.Store, opts Options) (*Engine, error) {
+	return newEngineWith(st, workerRegistry{}, opts)
+}
+
+func newEngineWith(st store.Store, acts worker.Activities, opts Options) (*Engine, error) {
 	if opts.InstanceID == "" {
 		host, _ := os.Hostname()
 		var b [4]byte
@@ -97,7 +101,7 @@ func newEngine(st store.Store, opts Options) (*Engine, error) {
 	if opts.Observer != nil {
 		obs = observer{opts.Observer}
 	}
-	w, err := worker.New(st, workerRegistry{}, workerRegistry{}, worker.Options{
+	w, err := worker.New(st, workerRegistry{}, acts, worker.Options{
 		Owner: opts.InstanceID, Queues: opts.Queues, LeaseTTL: opts.LeaseTTL,
 		MaxWorkflowTasks: opts.MaxWorkflowTasks, MaxActivities: opts.MaxActivities,
 		Eager: !opts.DisableEager, EagerWindow: opts.EagerWindow, StickyFor: opts.StickyFor,

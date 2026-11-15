@@ -242,6 +242,57 @@ func (e *execution) readyAt(now time.Time) (time.Time, bool) {
 
 func contains(queues []string, q string) bool { return slices.Contains(queues, q) }
 
+// Wake reports, for a test driver of virtual time (flowtest), whether some
+// task of the queues is claimable by owner now, and otherwise the earliest
+// store time at which one becomes claimable (ok false: none ever will
+// without new input). Work on other queues is ignored (nobody runs it).
+func (s *Store) Wake(owner string, queues []string) (ready bool, next time.Time, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.clock.Now()
+	consider := func(at time.Time) {
+		if !at.After(now) {
+			ready = true
+			return
+		}
+		if !ok || at.Before(next) {
+			next, ok = at, true
+		}
+	}
+	for _, e := range s.executions {
+		if !claimable(e.Status) || len(e.pending) == 0 || !contains(queues, e.Queue) {
+			continue
+		}
+		earliest := e.pending[0].visibleAt
+		for _, p := range e.pending[1:] {
+			if p.visibleAt.Before(earliest) {
+				earliest = p.visibleAt
+			}
+		}
+		at := latest(earliest, e.lockedUntil, e.notBefore)
+		if e.stickyOwner != "" && e.stickyOwner != owner {
+			at = latest(at, e.stickyUntil)
+		}
+		consider(at)
+	}
+	for _, t := range s.tasks {
+		if contains(queues, t.Queue) {
+			consider(latest(t.visibleAt, t.lockedUntil))
+		}
+	}
+	return ready, next, ok
+}
+
+func latest(ts ...time.Time) time.Time {
+	var m time.Time
+	for _, t := range ts {
+		if t.After(m) {
+			m = t
+		}
+	}
+	return m
+}
+
 // claimable reports whether executions in status s run workflow tasks.
 func claimable(s store.Status) bool { return s == store.StatusRunning || s == store.StatusCompensating }
 
