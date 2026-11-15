@@ -310,6 +310,9 @@ func (s *Store) CompleteWorkflowTask(_ context.Context, l store.Lease, c *store.
 	if c.Status != "" && c.Status != e.Status {
 		e.Status = c.Status
 	}
+	if c.Status == store.StatusNeedsAttention {
+		e.Err, e.ErrKinds = c.Err, c.ErrKinds // the reason, for an operator
+	}
 	if !e.Status.Active() {
 		s.end(e, c, now)
 	}

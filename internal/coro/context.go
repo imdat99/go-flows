@@ -42,6 +42,7 @@ type cancelCtx struct {
 	parent   *cancelCtx // linked parent, nil if none or disconnected
 	done     *Channel[struct{}]
 	children []*cancelCtx
+	hooks    []Hook // Watch registrations
 	err      error
 	cause    error
 }
@@ -111,6 +112,14 @@ func (c *cancelCtx) cancel(err, cause error, unlink bool) {
 		child.cancel(err, cause, false)
 	}
 	c.children = nil
+	hooks := c.hooks
+	c.hooks = nil
+	for _, h := range hooks {
+		h.slot().ctx = nil
+	}
+	for _, h := range hooks {
+		h.OnCancel()
+	}
 	if p := c.parent; unlink && p != nil {
 		for i, x := range p.children {
 			if x == c {
@@ -156,4 +165,77 @@ func Go(ctx Context, fn func(Context)) {
 		fn(ctx)
 		return nil
 	})
+}
+
+// Hook is notified when a watched context is canceled. Implementations
+// embed a HookSlot, which holds the registration: watching then needs no
+// allocation of its own (the executor's per-command state is the hook).
+type Hook interface {
+	OnCancel()
+	slot() *HookSlot
+}
+
+// HookSlot is the registration of a Hook; embed it in the hook's type.
+type HookSlot struct {
+	ctx *cancelCtx // watched context, nil when not watching
+	idx int        // position in ctx.hooks
+}
+
+func (s *HookSlot) slot() *HookSlot { return s }
+
+// Watch arranges for h.OnCancel to run when ctx is canceled, in the
+// coroutine or executor code that cancels it (deterministically, without a
+// coroutine of its own). OnCancel runs at once if ctx is already canceled,
+// and never if ctx cannot be canceled. A hook watches one context at a
+// time.
+func Watch(ctx Context, h Hook) {
+	if h.slot().ctx != nil {
+		Unwatch(h) // a hook watches one context at a time
+	}
+	c, ok := ctx.Value(cancelCtxKey{}).(*cancelCtx)
+	if !ok {
+		return
+	}
+	if c.err != nil {
+		h.OnCancel()
+		return
+	}
+	s := h.slot()
+	s.ctx, s.idx = c, len(c.hooks)
+	c.hooks = append(c.hooks, h)
+}
+
+// Unwatch stops h from being notified (O(1)) and reports whether it was
+// watching.
+func Unwatch(h Hook) bool {
+	s := h.slot()
+	c := s.ctx
+	if c == nil {
+		return false
+	}
+	last := len(c.hooks) - 1
+	if s.idx != last {
+		moved := c.hooks[last]
+		c.hooks[s.idx] = moved
+		moved.slot().idx = s.idx
+	}
+	c.hooks[last] = nil
+	c.hooks = c.hooks[:last]
+	s.ctx = nil
+	return true
+}
+
+type funcHook struct {
+	HookSlot
+	fn func()
+}
+
+func (h *funcHook) OnCancel() { h.fn() }
+
+// AfterCancel is Watch for a function. The returned stop function
+// unregisters fn and reports whether it did so before fn ran.
+func AfterCancel(ctx Context, fn func()) (stop func() bool) {
+	h := &funcHook{fn: fn}
+	Watch(ctx, h)
+	return func() bool { return Unwatch(h) }
 }

@@ -112,7 +112,8 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
   - T2.12 (phía store): `store.Watcher`, kèm `pg_notify` đi qua `RETURNING` trên các đường tạo việc cho owner khác (đường eager không phát notify vì NOTIFY lấy lock toàn cục khi commit), LISTEN trên một kết nối hijack, và `Watch` cho store bộ nhớ. Poll có backoff thì làm ở T3.4 (worker). Review: lần 1 đạt; các ghi chú (hint khi release hoặc retry với delay 0, `wake` không được chặn, timeout khi đóng kết nối, test ổn định hơn, kiểm tra đường eager không phát notify) đã sửa.
 
 ### P3 — Executor và worker
-- [ ] **T3.1** ⚡ Executor replay và catch-up trên runtime P1; so khớp loại, tên, `arg_hash`, thời lượng timer; replay ngắn hơn lịch sử → non-determinism (GW-11). Bench `BenchmarkReplay`.
+- [x] **T3.1** ⚡ Executor replay và catch-up trên runtime P1; so khớp loại, tên, `arg_hash`, thời lượng timer; replay ngắn hơn lịch sử → non-determinism (GW-11). Bench `BenchmarkReplay`.
+  - T3.1: `BenchmarkReplay` (cache lạnh, 302 event): **732 → 129 alloc** (chỉ còn khoảng 0.43 alloc mỗi event; mỗi command là 1 struct, hook qua interface, waiter đầu tiên lưu inline), khoảng 0.8–0.9 µs mỗi event. Review: lần 1 không đạt (`SideEffect` làm lệch thứ tự lệnh khi replay; workflow kết thúc sớm không bị phát hiện; `Execute` sau khi đã xong; executor không bị đánh dấu hỏng; `Watch` hai lần). Lần 2 đạt có điều kiện (replay chia batch giữa một task). Lần 3 đạt; hồi quy hiệu năng khi giữ phần đuôi đã sửa.
 - [ ] **T3.2** Non-determinism, workflow chưa đăng ký, version lạ → park `needs_attention` hoặc bàn giao, không fail (GW-11, GW-12).
 - [ ] **T3.3** ⚡ Cache sticky: mutex theo instance, khoá cache theo `(exec, seq, lease_version)`, evict khi có lỗi, giới hạn theo byte (GW-9).
 - [ ] **T3.4** Worker/dispatcher: slot, `recover` ở mọi biên, Stop bàn giao trong một transaction.

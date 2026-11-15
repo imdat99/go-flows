@@ -189,7 +189,8 @@ type Completion struct {
 	// instance id); ids that are not active children are ignored.
 	ChildCancels []string
 	// Status is the execution's status after the task. A non-active status
-	// ends the execution (Output, Err, ErrKinds apply).
+	// ends the execution (Output, Err, ErrKinds apply). With
+	// StatusNeedsAttention, Err and ErrKinds record the reason.
 	Status   Status
 	Output   []byte
 	Err      string

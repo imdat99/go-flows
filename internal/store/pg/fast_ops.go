@@ -204,6 +204,8 @@ func (s *Store) endFast(fb *fastBatch, l store.Lease, c *store.Completion, endin
 			fb.Int(micros(c.KeepFor))
 			fb.Int(micros(c.StickyFor))
 			fb.Str(l.Owner)
+			fb.Str(c.Err)
+			fb.Str(c.ErrKinds)
 		})
 		return
 	}

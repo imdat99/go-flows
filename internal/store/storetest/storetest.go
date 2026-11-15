@@ -1110,7 +1110,10 @@ func testExpiredLeaseStillValid(t *testing.T, h Harness) {
 func testParkedStatuses(t *testing.T, h Harness) {
 	s := h.New(t)
 	mustCreate(t, s, "parked")
-	started(t, s, claimOne(t, s, owner, h.TTL), &store.Completion{Status: store.StatusNeedsAttention})
+	started(t, s, claimOne(t, s, owner, h.TTL), &store.Completion{Status: store.StatusNeedsAttention, Err: "non-deterministic"})
+	if e, _ := s.GetExecution(ctx, "parked"); e.Err != "non-deterministic" {
+		t.Fatalf("park reason %q", e.Err)
+	}
 	if err := s.Signal(ctx, "parked", "x", nil); err != nil {
 		t.Fatalf("signal to needs_attention: %v", err)
 	}

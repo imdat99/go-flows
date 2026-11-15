@@ -25,3 +25,7 @@ BenchmarkHashArgs allocs/op <= 0
 # Latency is fsync-bound (~11.7 ms on the dev box, 2 commits): no rule.
 BenchmarkEagerActivity allocs/op <= 56
 BenchmarkEagerActivity B/op <= 11264
+
+# internal/executor (T3.1): cold replay of a 100-activity history (302
+# events): measured 130 allocs (~0.43 per event), ~750 ns/event.
+BenchmarkReplay allocs/op <= 140

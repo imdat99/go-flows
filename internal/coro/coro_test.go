@@ -407,3 +407,70 @@ func TestWaitGroupAndErrGroup(t *testing.T) {
 		t.Fatalf("wg=%v err=%v canceled=%v", wgDone, groupErr, canceled)
 	}
 }
+
+func TestAfterCancel(t *testing.T) {
+	s := newSched(t)
+	ctx, cancel := WithCancel(s.Root())
+	var order []int
+	AfterCancel(ctx, func() { order = append(order, 1) })
+	stop := AfterCancel(ctx, func() { order = append(order, 2) })
+	AfterCancel(ctx, func() { order = append(order, 3) })
+	child, _ := WithCancel(ctx)
+	AfterCancel(child, func() { order = append(order, 0) }) // children first
+	if !stop() || stop() {
+		t.Fatal("stop must succeed once")
+	}
+	cancel()
+	if want := []int{0, 1, 3}; !slices.Equal(order, want) {
+		t.Fatalf("order %v, want %v", order, want)
+	}
+	ran := false
+	AfterCancel(ctx, func() { ran = true }) // already canceled: runs at once
+	if !ran {
+		t.Fatal("hook on a canceled context did not run")
+	}
+	never := AfterCancel(s.Root(), func() { t.Error("root is never canceled") })
+	if never() {
+		t.Fatal("stop on an uncancelable context reports registration")
+	}
+	if n := len(ctx.(*cancelCtx).hooks); n != 0 {
+		t.Fatalf("hooks kept after cancel: %d", n)
+	}
+}
+
+// Watching a hook that already watches another context moves it.
+func TestWatchTwiceMovesTheHook(t *testing.T) {
+	s := newSched(t)
+	a, cancelA := WithCancel(s.Root())
+	b, cancelB := WithCancel(s.Root())
+	n := 0
+	h := &funcHook{fn: func() { n++ }}
+	Watch(a, h)
+	Watch(b, h)
+	cancelA()
+	if n != 0 || len(a.(*cancelCtx).hooks) != 0 {
+		t.Fatalf("hook still on the first context: n=%d", n)
+	}
+	cancelB()
+	if n != 1 {
+		t.Fatalf("hook ran %d times", n)
+	}
+}
+
+// Watching an uncancelable or canceled context also leaves the old one.
+func TestWatchElsewhereLeavesTheOldContext(t *testing.T) {
+	s := newSched(t)
+	a, cancelA := WithCancel(s.Root())
+	canceled, cancelNow := WithCancel(s.Root())
+	cancelNow()
+	n := 0
+	h := &funcHook{fn: func() { n++ }}
+	Watch(a, h)
+	Watch(s.Root(), h) // never canceled
+	Watch(a, h)
+	Watch(canceled, h) // runs at once
+	cancelA()
+	if n != 1 {
+		t.Fatalf("hook ran %d times, want 1", n)
+	}
+}

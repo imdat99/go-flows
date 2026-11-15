@@ -637,7 +637,8 @@ const cancelChildren = `
 
 // updateRunning closes a task that leaves the execution active: $2 last
 // seq (0: unchanged), $3 status (empty: unchanged), $4 keep-for, $5
-// sticky-for, $6 owner. The lease is kept only while the execution stays
+// sticky-for, $6 owner, $7/$8 the reason of a park (needs_attention).
+// The lease is kept only while the execution stays
 // claimable. Released with work visible, it notifies other owners.
 const updateRunning = `
 	WITH v AS (
@@ -648,6 +649,8 @@ const updateRunning = `
 	UPDATE flows.execution e
 	SET last_seq = CASE WHEN $2::bigint > 0 THEN $2::bigint ELSE e.last_seq END,
 	    status = v.status,
+	    err = CASE WHEN $3::text = 'needs_attention' THEN $7::text ELSE e.err END,
+	    err_kinds = CASE WHEN $3::text = 'needs_attention' THEN $8::text ELSE e.err_kinds END,
 	    ready_at = CASE WHEN v.keep
 	        THEN least((SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
 	                   now() + $4 * interval '1 microsecond')
@@ -851,7 +854,7 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		queue(cancelChildren, l.ID, c.ChildCancels)
 	}
 	if !ending {
-		queue(updateRunning, l.ID, lastSeq, string(c.Status), micros(c.KeepFor), micros(c.StickyFor), l.Owner)
+		queue(updateRunning, l.ID, lastSeq, string(c.Status), micros(c.KeepFor), micros(c.StickyFor), l.Owner, c.Err, c.ErrKinds)
 		return
 	}
 	queue(endExecution, l.ID, lastSeq, string(c.Status), c.Output, c.Err, c.ErrKinds)
