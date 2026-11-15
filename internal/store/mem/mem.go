@@ -8,6 +8,7 @@ import (
 	"cmp"
 	"context"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -304,7 +305,7 @@ func (s *Store) CompleteWorkflowTask(_ context.Context, l store.Lease, c *store.
 	if c.Status != "" && c.Status != e.Status {
 		e.Status = c.Status
 	}
-	if c.Status == store.StatusNeedsAttention {
+	if c.Status == store.StatusNeedsAttention || c.Status == store.StatusCompensating {
 		e.Err, e.ErrKinds = c.Err, c.ErrKinds // the reason, for an operator
 	}
 	if !e.Status.Active() {
@@ -331,6 +332,9 @@ func (s *Store) cancelRequests(e *execution, c *store.Completion, now time.Time)
 	for _, t := range s.tasks {
 		if t.ExecutionID == e.ID && !t.Compensate && slices.Contains(c.CanceledActivities, t.ScheduleID) {
 			t.cancelRequested = true
+			if t.Lease.Owner == "" && t.visibleAt.After(now) {
+				t.visibleAt = now // waiting for a retry: claimable at once
+			}
 		}
 	}
 	for _, id := range c.ChildCancels {
@@ -410,7 +414,7 @@ func (s *Store) createActivities(e *execution, owner string, acts []store.NewAct
 	for _, a := range acts {
 		t := &activityTask{
 			ExecutionID: e.ID, InstanceID: e.InstanceID, ScheduleID: a.ScheduleID, Name: a.Name,
-			Queue: a.Queue, Input: clone(a.Input), Compensate: a.Compensate, visibleAt: now,
+			Queue: a.Queue, Input: clone(a.Input), Compensate: a.Compensate, Uncertain: a.Uncertain, visibleAt: now,
 		}
 		t.Lease.ID = s.id()
 		t.created = t.Lease.ID
@@ -582,7 +586,7 @@ func (s *Store) ExtendActivityTask(_ context.Context, l store.Lease, ttl time.Du
 
 // CompleteActivityTask implements store.Store.
 func (s *Store) CompleteActivityTask(_ context.Context, l store.Lease, r store.ActivityResult) (*store.WorkflowTask, error) {
-	if r.Event.Type != history.ActivityCompleted && r.Event.Type != history.ActivityFailed {
+	if !store.ValidResult(r.Event.Type) {
 		return nil, store.ErrInvalidCompletion
 	}
 	s.mu.Lock()
@@ -635,6 +639,24 @@ func (s *Store) Signal(_ context.Context, instanceID, name string, payload []byt
 // RequestCancel implements store.Store.
 func (s *Store) RequestCancel(_ context.Context, instanceID string) error {
 	return s.deliver(instanceID, history.Event{Type: history.ExecutionCancelRequested})
+}
+
+// ReopenCompensation implements store.Store.
+func (s *Store) ReopenCompensation(_ context.Context, instanceID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.latest[instanceID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	e := s.executions[id]
+	if e.Status != store.StatusNeedsAttention || !slices.Contains(strings.Split(e.ErrKinds, ","), store.KindCompensationFailed) {
+		return store.ErrNotActive
+	}
+	e.Status = store.StatusCompensating
+	s.addPending(e, history.Event{Type: history.CompensationRetryRequested}, s.clock.Now())
+	s.hint(store.WorkflowWork, e.Queue)
+	return nil
 }
 
 func (s *Store) deliver(instanceID string, ev history.Event) error {

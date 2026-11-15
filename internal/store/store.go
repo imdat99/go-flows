@@ -75,6 +75,9 @@ const (
 	KindTerminated = "terminated"
 	// KindCompensated means the child failed and was compensated.
 	KindCompensated = "compensated"
+	// KindCompensationFailed marks the reason of an execution parked because
+	// a compensation failed for good; ReopenCompensation resumes only those.
+	KindCompensationFailed = "compensation_failed"
 )
 
 // Status of an execution. Values are stored: never change them.
@@ -190,11 +193,13 @@ type Completion struct {
 	ChildCancels []string
 	// CanceledActivities are schedule ids of activities whose context the
 	// workflow canceled: their tasks are marked, and RenewLeases reports
-	// them so the worker running them cancels them (GW-13).
+	// them so the worker running them cancels them (GW-13). A task waiting
+	// for a retry becomes claimable at once (its claim records the cancel).
 	CanceledActivities []int32
 	// Status is the execution's status after the task. A non-active status
 	// ends the execution (Output, Err, ErrKinds apply). With
-	// StatusNeedsAttention, Err and ErrKinds record the reason.
+	// StatusNeedsAttention, Err and ErrKinds record the reason; with
+	// StatusCompensating, the workflow's error.
 	Status   Status
 	Output   []byte
 	Err      string
@@ -220,6 +225,9 @@ type NewActivityTask struct {
 	Queue      string
 	Input      []byte
 	Compensate bool // a compensation attempt instead of an invocation
+	// Uncertain tells a compensator that the activity it undoes may not
+	// have had its effect.
+	Uncertain bool
 	// ClaimFor, when > 0, creates the task already claimed by the
 	// completing owner for this long (eager execution). The resulting
 	// leases are returned by CompleteWorkflowTask.
@@ -236,6 +244,7 @@ type ActivityTask struct {
 	Queue       string
 	Input       []byte
 	Compensate  bool
+	Uncertain   bool  // compensation of an activity that may not have had its effect
 	Attempt     int32 // 1 for the first attempt
 	// CancelRequested reports that the workflow canceled the activity
 	// before this attempt: the worker records the cancel instead of running
@@ -244,8 +253,9 @@ type ActivityTask struct {
 }
 
 // ActivityResult ends an activity task: Event (ActivityCompleted or
-// ActivityFailed; the store sets ScheduleID and Attempt) is delivered to the
-// execution.
+// ActivityFailed, CompensationCompleted or CompensationFailed for a
+// compensation task; the store sets ScheduleID and Attempt) is delivered to
+// the execution.
 type ActivityResult struct {
 	Event history.Event
 	// Resume, when set, is the owner's kept workflow lease of the same
@@ -254,6 +264,15 @@ type ActivityResult struct {
 	// to run next (eager execution).
 	Resume    *Lease
 	ResumeFor time.Duration
+}
+
+// ValidResult reports whether t can end an activity task (ActivityResult).
+func ValidResult(t history.Type) bool {
+	switch t {
+	case history.ActivityCompleted, history.ActivityFailed, history.CompensationCompleted, history.CompensationFailed:
+		return true
+	}
+	return false
 }
 
 // Store is the persistence contract of the engine. Methods are safe for
@@ -323,6 +342,13 @@ type Store interface {
 	// returns how many it deleted. Their instance ids become free. Rows
 	// locked elsewhere are skipped, so concurrent purges split the work.
 	PurgeEnded(ctx context.Context, olderThan time.Duration, limit int) (int, error)
+
+	// ReopenCompensation resumes the compensation of an execution parked
+	// because a compensation failed (its ErrKinds hold
+	// KindCompensationFailed): it becomes compensating again, with a
+	// CompensationRetryRequested pending event. ErrNotFound for an unknown
+	// id, ErrNotActive when the latest execution is not parked that way.
+	ReopenCompensation(ctx context.Context, instanceID string) error
 
 	// Terminate ends the active execution of an instance id by force:
 	// ExecutionTerminated is appended to its history, no workflow code or

@@ -113,9 +113,12 @@ func (e *Engine) Signal(ctx context.Context, instanceID, name string, payload an
 }
 
 // Cancel asks the running execution of instanceID to cancel: its root
-// context is canceled, which cancels its activities, timers and children;
-// the workflow decides what to do (it can compensate in a Disconnected
-// context).
+// context is canceled, which cancels its activities, timers and children.
+// The workflow decides what to do (it can clean up in a Disconnected
+// context); if it returns an error, its activities are compensated, and it
+// ends canceled. Once the workflow has ended and compensates (or is parked),
+// a cancel is accepted but has no effect: compensation always completes
+// (Terminate stops it).
 func (e *Engine) Cancel(ctx context.Context, instanceID string) error {
 	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
 		return err
@@ -123,8 +126,24 @@ func (e *Engine) Cancel(ctx context.Context, instanceID string) error {
 	return e.st.RequestCancel(ctx, instanceID)
 }
 
+// RetryCompensation resumes the compensation of instanceID's execution,
+// parked as needs_attention because a compensation failed after its
+// retries (errors.Is ErrCompensationFailed), once the cause is fixed: the
+// failed compensation runs again, then the remaining ones. ErrNotActive
+// when the execution is not parked that way.
+func (e *Engine) RetryCompensation(ctx context.Context, instanceID string) error {
+	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
+		return err
+	}
+	return e.st.ReopenCompensation(ctx, instanceID)
+}
+
 // Terminate ends the running execution of instanceID at once, without
-// running workflow code or compensation (for stuck executions).
+// running workflow code or compensation (for stuck executions). A failed
+// workflow compensates only once every activity it started has an outcome
+// (each is canceled; the outcome tells whether it has a compensator): an
+// activity that ignores its context, or whose queue no engine runs, keeps
+// it compensating until it ends or the execution is terminated.
 func (e *Engine) Terminate(ctx context.Context, instanceID, reason string) error {
 	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
 		return err

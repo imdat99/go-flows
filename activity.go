@@ -27,8 +27,21 @@ type InvokeFunc[I, O, C any] func(ctx context.Context, k Key, in I) (O, C, error
 
 // CompensateFunc undoes an activity from its compensation data. It runs at
 // least once, possibly for an activity that did not take effect
-// (CompensationUncertain), and must be idempotent.
+// (CompensationUncertain), and must be idempotent. Compensators run when the
+// workflow fails or is canceled, for every activity that completed or may
+// have had its effect, one at a time, latest first.
 type CompensateFunc[C any] func(ctx context.Context, k Key, comp C) error
+
+type uncertainKey struct{}
+
+// CompensationUncertain reports, in a compensator, that the activity it
+// undoes failed in a way that may or may not have had its effect (a crash,
+// a timeout, a panic, a cancel): its compensation data may be the zero
+// value, and there may be nothing to undo.
+func CompensationUncertain(ctx context.Context) bool {
+	v, _ := ctx.Value(uncertainKey{}).(bool)
+	return v
+}
 
 // RetryPolicy decides whether a failed attempt is retried and after how
 // long: Attempts in total (the first included), Initial delay growing by
@@ -105,7 +118,12 @@ func DefineActivity[I, O, C any](name string, invoke InvokeFunc[I, O, C], compen
 			if compensate != nil { // without a compensator nothing is stored
 				var cerr error
 				if cb, cerr = comp.encode(c); cerr != nil {
-					return nil, nil, Permanent(fmt.Errorf("encode compensation data of %s: %w", name, cerr))
+					if err != nil {
+						return nil, nil, err // the activity's own error tells more
+					}
+					// It took effect, but cannot be undone with its data: an
+					// uncertain failure (the compensator gets the zero value).
+					return nil, nil, Permanent(fmt.Errorf("%w: encode compensation data of %s: %w", worker.ErrUncertain, name, cerr))
 				}
 			}
 			if err != nil {
@@ -126,6 +144,9 @@ func DefineActivity[I, O, C any](name string, invoke InvokeFunc[I, O, C], compen
 				c, err := comp.decode(t.Input)
 				if err != nil {
 					return nil, nil, Permanent(fmt.Errorf("decode compensation data of %s: %w", name, err))
+				}
+				if t.Uncertain {
+					ctx = context.WithValue(ctx, uncertainKey{}, true)
 				}
 				return nil, nil, compensate(ctx, activityKey(t), c)
 			},

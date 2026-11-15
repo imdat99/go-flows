@@ -140,9 +140,35 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
     - Review: lần 1 không đạt (`SideEffect` lệch khi replay, codec dựng mỗi lần gọi, comp data khi không có compensator, kiểm tra error kind, gán nhầm timeout, `UseNumber`, zero value, tài liệu, ví dụ fanout, test). Lần 2 đạt. Các ghi chú thấp đã sửa: zero `Ctx` panic `ErrNotInWorkflow`, `Select` không có case thì panic, `Rand` báo `ErrNonDeterministic`, decode từ chối dữ liệu thừa. Ghi chú trung bình (encode comp data lỗi sau khi activity thành công phải đánh dấu `uncertain`, và giữ lỗi gốc khi invoke lỗi) chuyển sang T5.1.
 
 ### P5 — Lớp saga
-- [ ] **T5.1** `comp_data` và `uncertain` trong `ActivityCompleted`/`Failed`; `CompensationUncertain`.
-- [ ] **T5.2** Pha compensating dựng từ history, thứ tự ngược, `activity_task kind=compensate`, `CompensatePolicy`.
-- [ ] **T5.3** `needs_attention`, `RetryCompensation`, bàn giao khi gặp compensator lạ.
+- [x] **T5.1** `comp_data` và `uncertain` trong `ActivityCompleted`/`Failed`; `CompensationUncertain`.
+- [x] **T5.2** Pha compensating dựng từ history, thứ tự ngược, `activity_task kind=compensate`, `CompensatePolicy`.
+- [x] **T5.3** `needs_attention`, `RetryCompensation`, bàn giao khi gặp compensator lạ.
+
+  - T5.1–T5.3: lớp saga trên event history.
+    - **Planner** `internal/compensation`: dựng chỉ từ history, không chạy code workflow.
+      - Hoàn tác các activity đã xong hoặc `uncertain` và có compensator. "Có compensator" do binary chạy activity ghi lại: `comp_data` khác rỗng, tối thiểu là `"null"`. Không tra registry của binary đang lập kế hoạch, nên deploy trộn phiên bản vẫn an toàn.
+      - Chạy từng cái một, theo thứ tự ngược với thứ tự kết quả, sau khi mọi activity đang chạy đã có kết quả.
+      - Khi workflow kết thúc: huỷ activity, timer và child còn mở. Activity đang chờ retry thì claim được ngay, không phải chờ hết backoff.
+    - **Worker:** chế độ compensating trong driver (`compensate.go`).
+      - Lần đầu thì đọc history; `Executor.MayCompensate`, dùng bộ đếm không alloc, giúp bỏ qua khi không có gì để hoàn tác.
+      - Ledger được giữ lại giữa các task của cùng driver.
+      - Task compensation chạy eager hoặc qua poll. Binary không có compensator thì bàn giao task.
+      - Kết quả là `CompensationCompleted`/`CompensationFailed`.
+    - **Kết thúc:** `compensated`, hoặc `canceled` nếu workflow bị huỷ, hoặc `failed` nếu không có compensation nào chạy. Lỗi của workflow được lưu ngay khi chuyển sang `compensating`.
+    - **Park:** compensation hết lượt retry thì chuyển `needs_attention` (kind `compensation_failed`). `Engine.RetryCompensation` gọi `store.ReopenCompensation` để tiếp tục.
+    - **Lưu trữ:** migration `00003` (`activity_task.uncertain`).
+    - **API:** `CompensationUncertain`; `ErrCompensated` và `ErrCompensationFailed` là error kind. Activity thành công nhưng comp data không encode được thì thành lỗi `uncertain` (`worker.ErrUncertain`). Activity bị huỷ trước lần chạy đầu tiên thì là lỗi chắc chắn (`certain`).
+    - **Test:**
+      - conformance gồm `CompensationTask`, `ActivityResultTypes`, `ReopenCompensation`, và `CancelBeforeRetry` với độ trễ 1 giờ;
+      - unit test cho planner, `TestMayCompensate`, và deploy trộn phiên bản ở mức worker;
+      - test engine gồm thứ tự ngược, `uncertain`, activity đang chạy, cancel, park/retry, bàn giao giữa hai engine, signal khi đang compensating, compensator panic, công việc còn mở;
+      - e2e Postgres ở cả eager lẫn poll.
+    - **Bench:** `BenchmarkReplay` vẫn 129 alloc (khoảng 0.82–0.89 µs/event). `BenchmarkActivityRun` khoảng 1406–1575 alloc/run, nằm trong dải nhiễu đo ở P4.
+    - **Giới hạn:**
+      - Workflow lỗi phải chờ mọi activity đang chạy, kể cả activity không có compensator. Activity bỏ qua context sẽ giữ execution ở `compensating` cho tới khi `Terminate`.
+      - Mỗi bước compensation chạy ở driver mới phải đọc lại history (chỉ trên đường lỗi).
+      - Hoàn tác child đã hoàn thành: để T6.3.
+    - **Review:** lần 1 không đạt (H1 compensation bị bỏ qua khi deploy trộn; M1 activity trong backoff chặn compensation; M2 đọc lại history; L1–L5). Lần 2 đạt; ba ghi chú thấp đã sửa: tài liệu `Terminate`, lỗi của workflow sau `RetryCompensation`, comment của test.
 - [ ] **T5.4** `Lock`/`LockWait` gắn với lease (port `saga/lock.go`).
 - [ ] **T5.5** `RunHook` chạy trong transaction kết thúc, `Observer`, port `idem/`.
 - [ ] **T5.6** Port test saga: `CompensationReverseOrder`, `review_fixes_test.go`, `lock_test.go`, `async_test.go`.

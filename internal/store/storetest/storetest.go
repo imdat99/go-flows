@@ -96,6 +96,9 @@ func Run(t *testing.T, h Harness) {
 		{"GW3_TerminalWithNilConsumed", testTerminalWithNilConsumed},
 		{"WatchHints", testWatch},
 		{"Terminate", testTerminate},
+		{"CompensationTask", testCompensationTask},
+		{"ActivityResultTypes", testActivityResultTypes},
+		{"ReopenCompensation", testReopenCompensation},
 		{"GW13_ActivityCancelReachesItsWorker", testActivityCancel},
 		{"GW13_CancelBeforeRetry", testCancelBeforeRetry},
 	}

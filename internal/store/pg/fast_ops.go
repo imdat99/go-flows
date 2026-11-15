@@ -146,6 +146,7 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 			fb.Blobs(n, func(i int) []byte { return acts[i].Input })
 			fb.Ints(n, func(i int) int64 { return micros(acts[i].ClaimFor) })
 			fb.Str(l.Owner)
+			fb.Bools(n, func(i int) bool { return acts[i].Uncertain })
 		})
 	}
 	for i := range c.Children {

@@ -49,6 +49,13 @@ var (
 	ErrInstanceExists = errors.New("flows: instance id already in use")
 	// ErrNotInWorkflow reports a workflow API called outside a workflow.
 	ErrNotInWorkflow = errors.New("flows: called outside a workflow")
+	// ErrCompensated matches the error of a workflow that failed and whose
+	// completed activities were compensated (status compensated).
+	ErrCompensated = errors.New("flows: compensated")
+	// ErrCompensationFailed is the reason of an execution parked as
+	// needs_attention because a compensation failed after its retries;
+	// Engine.RetryCompensation resumes it.
+	ErrCompensationFailed = errors.New("flows: compensation failed")
 )
 
 // permanentError marks an error as not retryable.
@@ -86,6 +93,8 @@ var kinds = struct {
 	{store.KindTerminated, ErrTerminated},
 	{store.KindInstanceExists, ErrInstanceExists},
 	{"activity_canceled", ErrActivityCanceled},
+	{store.KindCompensated, ErrCompensated},
+	{store.KindCompensationFailed, ErrCompensationFailed},
 }}
 
 type errorKind struct {

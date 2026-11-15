@@ -592,16 +592,16 @@ const deletePending = `
 // created leased to $8 (eager execution).
 const insertActivities = `
 	INSERT INTO flows.activity_task (execution_id, instance_id, schedule_id, compensate, name, queue, input,
-	                                 attempt, owner_id, lease_version, locked_until, visible_at)
+	                                 attempt, owner_id, lease_version, locked_until, visible_at, uncertain)
 	SELECT $1, e.instance_id, u.sched, u.comp, u.name, u.queue, u.input,
 	       CASE WHEN u.claim > 0 THEN 1 ELSE 0 END,
 	       CASE WHEN u.claim > 0 THEN $8 ELSE '' END,
 	       CASE WHEN u.claim > 0 THEN 1 ELSE 0 END,
 	       CASE WHEN u.claim > 0 THEN now() + u.claim * interval '1 microsecond' END,
-	       now() + greatest(u.claim, 0) * interval '1 microsecond'
+	       now() + greatest(u.claim, 0) * interval '1 microsecond', u.uncertain
 	FROM flows.execution e,
-	     unnest($2::int[], $3::boolean[], $4::text[], $5::text[], $6::bytea[], $7::bigint[])
-	       AS u(sched, comp, name, queue, input, claim)
+	     unnest($2::int[], $3::boolean[], $4::text[], $5::text[], $6::bytea[], $7::bigint[], $9::boolean[])
+	       AS u(sched, comp, name, queue, input, claim, uncertain)
 	WHERE e.id = $1
 	RETURNING id, schedule_id, compensate, owner_id,
 	          CASE WHEN owner_id = '' THEN ` + notifyA + "queue)" + ` END`
@@ -638,12 +638,15 @@ const cancelChildren = `
 // cancelActivities marks the tasks of activities the workflow canceled;
 // RenewLeases reports them to the workers running them.
 const cancelActivities = `
-	UPDATE flows.activity_task SET cancel_requested = true
+	UPDATE flows.activity_task
+	SET cancel_requested = true,
+	    visible_at = CASE WHEN owner_id = '' THEN least(visible_at, now()) ELSE visible_at END
 	WHERE execution_id = $1 AND schedule_id = ANY($2::int[]) AND NOT compensate`
 
 // updateRunning closes a task that leaves the execution active: $2 last
 // seq (0: unchanged), $3 status (empty: unchanged), $4 keep-for, $5
-// sticky-for, $6 owner, $7/$8 the reason of a park (needs_attention).
+// sticky-for, $6 owner, $7/$8 the reason of a park (needs_attention) or of
+// a compensation (the workflow's error).
 // The lease is kept only while the execution stays
 // claimable. Released with work visible, it notifies other owners.
 const updateRunning = `
@@ -655,8 +658,8 @@ const updateRunning = `
 	UPDATE flows.execution e
 	SET last_seq = CASE WHEN $2::bigint > 0 THEN $2::bigint ELSE e.last_seq END,
 	    status = v.status,
-	    err = CASE WHEN $3::text = 'needs_attention' THEN $7::text ELSE e.err END,
-	    err_kinds = CASE WHEN $3::text = 'needs_attention' THEN $8::text ELSE e.err_kinds END,
+	    err = CASE WHEN $3::text IN ('needs_attention', 'compensating') THEN $7::text ELSE e.err END,
+	    err_kinds = CASE WHEN $3::text IN ('needs_attention', 'compensating') THEN $8::text ELSE e.err_kinds END,
 	    ready_at = CASE WHEN v.keep
 	        THEN least((SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
 	                   now() + $4 * interval '1 microsecond')
@@ -847,11 +850,13 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		scheds, comps := make([]int32, n), make([]bool, n)
 		names, queues := make([]string, n), make([]string, n)
 		inputs, claims := make([][]byte, n), make([]int64, n)
+		uncertain := make([]bool, n)
 		for i, a := range c.Activities {
 			scheds[i], comps[i], names[i], queues[i], inputs[i], claims[i] = a.ScheduleID, a.Compensate, a.Name, a.Queue, a.Input, micros(a.ClaimFor)
+			uncertain[i] = a.Uncertain
 		}
 		sh.activityAt = sh.statements
-		queue(insertActivities, l.ID, scheds, comps, names, queues, inputs, claims, l.Owner)
+		queue(insertActivities, l.ID, scheds, comps, names, queues, inputs, claims, l.Owner, uncertain)
 	}
 	for _, ch := range c.Children {
 		queue(insertChild, ch.InstanceID, ch.Workflow, ch.Version, ch.Queue, l.ID, ch.ParentSched, ch.Input)
@@ -944,7 +949,7 @@ const claimActivities = `
 	    visible_at = now() + $4 * interval '1 microsecond'
 	FROM c WHERE t.id = c.id
 	RETURNING t.id, t.lease_version, t.execution_id, t.instance_id, t.schedule_id, t.name, t.queue,
-	          t.input, t.compensate, t.attempt, t.cancel_requested`
+	          t.input, t.compensate, t.attempt, t.cancel_requested, t.uncertain`
 
 // ClaimActivityTasks implements store.Store.
 func (s *Store) ClaimActivityTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.ActivityTask, error) {
@@ -959,7 +964,7 @@ func (s *Store) ClaimActivityTasks(ctx context.Context, owner string, queues []s
 		for rows.Next() {
 			var t store.ActivityTask
 			if err := rows.Scan(&t.Lease.ID, &t.Lease.Version, &t.ExecutionID, &t.InstanceID, &t.ScheduleID,
-				&t.Name, &t.Queue, &t.Input, &t.Compensate, &t.Attempt, &t.CancelRequested); err != nil {
+				&t.Name, &t.Queue, &t.Input, &t.Compensate, &t.Attempt, &t.CancelRequested, &t.Uncertain); err != nil {
 				return err
 			}
 			t.Lease.Owner = owner
@@ -1050,7 +1055,7 @@ const (
 // CompleteActivityTask implements store.Store.
 func (s *Store) CompleteActivityTask(ctx context.Context, l store.Lease, r store.ActivityResult) (*store.WorkflowTask, error) {
 	ev := r.Event
-	if ev.Type != history.ActivityCompleted && ev.Type != history.ActivityFailed {
+	if !store.ValidResult(ev.Type) {
 		return nil, store.ErrInvalidCompletion
 	}
 	var task *store.WorkflowTask

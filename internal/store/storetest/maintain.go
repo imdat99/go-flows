@@ -4,6 +4,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/imdat99/go-flows/internal/history"
 	"github.com/imdat99/go-flows/internal/store"
@@ -244,7 +245,9 @@ func testCancelBeforeRetry(t *testing.T, h Harness) {
 	if a.CancelRequested {
 		t.Fatal("fresh task claimed as canceled")
 	}
-	if err := s.RetryActivityTask(ctx, a.Lease, 0); err != nil {
+	// A long retry delay: the cancel makes the task claimable at once, so
+	// the workflow learns of it without waiting out the backoff.
+	if err := s.RetryActivityTask(ctx, a.Lease, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Signal(ctx, "i1", "x", nil); err != nil {

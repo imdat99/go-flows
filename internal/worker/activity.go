@@ -48,9 +48,38 @@ type attemptOutcome struct {
 	lost  bool // the lease was lost: record nothing
 }
 
+// ErrUncertain is wrapped by an activity's error to mark a failure after
+// which the activity may still have had its effect (its compensator runs).
+var ErrUncertain = errors.New("outcome uncertain")
+
+// nullData is the compensation data recorded for an uncertain failure of an
+// activity that has a compensator but returned no data: it marks the
+// outcome compensable (the compensator gets the zero value). Whether an
+// activity has a compensator is decided where it ran and recorded with its
+// outcome, so that a binary without the compensator never skips it.
+var nullData = []byte("null")
+
 // attempt runs one attempt of t under ctx (canceled when its lease is
-// lost) and decides what to record.
+// lost) and decides what to record: an activity outcome, or for a
+// compensation task, CompensationCompleted or CompensationFailed.
 func (w *Worker) attempt(ctx context.Context, a *Activity, t *store.ActivityTask) attemptOutcome {
+	o := w.attemptOnce(ctx, a, t)
+	if !t.Compensate && !o.lost && !o.retry && o.ev.Uncertain && len(o.ev.CompData) == 0 {
+		if _, ok := w.acts.Activity(t.Name, true); ok {
+			o.ev.CompData = nullData
+		}
+	}
+	if t.Compensate && !o.lost && !o.retry {
+		if o.ev.Type == history.ActivityCompleted {
+			o.ev = history.Event{Type: history.CompensationCompleted}
+		} else {
+			o.ev = history.Event{Type: history.CompensationFailed, Err: o.ev.Err, ErrKinds: o.ev.ErrKinds, Permanent: o.ev.Permanent}
+		}
+	}
+	return o
+}
+
+func (w *Worker) attemptOnce(ctx context.Context, a *Activity, t *store.ActivityTask) attemptOutcome {
 	actx := ctx
 	if a.Timeout > 0 {
 		var cancel context.CancelFunc
@@ -58,13 +87,12 @@ func (w *Worker) attempt(ctx context.Context, a *Activity, t *store.ActivityTask
 		defer cancel()
 	}
 	if t.CancelRequested {
-		// Canceled by the workflow while waiting for this attempt (a retry):
-		// do not run it again. An earlier attempt may have had an effect;
-		// failed attempts record no compensation data, so the compensator
-		// gets the zero value.
+		// Canceled by the workflow before this attempt: do not run it. An
+		// earlier attempt (a retry is pending) may have had an effect; its
+		// compensator gets the zero value. Before any attempt, certain.
 		return attemptOutcome{ev: history.Event{
 			Type: history.ActivityFailed, Err: ErrActivityCanceled.Error(), ErrKinds: w.opts.Errors.Kinds(ErrActivityCanceled),
-			Permanent: true, Uncertain: true,
+			Permanent: true, Uncertain: t.Attempt > 1,
 		}}
 	}
 	out, comp, err, panicked := safeRun(actx, a, t)
@@ -92,7 +120,7 @@ func (w *Worker) attempt(ctx context.Context, a *Activity, t *store.ActivityTask
 	}
 	// Uncertain: the attempt may have had its effect though it reports a
 	// failure (panic, timeout). Its compensator still runs.
-	uncertain := panicked || errors.Is(err, context.DeadlineExceeded)
+	uncertain := panicked || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrUncertain)
 	permanent := panicked || w.opts.Errors.Permanent(err)
 	if !permanent && t.Attempt < int32(a.Retry.Attempts) {
 		return attemptOutcome{retry: true, delay: a.Retry.Delay(t.Attempt + 1)}

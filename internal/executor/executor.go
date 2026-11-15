@@ -105,6 +105,9 @@ type Executor struct {
 	// TaskStarted, or Execute, shows it complete, because a replayed side
 	// effect needs its recorded value when the workflow reaches it.
 	tail []history.Event
+	// Counts for MayCompensate: activities scheduled, their outcomes, and
+	// the outcomes recorded with compensation data.
+	activities, outcomes, compensable int
 }
 
 // errBroken wraps the first error for every later call.
@@ -124,6 +127,27 @@ func (e *Executor) LastSeq() int64 {
 		return e.tail[n-1].Seq
 	}
 	return e.lastSeq
+}
+
+// count updates the MayCompensate counts with an applied event.
+func (e *Executor) count(ev *history.Event) {
+	switch ev.Type {
+	case history.ActivityScheduled:
+		e.activities++
+	case history.ActivityCompleted, history.ActivityFailed:
+		e.outcomes++
+		if len(ev.CompData) > 0 {
+			e.compensable++
+		}
+	default:
+	}
+}
+
+// MayCompensate reports whether the history may hold something to
+// compensate: an activity outcome with compensation data, or an activity
+// without an outcome yet. When false, a failed workflow ends at once.
+func (e *Executor) MayCompensate() bool {
+	return e.compensable > 0 || e.activities > e.outcomes
 }
 
 // ExecutionID is the execution this executor runs.
@@ -302,6 +326,9 @@ func (e *Executor) commit(c *store.Completion) error {
 			return err
 		}
 		for i := before; i < len(st.out); i++ {
+			if st.out[i].Type == history.ActivityScheduled {
+				e.activities++
+			}
 			sideTables(c, &st.out[i], cmd)
 		}
 	}
@@ -389,6 +416,7 @@ func (e *Executor) apply(ev *history.Event) error {
 		e.finished = true
 		return nil
 	default:
+		e.count(ev)
 		if err := st.applyCommandEvent(ev); err != nil {
 			return err
 		}

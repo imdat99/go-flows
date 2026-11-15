@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/imdat99/go-flows/internal/store"
 )
@@ -187,6 +188,42 @@ const (
 )
 
 const typeTerminated = "6" // history.ExecutionTerminated
+
+const typeRetryCompensation = "25" // history.CompensationRetryRequested
+
+// reopenCompensation makes the latest execution of $1, parked because a
+// compensation failed, compensating again with a retry request.
+const reopenCompensation = `
+	WITH e AS (
+		UPDATE flows.execution SET status = 'compensating', ready_at = least(coalesce(ready_at, now()), now())
+		WHERE id = ` + latestOf + `
+		  AND status = 'needs_attention' AND '` + store.KindCompensationFailed + `' = ANY(string_to_array(err_kinds, ','))
+		RETURNING id, queue
+	), ins AS (
+		INSERT INTO flows.pending_event (execution_id, visible_at, type)
+		SELECT id, now(), ` + typeRetryCompensation + ` FROM e
+	)
+	SELECT ` + notifyW + "queue)" + ` FROM e`
+
+// ReopenCompensation implements store.Store.
+func (s *Store) ReopenCompensation(ctx context.Context, instanceID string) error {
+	var tag pgconn.CommandTag
+	err := retry(ctx, func() error {
+		var err error
+		tag, err = s.pool.Exec(ctx, reopenCompensation, instanceID)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("reopen compensation: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	if _, err := s.GetExecution(ctx, instanceID); err != nil {
+		return err
+	}
+	return store.ErrNotActive
+}
 
 // notifyTerminated delivers ChildFailed (terminated) to the active parent
 // of the latest execution of $1.

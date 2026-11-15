@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/imdat99/go-flows/internal/compensation"
 	"github.com/imdat99/go-flows/internal/coro"
 	"github.com/imdat99/go-flows/internal/executor"
 	"github.com/imdat99/go-flows/internal/store"
@@ -41,6 +42,12 @@ type driver struct {
 	results  chan eagerResult
 	running  map[int32]int64 // schedule id -> activity lease id of eager activities in flight
 	window   *time.Timer     // reused for every wait on eager results
+	// compensating: the workflow ended and its compensation runs
+	// (compensate.go); ledger is its state after ledgerSeq, kept between
+	// the tasks of this driver.
+	compensating bool
+	ledger       *compensation.Ledger
+	ledgerSeq    int64
 }
 
 type eagerResult struct {
@@ -188,18 +195,8 @@ func (d *driver) lost() {
 // the store asks for a re-run (undelivered signals), else nil.
 func (d *driver) step(pollCtx context.Context, task *store.WorkflowTask) *store.WorkflowTask {
 	w := d.w
-	if d.ex == nil {
-		d.ex = w.cache.take(task.Execution.ID, task.LastSeq)
-	}
-	if d.ex != nil && d.ex.LastSeq() != task.LastSeq {
-		d.evict()
-	}
-	if d.ex == nil && !d.build(task) {
-		return nil
-	}
-	c, err := d.ex.Execute(task)
-	if err != nil {
-		d.fail(task, err)
+	c := d.execute(task)
+	if c == nil {
 		return nil
 	}
 	stopping := pollCtx.Err() != nil
@@ -222,11 +219,59 @@ func (d *driver) step(pollCtx context.Context, task *store.WorkflowTask) *store.
 	return nil
 }
 
+// execute produces the completion of a task: by running the workflow, or,
+// once it ended and compensates, by planning its compensation. nil when the
+// task was handed back or parked.
+func (d *driver) execute(task *store.WorkflowTask) *store.Completion {
+	w := d.w
+	if d.compensating || task.Execution.Status == store.StatusCompensating {
+		d.compensating = true
+		d.evict()
+		if ex := w.cache.take(task.Execution.ID, -1); ex != nil { // a stale executor: never used again
+			ex.Close()
+		}
+		c, err := d.compensate(task)
+		if err != nil {
+			w.log.LogAttrs(d.ctx, slog.LevelError, "flows: compensation task failed, handing back",
+				slog.String("instance", task.Execution.InstanceID), slog.Any("error", err))
+			d.release(w.opts.HandBack)
+			return nil
+		}
+		return c
+	}
+	if d.ex == nil {
+		d.ex = w.cache.take(task.Execution.ID, task.LastSeq)
+	}
+	if d.ex != nil && d.ex.LastSeq() != task.LastSeq {
+		d.evict()
+	}
+	if d.ex == nil && !d.build(task) {
+		return nil
+	}
+	c, err := d.ex.Execute(task)
+	if err != nil {
+		d.fail(task, err)
+		return nil
+	}
+	if (c.Status == store.StatusFailed || c.Status == store.StatusCanceled) && d.ex.MayCompensate() {
+		if err := d.beginCompensation(task, c); err != nil {
+			d.fail(task, fmt.Errorf("start compensation: %w", err))
+			return nil
+		}
+		if c.Status != store.StatusFailed && c.Status != store.StatusCanceled {
+			d.compensating = true // from now on, no workflow code runs
+			d.evict()
+		}
+	}
+	return c
+}
+
 // completeFailed handles a rejected completion; it returns the task to
 // run instead when the store asks for a re-run with undelivered events.
 func (d *driver) completeFailed(task *store.WorkflowTask, err error) *store.WorkflowTask {
 	w := d.w
 	d.evict() // its state includes what was not stored
+	d.ledger = nil
 	switch {
 	case errors.Is(err, store.ErrPendingEvents):
 		next, rerr := w.st.ResumeWorkflowTask(d.ctx, d.lease, w.opts.LeaseTTL)
@@ -262,7 +307,7 @@ func (d *driver) completed(task *store.WorkflowTask, c *store.Completion, eager 
 	}
 	if c.Status != "" && (!c.Status.Active() || c.Status == store.StatusNeedsAttention) {
 		d.evict()
-	} else if !d.held && d.inflight == 0 && len(eager) == 0 {
+	} else if d.ex != nil && !d.held && d.inflight == 0 && len(eager) == 0 {
 		w.cache.put(d.ex)
 		d.ex = nil
 	}
@@ -278,7 +323,7 @@ func (d *driver) completed(task *store.WorkflowTask, c *store.Completion, eager 
 		d.launch(store.ActivityTask{
 			Lease: leases[i], ExecutionID: task.Execution.ID, InstanceID: task.Execution.InstanceID,
 			ScheduleID: a.ScheduleID, Name: a.Name, Queue: a.Queue, Input: a.Input, Compensate: a.Compensate,
-			Attempt: 1,
+			Uncertain: a.Uncertain, Attempt: 1,
 		}, sent)
 	}
 }

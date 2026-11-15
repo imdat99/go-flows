@@ -199,3 +199,56 @@ func TestReplaySplitInsideATask(t *testing.T) {
 		r.Close()
 	}
 }
+
+// MayCompensate counts live and replayed activities: running ones, and
+// outcomes with compensation data.
+func TestMayCompensate(t *testing.T) {
+	wf := executor.Workflow{Name: "wf", Version: 1, Run: func(ctx coro.Context, _ []byte) ([]byte, error) {
+		st := executor.FromContext(ctx)
+		if _, err := st.ScheduleActivity(ctx, "A", "q", nil).Get(ctx); err != nil {
+			return nil, err
+		}
+		_, err := st.ScheduleActivity(ctx, "B", "q", nil).Get(ctx)
+		return nil, err
+	}}
+	ex := executor.New(wf, 1, executor.Options{})
+	defer ex.Close()
+	var hist []history.Event
+	run := func(evs ...history.Event) {
+		t.Helper()
+		task := &store.WorkflowTask{LastSeq: ex.LastSeq(), Now: time.Unix(1000, 0)}
+		for j, ev := range evs {
+			task.Pending = append(task.Pending, store.PendingEvent{ID: int64(j + 1), Event: ev})
+		}
+		c, err := ex.Execute(task)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hist = append(hist, c.History...)
+	}
+	run(startEvent())
+	if !ex.MayCompensate() {
+		t.Fatal("A is running")
+	}
+	run(history.Event{Type: history.ActivityCompleted, ScheduleID: 1})
+	if !ex.MayCompensate() {
+		t.Fatal("B is running")
+	}
+	run(history.Event{Type: history.ActivityFailed, ScheduleID: 2, Err: "x"})
+	if ex.MayCompensate() {
+		t.Fatal("nothing to compensate")
+	}
+	r := executor.New(wf, 1, executor.Options{})
+	defer r.Close()
+	for i := range hist {
+		if hist[i].Type == history.ActivityCompleted {
+			hist[i].CompData = []byte("{}") // A's outcome, with data
+		}
+	}
+	if err := r.Replay(hist); err != nil {
+		t.Fatal(err)
+	}
+	if !r.MayCompensate() {
+		t.Fatal("replayed outcome with data")
+	}
+}

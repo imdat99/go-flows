@@ -182,10 +182,11 @@ func (h *Handle[O]) Status(ctx context.Context) (Status, error) {
 
 // Wait waits for the instance to end (following continue-as-new) and returns
 // its output, or a *RunError for any other end (errors.Is matches the
-// recorded kinds, ErrCanceled and ErrTerminated included). An execution
-// parked as needs_attention (its reason: errors.Is ErrNonDeterministic, or
-// exhausted compensation retries) ends the wait with a *RunError too,
-// although it can still resume once fixed.
+// recorded kinds, and ErrCanceled, ErrTerminated or ErrCompensated for the
+// way it ended). A failed or canceled workflow is compensated before it
+// ends. An execution parked as needs_attention (its reason: errors.Is
+// ErrNonDeterministic, or ErrCompensationFailed) ends the wait with a
+// *RunError too, although it can still resume once fixed.
 func (h *Handle[O]) Wait(ctx context.Context) (O, error) {
 	var zero O
 	delay := 5 * time.Millisecond
@@ -204,7 +205,9 @@ func (h *Handle[O]) Wait(ctx context.Context) (O, error) {
 				cause.kinds = append(cause.kinds, store.KindTerminated)
 			case StatusCanceled:
 				cause.kinds = append(cause.kinds, "canceled")
-			case StatusNeedsAttention, StatusCompensated, StatusFailed, StatusRunning, StatusCompensating,
+			case StatusCompensated:
+				cause.kinds = append(cause.kinds, store.KindCompensated)
+			case StatusNeedsAttention, StatusFailed, StatusRunning, StatusCompensating,
 				StatusCompleted, store.StatusContinued:
 			}
 			return zero, &RunError{InstanceID: h.id, Status: e.Status, Cause: cause}

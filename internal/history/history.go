@@ -80,31 +80,52 @@ const (
 	// ChildCancelRequested records that the parent canceled the child's context.
 	ChildCancelRequested
 
+	// CompensationScheduled starts the compensation of the activity of
+	// ScheduleID: Name, Queue, Payload (its compensation data) and
+	// Uncertain (the activity may not have had its effect). Compensation
+	// events follow the workflow's end (ExecutionFailed or
+	// ExecutionCanceled): they are written by the engine from the history,
+	// not by workflow code.
+	CompensationScheduled
+	// CompensationCompleted reports that the compensation of ScheduleID
+	// ran (or was not needed: the activity has no compensator).
+	CompensationCompleted
+	// CompensationFailed reports that the compensation of ScheduleID failed
+	// for good (retries exhausted): the execution is parked.
+	CompensationFailed
+	// CompensationRetryRequested resumes a parked compensation (an operator
+	// fixed the cause).
+	CompensationRetryRequested
+
 	typeCount // keep last
 )
 
 var typeNames = [typeCount]string{
-	ExecutionStarted:         "ExecutionStarted",
-	ExecutionCompleted:       "ExecutionCompleted",
-	ExecutionFailed:          "ExecutionFailed",
-	ExecutionContinuedAsNew:  "ExecutionContinuedAsNew",
-	ExecutionCanceled:        "ExecutionCanceled",
-	ExecutionTerminated:      "ExecutionTerminated",
-	ExecutionCancelRequested: "ExecutionCancelRequested",
-	TaskStarted:              "TaskStarted",
-	ActivityScheduled:        "ActivityScheduled",
-	ActivityCompleted:        "ActivityCompleted",
-	ActivityFailed:           "ActivityFailed",
-	ActivityCancelRequested:  "ActivityCancelRequested",
-	TimerScheduled:           "TimerScheduled",
-	TimerFired:               "TimerFired",
-	TimerCanceled:            "TimerCanceled",
-	SignalReceived:           "SignalReceived",
-	SideEffectResult:         "SideEffectResult",
-	ChildScheduled:           "ChildScheduled",
-	ChildCompleted:           "ChildCompleted",
-	ChildFailed:              "ChildFailed",
-	ChildCancelRequested:     "ChildCancelRequested",
+	ExecutionStarted:           "ExecutionStarted",
+	ExecutionCompleted:         "ExecutionCompleted",
+	ExecutionFailed:            "ExecutionFailed",
+	ExecutionContinuedAsNew:    "ExecutionContinuedAsNew",
+	ExecutionCanceled:          "ExecutionCanceled",
+	ExecutionTerminated:        "ExecutionTerminated",
+	ExecutionCancelRequested:   "ExecutionCancelRequested",
+	TaskStarted:                "TaskStarted",
+	ActivityScheduled:          "ActivityScheduled",
+	ActivityCompleted:          "ActivityCompleted",
+	ActivityFailed:             "ActivityFailed",
+	ActivityCancelRequested:    "ActivityCancelRequested",
+	TimerScheduled:             "TimerScheduled",
+	TimerFired:                 "TimerFired",
+	TimerCanceled:              "TimerCanceled",
+	SignalReceived:             "SignalReceived",
+	SideEffectResult:           "SideEffectResult",
+	ChildScheduled:             "ChildScheduled",
+	ChildCompleted:             "ChildCompleted",
+	ChildFailed:                "ChildFailed",
+	ChildCancelRequested:       "ChildCancelRequested",
+	CompensationScheduled:      "CompensationScheduled",
+	CompensationCompleted:      "CompensationCompleted",
+	CompensationFailed:         "CompensationFailed",
+	CompensationRetryRequested: "CompensationRetryRequested",
 }
 
 func (t Type) String() string {
