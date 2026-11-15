@@ -90,6 +90,8 @@ func Run(t *testing.T, h Harness) {
 		{"TimesComeFromTheStoreClock", testStoreClock},
 		{"GW3_SignalsRacingTerminalCompletion", testSignalsRacingTerminal},
 		{"ParkedExecutionCannotKeepItsLease", testParkedCannotKeep},
+		{"RenewLeases", testRenewLeases},
+		{"GW4_PurgeEnded", testPurgeEnded},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -477,12 +479,16 @@ func testTimers(t *testing.T, h Harness) {
 		t.Fatal(err)
 	}
 	sig := claimOne(t, s, owner, h.TTL)
-	if got := pendingTypes(sig); !slices.Equal(got, []history.Type{history.SignalReceived}) {
-		t.Fatalf("pending %v", got)
+	if sig.Now.Before(at) { // on a loaded machine the claim may come late
+		if got := pendingTypes(sig); !slices.Equal(got, []history.Type{history.SignalReceived}) {
+			t.Fatalf("pending %v", got)
+		}
+	} else if sig.Pending[0].Event.Type != history.SignalReceived {
+		t.Fatalf("pending %v", pendingTypes(sig))
 	}
 	c := store.Completion{
 		History:        []history.Event{{Seq: sig.LastSeq + 1, Type: history.TimerCanceled, ScheduleID: 2}},
-		Consumed:       pendingIDs(sig),
+		Consumed:       []int64{sig.Pending[0].ID}, // the signal only
 		CanceledTimers: []int32{2},
 	}
 	if _, err := s.CompleteWorkflowTask(ctx, sig.Lease, &c); err != nil {
@@ -733,10 +739,12 @@ func testSignalRacingCompletion(t *testing.T, h Harness) {
 	accepted := make([]bool, 20)
 	for i := range accepted {
 		wg.Go(func() {
+			// The instance stays active across continue-as-new: every
+			// signal must be accepted.
 			err := s.Signal(ctx, "i1", "s", nil)
 			accepted[i] = err == nil
-			if err != nil && !errors.Is(err, store.ErrNotActive) {
-				t.Errorf("signal: %v", err)
+			if err != nil {
+				t.Errorf("signal racing continue-as-new: %v", err)
 			}
 		})
 	}
@@ -957,23 +965,23 @@ func testContinueAsNewCarriesCancel(t *testing.T, h Harness) {
 	}
 }
 
-// Pending events come in (visibility time, arrival) order: a timer scheduled
-// first but firing later comes after a signal that arrived in between.
+// Pending events come in (visibility time, arrival) order: a timer created
+// before a signal arrives but firing later comes after it.
 func testPendingOrder(t *testing.T, h Harness) {
 	s := h.New(t)
 	mustCreate(t, s, "i1")
 	task := claimOne(t, s, owner, h.TTL)
-	at := task.Now.Add(h.TTL / 2)
-	started(t, s, task, &store.Completion{
-		History: []history.Event{{Type: history.TimerScheduled, ScheduleID: 1, At: at}},
-		Timers:  []history.Event{{ScheduleID: 1, At: at}},
-	})
-	h.Advance(t, s, h.TTL/4)
+	// Arrives while the task runs: pending, visible now.
 	if err := s.Signal(ctx, "i1", "early", nil); err != nil {
 		t.Fatal(err)
 	}
-	h.Advance(t, s, h.TTL/2)
-	if err := s.Signal(ctx, "i1", "late", nil); err != nil {
+	at := task.Now.Add(h.TTL / 2)
+	started(t, s, task, &store.Completion{ // consumes only the start event
+		History: []history.Event{{Type: history.TimerScheduled, ScheduleID: 1, At: at}},
+		Timers:  []history.Event{{ScheduleID: 1, At: at}},
+	})
+	h.Advance(t, s, h.TTL)
+	if err := s.Signal(ctx, "i1", "late", nil); err != nil { // after the timer fired
 		t.Fatal(err)
 	}
 	got := claimOne(t, s, owner, h.TTL)
@@ -1134,8 +1142,11 @@ func testInvalidCompletions(t *testing.T, h Harness) {
 	ended := base()
 	ended.Status = store.StatusCompleted
 	ended.Timers = []history.Event{{ScheduleID: 1, At: task.Now}}
+	zero := base()
+	zero.History[0].Seq = 0
 	for name, c := range map[string]store.Completion{
 		"continue-as-new without status": can, "duplicate schedule id": dup, "timer in a terminal completion": ended,
+		"history starting at seq 0": zero,
 	} {
 		if _, err := s.CompleteWorkflowTask(ctx, task.Lease, &c); !errors.Is(err, store.ErrInvalidCompletion) {
 			t.Errorf("%s: %v", name, err)
@@ -1143,7 +1154,24 @@ func testInvalidCompletions(t *testing.T, h Harness) {
 	}
 	ok := base()
 	ok.Activities = []store.NewActivityTask{{ScheduleID: 1, Name: "a", Queue: queue}}
+	ok.KeepFor = h.TTL
 	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, &ok); err != nil {
+		t.Fatal(err)
+	}
+	// A second task for an existing schedule id, after other changes in the
+	// same completion: rejected as a whole (Postgres fails mid-batch).
+	again := store.Completion{
+		History:    []history.Event{{Seq: 2, Type: history.TimerScheduled, ScheduleID: 2, At: task.Now}},
+		Timers:     []history.Event{{ScheduleID: 2, At: task.Now}},
+		Activities: []store.NewActivityTask{{ScheduleID: 1, Name: "a", Queue: queue}},
+	}
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, &again); !errors.Is(err, store.ErrInvalidCompletion) {
+		t.Errorf("task for an existing schedule id: %v", err)
+	}
+	if hist, _ := s.LoadHistory(ctx, task.Execution.ID, 1); len(hist) != 0 {
+		t.Errorf("partial apply: %+v", hist)
+	}
+	if err := s.ReleaseWorkflowTask(ctx, task.Lease, 0); err != nil {
 		t.Fatal(err)
 	}
 	a := claimActivity(t, s, owner, h.TTL)[0]

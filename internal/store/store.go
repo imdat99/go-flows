@@ -240,8 +240,8 @@ type ActivityTask struct {
 type ActivityResult struct {
 	Event history.Event
 	// Resume, when set, is the owner's kept workflow lease of the same
-	// execution (another execution's lease is ignored): in the same round
-	// trip the store extends it by ResumeFor and returns the workflow task
+	// execution (with another execution's lease no task is returned,
+	// though that lease may be extended): in the same round trip the store extends it by ResumeFor and returns the workflow task
 	// to run next (eager execution).
 	Resume    *Lease
 	ResumeFor time.Duration
@@ -299,6 +299,21 @@ type Store interface {
 	// after delay, for another attempt.
 	RetryActivityTask(ctx context.Context, l Lease, delay time.Duration) error
 
+	// RenewLeases extends by ttl from now every workflow and activity lease
+	// of owner that is still held, in one round trip. Rows locked by
+	// another transaction at that moment (a completion in progress, an
+	// operator's query) are skipped instead of waited for, and reported
+	// busy: one slow row must not stall the renewal of the others until
+	// they all look lost (saga review item 6). A lease neither renewed nor
+	// busy is lost.
+	RenewLeases(ctx context.Context, owner string, workflows, activities []Lease, ttl time.Duration) (Renewal, error)
+
+	// PurgeEnded deletes up to limit executions that ended before
+	// now - olderThan, with their history, pending events and tasks, and
+	// returns how many it deleted. Their instance ids become free. Rows
+	// locked elsewhere are skipped, so concurrent purges split the work.
+	PurgeEnded(ctx context.Context, olderThan time.Duration, limit int) (int, error)
+
 	// Signal delivers a SignalReceived event to the active execution of an
 	// instance id: ErrNotFound if the id is unknown, ErrNotActive if its
 	// latest execution ended.
@@ -338,4 +353,12 @@ func ChildOutcome(child Execution) history.Event {
 		ev.ErrKinds += kind
 	}
 	return ev
+}
+
+// Renewal is the outcome of RenewLeases: the leases that were lost (by
+// lease ID) and the ones that were busy and should be retried. Every other
+// lease was renewed.
+type Renewal struct {
+	LostWorkflows, BusyWorkflows   []int64
+	LostActivities, BusyActivities []int64
 }

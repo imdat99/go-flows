@@ -629,3 +629,58 @@ func cloneExecution(e store.Execution) store.Execution {
 	e.Input, e.Output = clone(e.Input), clone(e.Output)
 	return e
 }
+
+// RenewLeases implements store.Store. Nothing is ever busy in memory.
+func (s *Store) RenewLeases(_ context.Context, owner string, workflows, activities []store.Lease, ttl time.Duration) (store.Renewal, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.clock.Now()
+	var r store.Renewal
+	for _, l := range workflows {
+		e, err := s.fenced(l)
+		if err != nil || l.Owner != owner || !claimable(e.Status) {
+			r.LostWorkflows = append(r.LostWorkflows, l.ID)
+			continue
+		}
+		e.lockedUntil = now.Add(ttl)
+	}
+	for _, l := range activities {
+		t, err := s.fencedTask(l)
+		if err != nil || l.Owner != owner {
+			r.LostActivities = append(r.LostActivities, l.ID)
+			continue
+		}
+		t.lockedUntil = now.Add(ttl)
+	}
+	return r, nil
+}
+
+// PurgeEnded implements store.Store.
+func (s *Store) PurgeEnded(_ context.Context, olderThan time.Duration, limit int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := s.clock.Now().Add(-olderThan)
+	var ids []int64
+	for id, e := range s.executions {
+		if !e.EndedAt.IsZero() && e.EndedAt.Before(cutoff) {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	if len(ids) > limit {
+		ids = ids[:limit]
+	}
+	for _, id := range ids {
+		e := s.executions[id]
+		delete(s.executions, id)
+		if s.latest[e.InstanceID] == id {
+			delete(s.latest, e.InstanceID)
+		}
+		for tid, t := range s.tasks {
+			if t.ExecutionID == id {
+				delete(s.tasks, tid)
+			}
+		}
+	}
+	return len(ids), nil
+}

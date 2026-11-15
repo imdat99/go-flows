@@ -93,15 +93,17 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
 - [x] **T2.1** Interface `internal/store`, kiểu Task, Lease (`owner`, `version`); bộ test conformance (khung lấy từ `go-workflows/backend/test`).
 - [x] **T2.2** `internal/store/mem` qua toàn bộ conformance.
   - Review T2.1/T2.2: lần 1 không đạt (Keep không dùng được cho vòng eager; signal mất khi completion kết thúc execution; cancel mất khi ContinueAsNew; thứ tự pending; stickiness; copy phòng thủ; ...). Lần 2 đạt; các ghi chú nhỏ của lần 2 (lease của `needs_attention`, `Resume` sai execution, completion kết thúc execution còn tạo activity/timer) đã sửa. Bộ conformance có 39 case.
-- [ ] **T2.3** `migrations/00001` (schema `flows`) cùng `Migrate` có advisory lock và goose (port `saga/migrate.go`, GW-7). Test: 3 instance chạy migrate cùng lúc.
-- [ ] **T2.4** PG tạo instance: unique một phần, idempotency key, xung đột workflow (GW-1). Test tạo đồng thời.
-- [ ] **T2.5** ⚡ PG nhận workflow task: `ready_at`, partial index, `ORDER BY`, lô, `lease_version++`, chỉ dùng `now()` (GW-5, GW-8). Kiểm tra bằng `EXPLAIN`.
-- [ ] **T2.6** ⚡ PG hoàn tất workflow task: một transaction pipeline, được fence, unique `(instance, seq)` (GW-2). Test ABA cùng owner, owner cũ bị chặn.
-- [ ] **T2.7** ⚡ PG activity_task: nhận, eager-claim, gia hạn có kiểm tra số dòng, hoàn tất cộng đánh dấu sẵn sàng trong một câu lệnh, retry bằng `visible_at` (GW-2, GW-6, GW-15).
+- [x] **T2.3** `migrations/00001` (schema `flows`) cùng `Migrate` có advisory lock và goose (port `saga/migrate.go`, GW-7). Test: 3 instance chạy migrate cùng lúc.
+- [x] **T2.4** PG tạo instance: unique một phần, idempotency key, xung đột workflow (GW-1). Test tạo đồng thời.
+- [x] **T2.5** ⚡ PG nhận workflow task: `ready_at`, partial index, `ORDER BY`, lô, `lease_version++`, chỉ dùng `now()` (GW-5, GW-8). Kiểm tra bằng `EXPLAIN`.
+- [x] **T2.6** ⚡ PG hoàn tất workflow task: một transaction pipeline, được fence, unique `(instance, seq)` (GW-2). Test ABA cùng owner, owner cũ bị chặn.
+- [x] **T2.7** ⚡ PG activity_task: nhận, eager-claim, gia hạn có kiểm tra số dòng, hoàn tất cộng đánh dấu sẵn sàng trong một câu lệnh, retry bằng `visible_at` (GW-2, GW-6, GW-15).
 - [ ] **T2.8** ⚡ Đường nhanh `pgconn` cho T2.5–T2.7 (port `fast.go`). Bench allocs.
-- [ ] **T2.9** PG signal/cancel/terminate có khoá dòng; xen với kết thúc hoặc ContinueAsNew không mất signal (GW-3, GW-13).
-- [ ] **T2.10** Heartbeat gộp có `SKIP LOCKED`, phân biệt busy và lost (port `saga/lease.go`, GW-6). Test `LockedRowDoesNotStallOtherLeases`.
-- [ ] **T2.11** Retention và cascade theo lô `SKIP LOCKED` (GW-4).
+- [x] **T2.9** PG signal/cancel/terminate có khoá dòng; xen với kết thúc hoặc ContinueAsNew không mất signal (GW-3, GW-13).
+- [x] **T2.10** Heartbeat gộp có `SKIP LOCKED`, phân biệt busy và lost (port `saga/lease.go`, GW-6). Test `LockedRowDoesNotStallOtherLeases`.
+- [x] **T2.11** Retention và cascade theo lô `SKIP LOCKED` (GW-4).
+  - Review T2.3–T2.11 (Postgres store): lần 1 không đạt (signal chạy đua với ContinueAsNew bị từ chối nhầm `ErrNotActive`; activity task sống sót sau khi execution kết thúc vì SKIP LOCKED; Seq 0 lọt kiểm tra; test timer không ổn định). Lần 2 đạt; ghi chú nhỏ của lần 2 (owner khác, comment về batch) đã sửa.
+  - Số round trip: claim 1, completion 1, hoàn tất activity kèm resume 1, cộng 1 lần prepare ở lần đầu mỗi kết nối dùng. Đã biết: deadlock cha/con (cha huỷ con trong lúc con kết thúc) được phát hiện sau `deadlock_timeout` rồi thử lại. `ready_at` vẫn `<= now()` khi execution đang bị lease, nên claim phải quét qua các dòng này (chuyển sang xem xét ở T2.8).
 - [ ] **T2.12** LISTEN/NOTIFY và poll có backoff (GW-8).
 
 ### P3 — Executor và worker
