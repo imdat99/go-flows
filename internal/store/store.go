@@ -363,3 +363,27 @@ type Renewal struct {
 	LostWorkflows, BusyWorkflows   []int64
 	LostActivities, BusyActivities []int64
 }
+
+// WorkKind tells what kind of task a Watch hint is about.
+type WorkKind uint8
+
+const (
+	// WorkflowWork means a workflow task may be claimable.
+	WorkflowWork WorkKind = iota + 1
+	// ActivityWork means an activity task may be claimable.
+	ActivityWork
+)
+
+// Watcher is implemented by stores that can push hints that work is ready
+// (Postgres LISTEN/NOTIFY), so pollers can sleep longer between polls.
+type Watcher interface {
+	// Watch calls wake for each hint until ctx is done or the connection
+	// fails (then it returns the error; callers restart it with backoff).
+	// Hints can be missed, duplicated or spurious, and future work (timers,
+	// retry delays) gets none: pollers must still poll. wake must not block
+	// nor call the store: hand the hint to a buffered channel and drop it
+	// when full (Postgres stops delivering, and eventually rejects commits
+	// that notify, while a listener does not read its notifications).
+	// Queue names must stay well under 8000 bytes (the payload limit).
+	Watch(ctx context.Context, wake func(kind WorkKind, queue string)) error
+}

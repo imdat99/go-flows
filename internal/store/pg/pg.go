@@ -225,6 +225,7 @@ const insertExecution = `
 	), start AS (
 		INSERT INTO flows.pending_event (execution_id, visible_at, type, name, version, queue, payload)
 		SELECT id, now(), ` + typeStarted + `, $2, $3, $4, $7 FROM ins
+		RETURNING ` + notifyW + "$4)" + `
 	)
 	SELECT ` + executionColumns + ` FROM ins`
 
@@ -461,7 +462,8 @@ const releaseWorkflow = `
 	SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL,
 	    ready_at = (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
 	    not_before = CASE WHEN $2::bigint > 0 THEN now() + $2::bigint * interval '1 microsecond' END
-	WHERE id = $1`
+	WHERE id = $1
+	RETURNING CASE WHEN $2::bigint = 0 AND ready_at <= now() THEN ` + notifyW + "queue)" + ` END`
 
 // resumeExtend extends a kept lease, but only when less than half of ttl
 // is left: in the eager loop the lease was just set by the completion, and
@@ -601,7 +603,8 @@ const insertActivities = `
 	     unnest($2::int[], $3::boolean[], $4::text[], $5::text[], $6::bytea[], $7::bigint[])
 	       AS u(sched, comp, name, queue, input, claim)
 	WHERE e.id = $1
-	RETURNING id, schedule_id, compensate, owner_id`
+	RETURNING id, schedule_id, compensate, owner_id,
+	          CASE WHEN owner_id = '' THEN ` + notifyA + "queue)" + ` END`
 
 // insertChild creates a child execution, or delivers ChildFailed
 // (instance_exists) to the parent $5 when the id is taken.
@@ -615,6 +618,7 @@ const insertChild = `
 	), start AS (
 		INSERT INTO flows.pending_event (execution_id, visible_at, type, name, version, queue, payload)
 		SELECT id, now(), ` + typeStarted + `, $2, $3, $4, $7 FROM ins
+		RETURNING ` + notifyW + "$4)" + `
 	)
 	INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, ref, err, err_kinds, permanent)
 	SELECT $5, now(), ` + typeChildFailed + `, $6, $1, 'child instance id already in use', '` + store.KindInstanceExists + `', true
@@ -624,14 +628,17 @@ const cancelChildren = `
 	WITH t AS (
 		UPDATE flows.execution SET ready_at = least(coalesce(ready_at, now()), now())
 		WHERE instance_id = ANY($2::text[]) AND parent_id = $1 AND status IN ` + activeStatuses + `
-		RETURNING id
+		RETURNING id, queue
+	), ins AS (
+		INSERT INTO flows.pending_event (execution_id, visible_at, type)
+		SELECT id, now(), ` + typeCancelRequested + ` FROM t
 	)
-	INSERT INTO flows.pending_event (execution_id, visible_at, type)
-	SELECT id, now(), ` + typeCancelRequested + ` FROM t`
+	SELECT ` + notifyW + "queue) FROM t"
 
 // updateRunning closes a task that leaves the execution active: $2 last
-// seq (0: unchanged), $3 status (”: unchanged), $4 keep-for, $5 sticky-for,
-// $6 owner. The lease is kept only while the execution stays claimable.
+// seq (0: unchanged), $3 status (empty: unchanged), $4 keep-for, $5
+// sticky-for, $6 owner. The lease is kept only while the execution stays
+// claimable. Released with work visible, it notifies other owners.
 const updateRunning = `
 	WITH v AS (
 		SELECT coalesce(nullif($3::text, ''), status) AS status,
@@ -649,7 +656,8 @@ const updateRunning = `
 	    locked_until = CASE WHEN v.keep THEN now() + $4 * interval '1 microsecond' END,
 	    sticky_owner = CASE WHEN NOT v.keep AND $5::bigint > 0 THEN $6 ELSE '' END,
 	    sticky_until = CASE WHEN NOT v.keep AND $5::bigint > 0 THEN now() + $5 * interval '1 microsecond' END
-	FROM v WHERE e.id = $1`
+	FROM v WHERE e.id = $1
+	RETURNING CASE WHEN NOT v.keep AND e.ready_at <= now() THEN ` + notifyW + "e.queue)" + ` END`
 
 // endExecution ends an execution; continueAsNew then creates the next one
 // and carryPending moves the undelivered signals and cancel requests to it.
@@ -669,7 +677,8 @@ const (
 			RETURNING id
 		)
 		INSERT INTO flows.pending_event (execution_id, visible_at, type, name, version, queue, payload)
-		SELECT id, now(), ` + typeStarted + `, $2, $3, $4, $5 FROM ins`
+		SELECT id, now(), ` + typeStarted + `, $2, $3, $4, $5 FROM ins
+		RETURNING ` + notifyW + "$4)"
 	// carryPending copies the undelivered signals and cancel requests, in
 	// order, to the new execution (after its start event); dropEnded then
 	// deletes the originals.
@@ -699,10 +708,12 @@ const (
 		), p AS (
 			UPDATE flows.execution x SET ready_at = least(coalesce(x.ready_at, now()), now())
 			FROM c WHERE x.id = c.parent_id AND x.status IN ` + activeStatuses + `
-			RETURNING x.id
+			RETURNING x.id, x.queue
+		), ins AS (
+			INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, ref, payload, err, err_kinds)
+			SELECT p.id, now(), $2, c.parent_sched, c.instance_id, $3, $4, $5 FROM p, c
 		)
-		INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, ref, payload, err, err_kinds)
-		SELECT p.id, now(), $2, c.parent_sched, c.instance_id, $3, $4, $5 FROM p, c`
+		SELECT ` + notifyW + "queue) FROM p"
 )
 
 func validateCompletion(c *store.Completion) error {
@@ -885,7 +896,7 @@ func readCompletion(br pgx.BatchResults, sh completionShape) (map[actKey]int64, 
 			var id int64
 			var k actKey
 			var who string
-			if err := rows.Scan(&id, &k.sched, &k.comp, &who); err != nil {
+			if err := rows.Scan(&id, &k.sched, &k.comp, &who, nil); err != nil { // nil: the notify column
 				rows.Close()
 				return nil, err
 			}
@@ -970,8 +981,9 @@ func (s *Store) ExtendActivityTask(ctx context.Context, l store.Lease, ttl time.
 func (s *Store) RetryActivityTask(ctx context.Context, l store.Lease, delay time.Duration) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE flows.activity_task
-		SET owner_id = '', locked_until = NULL, visible_at = now() + $4 * interval '1 microsecond'
-		WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''`,
+		SET owner_id = '', locked_until = NULL, visible_at = now() + $4::bigint * interval '1 microsecond'
+		WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''
+		RETURNING CASE WHEN $4::bigint <= 0 THEN `+notifyA+`queue) END`,
 		l.ID, l.Owner, l.Version, micros(delay))
 	if err != nil {
 		return fmt.Errorf("retry activity task: %w", err)
@@ -1006,7 +1018,8 @@ const (
 		SET ready_at = CASE WHEN locked_until > now() THEN ready_at
 		                    ELSE least(coalesce(ready_at, now()), now()) END
 		WHERE id = (SELECT execution_id FROM flows.activity_task WHERE id = $1)
-		  AND status IN ` + activeStatuses
+		  AND status IN ` + activeStatuses + `
+		RETURNING CASE WHEN locked_until IS NULL OR locked_until <= now() THEN ` + notifyW + "queue)" + ` END`
 	finishTask = `
 		WITH t AS (
 			DELETE FROM flows.activity_task
@@ -1083,10 +1096,26 @@ const deliver = `
 		UPDATE flows.execution SET ready_at = least(coalesce(ready_at, now()), now())
 		WHERE id = (SELECT id FROM flows.execution WHERE instance_id = $1 ORDER BY id DESC LIMIT 1)
 		  AND status IN ` + activeStatuses + `
-		RETURNING id
+		RETURNING id, queue, status <> 'needs_attention' AND (locked_until IS NULL OR locked_until <= now()) AS free
+	), ins AS (
+		INSERT INTO flows.pending_event (execution_id, visible_at, type, name, payload)
+		SELECT id, now(), $2, $3, $4 FROM e
 	)
-	INSERT INTO flows.pending_event (execution_id, visible_at, type, name, payload)
-	SELECT id, now(), $2, $3, $4 FROM e`
+	SELECT CASE WHEN free THEN ` + notifyW + "queue)" + ` END FROM e`
+
+// Notifications (LISTEN/NOTIFY) are hints that work may be ready. The
+// statements that make work ready for other owners send them on
+// workChannel inside their transaction, so they are delivered at commit.
+// The eager path sends none, because NOTIFY takes a global lock at commit.
+// The payload is 'w' or 'a' followed by the queue name.
+const workChannel = "flows_work"
+
+// notifyW and notifyA start a pg_notify of a workflow or activity hint;
+// the caller appends the queue expression and the closing parenthesis.
+const (
+	notifyW = "pg_notify('" + workChannel + "', 'w' || "
+	notifyA = "pg_notify('" + workChannel + "', 'a' || "
+)
 
 // Signal implements store.Store.
 func (s *Store) Signal(ctx context.Context, instanceID, name string, payload []byte) error {

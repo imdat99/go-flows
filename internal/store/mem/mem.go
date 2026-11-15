@@ -56,6 +56,9 @@ type Store struct {
 	executions map[int64]*execution
 	latest     map[string]int64 // instance id -> latest execution id
 	tasks      map[int64]*activityTask
+
+	watchers map[int]func(store.WorkKind, string)
+	nextW    int
 }
 
 type execution struct {
@@ -83,7 +86,10 @@ type activityTask struct {
 	created     int64
 }
 
-var _ store.Store = (*Store)(nil)
+var (
+	_ store.Store   = (*Store)(nil)
+	_ store.Watcher = (*Store)(nil)
+)
 
 // New returns an empty store using clock (nil means the wall clock).
 func New(clock Clock) *Store {
@@ -129,6 +135,7 @@ func (s *Store) create(ne store.NewExecution, now time.Time) *execution {
 	}
 	s.executions[e.ID] = e
 	s.latest[ne.InstanceID] = e.ID
+	s.hint(store.WorkflowWork, e.Queue)
 	s.addPending(e, history.Event{
 		Type: history.ExecutionStarted, Name: ne.Workflow, Version: ne.Version, Queue: ne.Queue,
 		Payload: clone(ne.Input),
@@ -295,6 +302,7 @@ func (s *Store) CompleteWorkflowTask(_ context.Context, l store.Lease, c *store.
 		if cid, ok := s.latest[id]; ok {
 			if ch := s.executions[cid]; ch.Status.Active() && ch.ParentID == e.ID {
 				s.addPending(ch, history.Event{Type: history.ExecutionCancelRequested}, now)
+				s.hint(store.WorkflowWork, ch.Queue)
 			}
 		}
 	}
@@ -312,6 +320,9 @@ func (s *Store) CompleteWorkflowTask(_ context.Context, l store.Lease, c *store.
 	e.lockedUntil = time.Time{}
 	e.lease.Owner = ""
 	e.stickyOwner, e.stickyUntil = "", time.Time{}
+	if len(e.visiblePending(now)) > 0 {
+		s.hint(store.WorkflowWork, e.Queue)
+	}
 	if c.StickyFor > 0 && e.Status.Active() {
 		e.stickyOwner, e.stickyUntil = l.Owner, now.Add(c.StickyFor)
 	}
@@ -396,6 +407,9 @@ func (s *Store) createActivities(e *execution, owner string, acts []store.NewAct
 			leases = append(leases, t.Lease)
 		}
 		s.tasks[t.Lease.ID] = t
+		if a.ClaimFor <= 0 {
+			s.hint(store.ActivityWork, t.Queue)
+		}
 	}
 	return leases
 }
@@ -450,6 +464,7 @@ func (s *Store) notifyParent(e *execution, now time.Time) {
 		return
 	}
 	s.addPending(p, store.ChildOutcome(e.Execution), now)
+	s.hint(store.WorkflowWork, p.Queue)
 }
 
 // ExtendWorkflowTask implements store.Store.
@@ -477,6 +492,9 @@ func (s *Store) ReleaseWorkflowTask(_ context.Context, l store.Lease, delay time
 	e.lockedUntil, e.lease.Owner = time.Time{}, ""
 	e.stickyOwner, e.stickyUntil = "", time.Time{}
 	e.notBefore = now.Add(delay)
+	if delay <= 0 && len(e.visiblePending(now)) > 0 {
+		s.hint(store.WorkflowWork, e.Queue)
+	}
 	return nil
 }
 
@@ -564,6 +582,9 @@ func (s *Store) CompleteActivityTask(_ context.Context, l store.Lease, r store.A
 		ev := cloneEvent(r.Event)
 		ev.ScheduleID, ev.Attempt = t.ScheduleID, t.Attempt
 		s.addPending(e, ev, now)
+		if !e.lockedUntil.After(now) {
+			s.hint(store.WorkflowWork, e.Queue)
+		}
 	}
 	if r.Resume == nil || r.Resume.ID != t.ExecutionID {
 		return nil, nil
@@ -585,6 +606,9 @@ func (s *Store) RetryActivityTask(_ context.Context, l store.Lease, delay time.D
 		return err
 	}
 	t.Lease.Owner, t.lockedUntil, t.visibleAt = "", time.Time{}, now.Add(delay)
+	if delay <= 0 {
+		s.hint(store.ActivityWork, t.Queue)
+	}
 	return nil
 }
 
@@ -610,6 +634,7 @@ func (s *Store) deliver(instanceID string, ev history.Event) error {
 		return store.ErrNotActive
 	}
 	s.addPending(e, ev, s.clock.Now())
+	s.hint(store.WorkflowWork, e.Queue)
 	return nil
 }
 
@@ -683,4 +708,30 @@ func (s *Store) PurgeEnded(_ context.Context, olderThan time.Duration, limit int
 		}
 	}
 	return len(ids), nil
+}
+
+// Watch implements store.Watcher. wake is called with the store's lock
+// held: it must not call the store (signal a channel instead).
+func (s *Store) Watch(ctx context.Context, wake func(store.WorkKind, string)) error {
+	s.mu.Lock()
+	if s.watchers == nil {
+		s.watchers = make(map[int]func(store.WorkKind, string))
+	}
+	id := s.nextW
+	s.nextW++
+	s.watchers[id] = wake
+	s.mu.Unlock()
+	<-ctx.Done()
+	s.mu.Lock()
+	delete(s.watchers, id)
+	s.mu.Unlock()
+	return ctx.Err()
+}
+
+// hint notifies watchers; s.mu is held. Generous: a spurious hint only
+// costs a poll.
+func (s *Store) hint(kind store.WorkKind, queue string) {
+	for _, w := range s.watchers {
+		w(kind, queue)
+	}
 }

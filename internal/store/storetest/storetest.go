@@ -94,6 +94,7 @@ func Run(t *testing.T, h Harness) {
 		{"GW4_PurgeEnded", testPurgeEnded},
 		{"KeptLeaseHolderDies", testKeptLeaseHolderDies},
 		{"GW3_TerminalWithNilConsumed", testTerminalWithNilConsumed},
+		{"WatchHints", testWatch},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

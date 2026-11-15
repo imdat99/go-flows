@@ -107,7 +107,9 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
   - T2.8: đường chạy nhanh qua pgconn cho `CompleteWorkflowTask` và `CompleteActivityTask` (gồm resume). `BenchmarkEagerActivity` (phía store, 1 activity mỗi op, có fsync): alloc **311 → 51**, **20.4 → 9.4 KiB**. Độ trễ không đổi, khoảng 11.7 ms, vì bị giới hạn bởi 2 lần fsync. Với `synchronous_commit=off` còn khoảng 4.3 ms. Đường pgx vẫn được giữ làm fallback và chạy cùng bộ conformance.
   - Review T2.8: lần 1 không đạt (lost wake-up vì bỏ qua UPDATE lên dòng đang bị lease; đường pgx gửi NULL làm hỏng kiểm tra GW-3; statement prepared bị cũ; timestamp bị kẹp). Lần 2 đạt: wake luôn lấy row lock; Release và mọi chỗ tính lại `ready_at` đều chạy sau fence.
   - Hướng tối ưu tiếp theo (ghi nhận lại): giảm số commit trên đường eager (tuỳ chọn tương tự `AsyncStepStart` của saga); activity eager không cần dòng `activity_task`, phục hồi từ history thay vào đó.
-- [ ] **T2.12** LISTEN/NOTIFY và poll có backoff (GW-8).
+- [x] **T2.12** LISTEN/NOTIFY và poll có backoff (GW-8).
+
+  - T2.12 (phía store): `store.Watcher`, kèm `pg_notify` đi qua `RETURNING` trên các đường tạo việc cho owner khác (đường eager không phát notify vì NOTIFY lấy lock toàn cục khi commit), LISTEN trên một kết nối hijack, và `Watch` cho store bộ nhớ. Poll có backoff thì làm ở T3.4 (worker). Review: lần 1 đạt; các ghi chú (hint khi release hoặc retry với delay 0, `wake` không được chặn, timeout khi đóng kết nối, test ổn định hơn, kiểm tra đường eager không phát notify) đã sửa.
 
 ### P3 — Executor và worker
 - [ ] **T3.1** ⚡ Executor replay và catch-up trên runtime P1; so khớp loại, tên, `arg_hash`, thời lượng timer; replay ngắn hơn lịch sử → non-determinism (GW-11). Bench `BenchmarkReplay`.
