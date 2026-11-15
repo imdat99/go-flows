@@ -1,0 +1,314 @@
+package flows
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"time"
+
+	"github.com/imdat99/go-flows/internal/coro"
+	"github.com/imdat99/go-flows/internal/executor"
+	"github.com/imdat99/go-flows/internal/text"
+)
+
+// Ctx is the context of workflow code. Workflow code runs deterministically
+// and is replayed: it must not do I/O, read the clock, start goroutines or
+// use randomness itself. It calls activities for side effects, and Now,
+// Rand, SideEffect, Go and Select instead of the standard ones.
+type Ctx struct{ c coro.Context }
+
+func (c Ctx) state() *executor.State {
+	if c.c == nil {
+		panic(ErrNotInWorkflow)
+	}
+	st := executor.FromContext(c.c)
+	if st == nil {
+		panic(ErrNotInWorkflow)
+	}
+	return st
+}
+
+// inner returns c's coroutine context, panicking with ErrNotInWorkflow for
+// a zero Ctx.
+func (c Ctx) inner() coro.Context {
+	if c.c == nil {
+		panic(ErrNotInWorkflow)
+	}
+	return c.c
+}
+
+// Err reports ErrCanceled once the context is canceled (the workflow was
+// canceled, or a WithCancel parent was).
+func (c Ctx) Err() error {
+	if c.c == nil {
+		return ErrNotInWorkflow
+	}
+	return c.c.Err()
+}
+
+// Value returns the value stored under key (WithValue), or nil.
+func (c Ctx) Value(key any) any { return c.inner().Value(key) }
+
+// WithValue returns a child of c carrying val under key.
+func WithValue(c Ctx, key, val any) Ctx { return Ctx{coro.WithValue(c.inner(), key, val)} }
+
+// WithCancel returns a child of c canceled by cancel or with c. Canceling
+// the context of a running activity, timer or child cancels it.
+func WithCancel(c Ctx) (Ctx, func()) {
+	cc, cancel := coro.WithCancel(c.inner())
+	return Ctx{cc}, cancel
+}
+
+// Disconnected returns a context with c's values that is not canceled with
+// c: for cleanup a canceled workflow still does.
+func Disconnected(c Ctx) (Ctx, func()) {
+	cc, cancel := coro.Disconnected(c.inner())
+	return Ctx{cc}, cancel
+}
+
+// Go runs fn concurrently with the workflow, deterministically (a
+// coroutine, not a goroutine).
+func Go(c Ctx, fn func(c Ctx)) {
+	coro.Go(c.inner(), func(cc coro.Context) { fn(Ctx{cc}) })
+}
+
+// Now returns the workflow time: the database time of the current task's
+// start, the same on every replay.
+func Now(c Ctx) time.Time { return c.state().Now() }
+
+// Replaying reports whether the workflow is replaying recorded history;
+// use it to skip logging or metrics on replay.
+func Replaying(c Ctx) bool { return c.state().Replaying() }
+
+// Sleep waits d of workflow time (a durable timer: the worker does not
+// hold the workflow while it waits). It returns ErrCanceled if c is
+// canceled first.
+func Sleep(c Ctx, d time.Duration) error {
+	_, err := NewTimer(c, d).Get(c)
+	return err
+}
+
+// NewTimer starts a durable timer firing d after the current workflow time.
+func NewTimer(c Ctx, d time.Duration) *Future[struct{}] {
+	f := c.state().NewTimer(c.c, d, "")
+	return &Future[struct{}]{timer: f}
+}
+
+// SideEffect records fn's value the first time the workflow reaches it and
+// returns the recorded value on every replay: for a value computed outside
+// the workflow's determinism (a generated id). A value that cannot be
+// encoded fails the workflow (a panic, recorded with ErrPanic): returning an
+// error live would not replay.
+func SideEffect[T any](c Ctx, fn func() T) (T, error) {
+	cd := newCodec[T]()
+	raw, err := c.state().SideEffect(c.c, func() []byte {
+		b, err := cd.encode(fn())
+		if err != nil {
+			panic(Permanent(fmt.Errorf("flows: side effect value not encodable: %w", err)))
+		}
+		return b
+	})
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return cd.decode(raw)
+}
+
+// Rand returns a random number, recorded (SideEffect).
+func Rand(c Ctx) (uint64, error) {
+	raw, err := c.state().SideEffect(c.c, func() []byte {
+		return binary.BigEndian.AppendUint64(nil, rand.Uint64()) //nolint:gosec // not for security
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(raw) != 8 {
+		return 0, fmt.Errorf("%w: recorded random value has %d bytes", ErrNonDeterministic, len(raw))
+	}
+	return binary.BigEndian.Uint64(raw), nil
+}
+
+// Future is the result of an activity, a child workflow or a timer.
+type Future[T any] struct {
+	res   *coro.Future[executor.Result]
+	timer *coro.Future[struct{}]
+	cd    codec[T]
+	err   error // failed before issuing (input not encodable)
+}
+
+var errSelectNoCases = errors.New("flows: Select without cases")
+
+var errZeroFuture = errors.New("flows: zero Future (use the one returned by Start, Child or NewTimer)")
+
+// Get waits for the result.
+func (f *Future[T]) Get(c Ctx) (T, error) {
+	var zero T
+	switch {
+	case f.err != nil:
+		return zero, f.err
+	case f.timer != nil:
+		_, err := f.timer.Get(c.c)
+		return zero, err
+	case f.res == nil:
+		return zero, errZeroFuture
+	}
+	r, err := f.res.Get(c.c)
+	if err != nil {
+		return zero, err
+	}
+	if r.Err != nil {
+		return zero, fromExecutor(r.Err)
+	}
+	return f.cd.decode(r.Output)
+}
+
+// Ready reports whether Get would return without waiting.
+func (f *Future[T]) Ready() bool {
+	switch {
+	case f.err != nil:
+		return true
+	case f.timer != nil:
+		return f.timer.Ready()
+	case f.res == nil:
+		return true
+	}
+	return f.res.Ready()
+}
+
+// SelectCase is one alternative of Select.
+type SelectCase struct{ c func() coro.Case }
+
+// OnFuture fires when f has its result.
+func OnFuture[T any](f *Future[T], fn func(c Ctx, v T, err error)) SelectCase {
+	return SelectCase{func() coro.Case {
+		switch {
+		case f.err != nil:
+			done := coro.NewFuture[struct{}]()
+			done.Set(struct{}{}, nil)
+			return coro.OnFuture(done, func(cc coro.Context, _ struct{}, _ error) {
+				var zero T
+				fn(Ctx{cc}, zero, f.err)
+			})
+		case f.timer != nil:
+			return coro.OnFuture(f.timer, func(cc coro.Context, _ struct{}, err error) {
+				var zero T
+				fn(Ctx{cc}, zero, err)
+			})
+		case f.res == nil:
+			f.err = errZeroFuture
+			return OnFuture(f, fn).c()
+		}
+		return coro.OnFuture(f.res, func(cc coro.Context, _ executor.Result, _ error) {
+			v, err := f.Get(Ctx{cc})
+			fn(Ctx{cc}, v, err)
+		})
+	}}
+}
+
+// OnSignal fires when a signal arrives on ch.
+func OnSignal[T any](ch *SignalChannel[T], fn func(c Ctx, v T, err error)) SelectCase {
+	return SelectCase{func() coro.Case {
+		return coro.OnReceive(ch.ch, func(cc coro.Context, raw []byte, _ bool) {
+			v, err := ch.cd.decode(raw)
+			fn(Ctx{cc}, v, err)
+		})
+	}}
+}
+
+// OnDefault fires when no other case is ready (Select does not block).
+func OnDefault(fn func(c Ctx)) SelectCase {
+	return SelectCase{func() coro.Case { return coro.OnDefault(func(cc coro.Context) { fn(Ctx{cc}) }) }}
+}
+
+// Select waits until one case is ready and runs it; the first ready case
+// in order wins (deterministic). A Select without cases (or with only
+// zero ones) would block forever: it panics, failing the workflow.
+func Select(c Ctx, cases ...SelectCase) {
+	cc := make([]coro.Case, 0, len(cases))
+	for _, k := range cases {
+		if k.c != nil { // a zero SelectCase is ignored
+			cc = append(cc, k.c())
+		}
+	}
+	if len(cc) == 0 {
+		panic(Permanent(errSelectNoCases))
+	}
+	coro.Select(c.inner(), cc...)
+}
+
+// SignalChannel receives the signals sent to the workflow under one name,
+// in arrival order; none is dropped.
+type SignalChannel[T any] struct {
+	ch *coro.Channel[[]byte]
+	cd codec[T]
+}
+
+// Signals returns the channel of the signals called name. An invalid name
+// (see Engine.Signal) fails the workflow.
+func Signals[T any](c Ctx, name string) *SignalChannel[T] {
+	if err := text.CheckName(ErrInvalidArgument, "signal name", name); err != nil {
+		panic(Permanent(err))
+	}
+	return &SignalChannel[T]{ch: c.state().SignalChannel(name), cd: newCodec[T]()}
+}
+
+// Receive waits for the next signal; it returns ErrCanceled when c is
+// canceled first.
+func (s *SignalChannel[T]) Receive(c Ctx) (T, error) {
+	var zero T
+	done := c.inner().Done()
+	if done == nil {
+		raw, _ := s.ch.Receive(c.c)
+		return s.cd.decode(raw)
+	}
+	var (
+		raw      []byte
+		canceled bool
+	)
+	coro.Select(c.c,
+		coro.OnReceive(s.ch, func(_ coro.Context, v []byte, _ bool) { raw = v }),
+		coro.OnReceive(done, func(coro.Context, struct{}, bool) { canceled = true }),
+	)
+	if canceled {
+		return zero, ErrCanceled
+	}
+	return s.cd.decode(raw)
+}
+
+// TryReceive returns the next signal if one is buffered.
+func (s *SignalChannel[T]) TryReceive() (v T, ok bool, err error) {
+	raw, ok, done := s.ch.TryReceive()
+	if !done || !ok {
+		return v, false, nil
+	}
+	v, err = s.cd.decode(raw)
+	return v, true, err
+}
+
+// Await waits for the next signal called name, at most timeout (0: no
+// limit). It returns ErrAwaitTimeout when the time is up, ErrCanceled when
+// c is canceled.
+func Await[T any](c Ctx, name string, timeout time.Duration) (T, error) {
+	ch := Signals[T](c, name)
+	if timeout <= 0 {
+		return ch.Receive(c)
+	}
+	tc, cancelTimer := WithCancel(c)
+	defer cancelTimer()
+	timer := NewTimer(tc, timeout)
+	var (
+		v   T
+		err error
+	)
+	Select(c,
+		OnSignal(ch, func(_ Ctx, got T, e error) { v, err = got, e }),
+		OnFuture(timer, func(_ Ctx, _ struct{}, e error) {
+			if err = e; err == nil {
+				err = ErrAwaitTimeout
+			}
+		}),
+	)
+	return v, err
+}

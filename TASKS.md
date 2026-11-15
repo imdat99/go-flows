@@ -126,12 +126,18 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
     - Review: lần 1 không đạt (hạn chờ của Stop làm hỏng workflow; báo cáo lease cũ huỷ nhầm lease mới; nhả lease mà không giải phóng slot; resume lỗi làm rò lease; Compensate bị bỏ; renewedAt sai; huỷ khi đang chờ retry; Terminate dễ gãy; panic). Lần 2 không đạt (attempt thành công sau hạn chờ bị bỏ). Lần 3 đạt.
 
 ### P4 — API công khai
-- [ ] **T4.1** ⚡ `DefineWorkflow`/`DefineActivity` generic, đặt tên tường minh, trùng tên thì panic, kiểm tra tên (GW-12); `jsonSlot`.
-- [ ] **T4.2** `Engine` (`New`/`Start`/`Stop`/`Options`), `Handle`, `Start`/`Run`/`Wait`, idempotency (port `saga/engine.go:306`).
-- [ ] **T4.3** `Ctx` API: `Go`, `Select`, `Sleep`/`NewTimer`, `Await`/`SignalChannel` FIFO (GW-14), `Now`, `Rand`, `SideEffect` (GW-18).
-- [ ] **T4.4** Kiểm tra input và làm sạch dữ liệu: `checkName`, `checkStorableJSON` gồm cả surrogate đơn lẻ, `store.Text`, lỗi được tái dựng qua `error_kinds` với `errors.Is` (port saga).
-- [ ] **T4.5** Retry policy phía engine, `Permanent` dùng `errors.As` (GW-15).
-- [ ] **T4.6** `examples/` (đơn hàng, fan-out, signal) chạy end-to-end.
+- [x] **T4.1** ⚡ `DefineWorkflow`/`DefineActivity` generic, đặt tên tường minh, trùng tên thì panic, kiểm tra tên (GW-12); `jsonSlot`.
+- [x] **T4.2** `Engine` (`New`/`Start`/`Stop`/`Options`), `Handle`, `Start`/`Run`/`Wait`, idempotency (port `saga/engine.go:306`).
+- [x] **T4.3** `Ctx` API: `Go`, `Select`, `Sleep`/`NewTimer`, `Await`/`SignalChannel` FIFO (GW-14), `Now`, `Rand`, `SideEffect` (GW-18).
+- [x] **T4.4** Kiểm tra input và làm sạch dữ liệu: `checkName`, `checkStorableJSON` gồm cả surrogate đơn lẻ, `store.Text`, lỗi được tái dựng qua `error_kinds` với `errors.Is` (port saga).
+- [x] **T4.5** Retry policy phía engine, `Permanent` dùng `errors.As` (GW-15).
+- [x] **T4.6** `examples/` (đơn hàng, fan-out, signal) chạy end-to-end.
+
+  - T4.1–T4.6: API công khai ở package gốc (`activity.go`, `codec.go`, `ctx.go`, `engine.go`, `errors.go`, `registry.go`, `workflow.go`), cùng `examples/quickstart` (signal) và `examples/fanout` (fan-out, Select, huỷ), chạy end-to-end trên Postgres.
+    - Payload lưu trong cột `bytea`, nên không cần `checkStorableJSON` (kể cả surrogate đơn lẻ); chỉ văn bản (lỗi, tên) đi qua `text.Safe`/`CheckName`.
+    - Ví dụ đơn hàng có compensation chuyển sang T5.6, vì cần lớp saga.
+    - Bench (`-count 6`): `BenchmarkCodec` encode 1 alloc/32 B khoảng 550 ns, decode 1 alloc/24 B khoảng 900 ns, lookup codec 0 alloc khoảng 36 ns. `BenchmarkPublicActivityRun` (Postgres, eager, 10 activity): 1461–2043 alloc/run, trung vị khoảng 1540; `BenchmarkActivityRun` (worker) đo cùng phiên: 1374–1507, trung vị khoảng 1440. Lớp typed gần như không tốn thêm. Máy ồn hơn lần đo T3 (khoảng 1090 alloc), nên số tuyệt đối thay đổi theo độ trễ của poll. Việc giảm alloc chuyển sang T8.2.
+    - Review: lần 1 không đạt (`SideEffect` lệch khi replay, codec dựng mỗi lần gọi, comp data khi không có compensator, kiểm tra error kind, gán nhầm timeout, `UseNumber`, zero value, tài liệu, ví dụ fanout, test). Lần 2 đạt. Các ghi chú thấp đã sửa: zero `Ctx` panic `ErrNotInWorkflow`, `Select` không có case thì panic, `Rand` báo `ErrNonDeterministic`, decode từ chối dữ liệu thừa. Ghi chú trung bình (encode comp data lỗi sau khi activity thành công phải đánh dấu `uncertain`, và giữ lỗi gốc khi invoke lỗi) chuyển sang T5.1.
 
 ### P5 — Lớp saga
 - [ ] **T5.1** `comp_data` và `uncertain` trong `ActivityCompleted`/`Failed`; `CompensationUncertain`.
