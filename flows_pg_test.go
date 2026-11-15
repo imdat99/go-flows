@@ -337,3 +337,54 @@ func TestPostgresStopHandOver(t *testing.T) {
 		t.Fatalf("activity ran %d times", n)
 	}
 }
+
+var (
+	reserveKid = flows.DefineWorkflow("pgtest.reserve-kid", 1, func(c flows.Ctx, sku string) (string, error) {
+		return reserve.Run(c, sku)
+	})
+	reserveParent = flows.DefineWorkflow("pgtest.reserve-parent", 1, func(c flows.Ctx, id string) (int, error) {
+		if _, err := reserve.Run(c, "p1"); err != nil {
+			return 0, err
+		}
+		if _, err := reserveKid.Child(c, id+"-kid", "k1").Get(c); err != nil {
+			return 0, err
+		}
+		return 0, errors.New("declined after the child")
+	})
+)
+
+// T6.3 on Postgres: the failing parent compensates its completed child.
+func TestPostgresNestedCompensation(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	if err := flows.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	e, err := flows.New(pool, flows.Options{InstanceID: "pg-nest", PollMax: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Stop(ctx) })
+	undone.Delete("pg-nest")
+	undone.Delete("pg-nest-kid")
+	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := reserveParent.Run(wctx, e, "pg-nest", "pg-nest"); !errors.Is(err, flows.ErrCompensated) {
+		t.Fatalf("%v", err)
+	}
+	for id, want := range map[string]string{"pg-nest": "p1", "pg-nest-kid": "k1"} {
+		undoneMu.Lock()
+		v, ok := undone.Load(id)
+		var got []string
+		if ok {
+			got = slices.Clone(*v.(*[]string))
+		}
+		undoneMu.Unlock()
+		if !slices.Equal(got, []string{want}) {
+			t.Fatalf("%s undone %v", id, got)
+		}
+	}
+}

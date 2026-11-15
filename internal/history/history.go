@@ -109,39 +109,44 @@ const (
 	// by ScheduleID) after it expired: the workflow fails with it.
 	LockLost
 
+	// ExecutionCompensationRequested asks a completed execution (a child
+	// whose parent compensates) to compensate its activities and children.
+	ExecutionCompensationRequested
+
 	typeCount // keep last
 )
 
 var typeNames = [typeCount]string{
-	ExecutionStarted:           "ExecutionStarted",
-	ExecutionCompleted:         "ExecutionCompleted",
-	ExecutionFailed:            "ExecutionFailed",
-	ExecutionContinuedAsNew:    "ExecutionContinuedAsNew",
-	ExecutionCanceled:          "ExecutionCanceled",
-	ExecutionTerminated:        "ExecutionTerminated",
-	ExecutionCancelRequested:   "ExecutionCancelRequested",
-	TaskStarted:                "TaskStarted",
-	ActivityScheduled:          "ActivityScheduled",
-	ActivityCompleted:          "ActivityCompleted",
-	ActivityFailed:             "ActivityFailed",
-	ActivityCancelRequested:    "ActivityCancelRequested",
-	TimerScheduled:             "TimerScheduled",
-	TimerFired:                 "TimerFired",
-	TimerCanceled:              "TimerCanceled",
-	SignalReceived:             "SignalReceived",
-	SideEffectResult:           "SideEffectResult",
-	ChildScheduled:             "ChildScheduled",
-	ChildCompleted:             "ChildCompleted",
-	ChildFailed:                "ChildFailed",
-	ChildCancelRequested:       "ChildCancelRequested",
-	CompensationScheduled:      "CompensationScheduled",
-	CompensationCompleted:      "CompensationCompleted",
-	CompensationFailed:         "CompensationFailed",
-	CompensationRetryRequested: "CompensationRetryRequested",
-	LockRequested:              "LockRequested",
-	LockAcquired:               "LockAcquired",
-	LockHeld:                   "LockHeld",
-	LockLost:                   "LockLost",
+	ExecutionStarted:               "ExecutionStarted",
+	ExecutionCompleted:             "ExecutionCompleted",
+	ExecutionFailed:                "ExecutionFailed",
+	ExecutionContinuedAsNew:        "ExecutionContinuedAsNew",
+	ExecutionCanceled:              "ExecutionCanceled",
+	ExecutionTerminated:            "ExecutionTerminated",
+	ExecutionCancelRequested:       "ExecutionCancelRequested",
+	TaskStarted:                    "TaskStarted",
+	ActivityScheduled:              "ActivityScheduled",
+	ActivityCompleted:              "ActivityCompleted",
+	ActivityFailed:                 "ActivityFailed",
+	ActivityCancelRequested:        "ActivityCancelRequested",
+	TimerScheduled:                 "TimerScheduled",
+	TimerFired:                     "TimerFired",
+	TimerCanceled:                  "TimerCanceled",
+	SignalReceived:                 "SignalReceived",
+	SideEffectResult:               "SideEffectResult",
+	ChildScheduled:                 "ChildScheduled",
+	ChildCompleted:                 "ChildCompleted",
+	ChildFailed:                    "ChildFailed",
+	ChildCancelRequested:           "ChildCancelRequested",
+	CompensationScheduled:          "CompensationScheduled",
+	CompensationCompleted:          "CompensationCompleted",
+	CompensationFailed:             "CompensationFailed",
+	CompensationRetryRequested:     "CompensationRetryRequested",
+	LockRequested:                  "LockRequested",
+	LockAcquired:                   "LockAcquired",
+	LockHeld:                       "LockHeld",
+	LockLost:                       "LockLost",
+	ExecutionCompensationRequested: "ExecutionCompensationRequested",
 }
 
 func (t Type) String() string {

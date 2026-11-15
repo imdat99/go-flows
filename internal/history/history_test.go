@@ -51,6 +51,7 @@ func TestTypeValuesAreStable(t *testing.T) {
 		ChildScheduled: 18, ChildCompleted: 19, ChildFailed: 20, ChildCancelRequested: 21,
 		CompensationScheduled: 22, CompensationCompleted: 23, CompensationFailed: 24, CompensationRetryRequested: 25,
 		LockRequested: 26, LockAcquired: 27, LockHeld: 28, LockLost: 29,
+		ExecutionCompensationRequested: 30,
 	}
 	for ty, v := range stable {
 		if uint8(ty) != v {

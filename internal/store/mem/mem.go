@@ -104,6 +104,9 @@ type execution struct {
 	notBefore   time.Time // released with a delay
 	history     []history.Event
 	pending     []pending
+	// compRequested: a completed child reopened by its parent's
+	// compensation; its end answers the parent with CompensationCompleted.
+	compRequested bool
 }
 
 type pending struct {
@@ -342,6 +345,7 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 	s.createChildren(e, c.Children, now)
 	s.cancelRequests(e, c, now)
 	s.acquireLocks(e, c.Locks, now)
+	s.compensateChildren(e, c.CompensateChildren, now)
 
 	if c.Status != "" && c.Status != e.Status {
 		e.Status = c.Status
@@ -520,7 +524,11 @@ func (s *Store) notifyParent(e *execution, now time.Time) {
 	if !ok || !p.Status.Active() {
 		return
 	}
-	s.addPending(p, store.ChildOutcome(e.Execution), now)
+	ev := store.ChildOutcome(e.Execution)
+	if e.compRequested {
+		ev = history.Event{Type: history.CompensationCompleted, ScheduleID: e.ParentSched, Ref: e.InstanceID}
+	}
+	s.addPending(p, ev, now)
 	s.hint(store.WorkflowWork, p.Queue)
 }
 
@@ -750,6 +758,26 @@ func (s *Store) Unstick(_ context.Context, owner string) error {
 	return nil
 }
 
+// compensateChildren reopens the completed children of e at scheds for
+// compensation, or answers at once for the others.
+func (s *Store) compensateChildren(e *execution, scheds []int32, now time.Time) {
+	for _, sched := range scheds {
+		var child *execution
+		for _, ch := range s.executions {
+			if ch.ParentID == e.ID && ch.ParentSched == sched && ch.Status == store.StatusCompleted {
+				child = ch
+			}
+		}
+		if child == nil {
+			s.addPending(e, history.Event{Type: history.CompensationCompleted, ScheduleID: sched}, now)
+			continue
+		}
+		child.Status, child.EndedAt, child.compRequested = store.StatusCompensating, time.Time{}, true
+		s.addPending(child, history.Event{Type: history.ExecutionCompensationRequested}, now)
+		s.hint(store.WorkflowWork, child.Queue)
+	}
+}
+
 // cancelChildrenOf asks the active children of execution id to cancel.
 func (s *Store) cancelChildrenOf(id int64, now time.Time) {
 	for _, ch := range s.executions {
@@ -849,6 +877,9 @@ func (s *Store) PurgeEnded(_ context.Context, olderThan time.Duration, limit int
 	var ids []int64
 	for id, e := range s.executions {
 		if !e.EndedAt.IsZero() && e.EndedAt.Before(cutoff) {
+			if p, ok := s.executions[e.ParentID]; ok && p.Status.Active() {
+				continue // a child of an active parent may still have to compensate
+			}
 			ids = append(ids, id)
 		}
 	}

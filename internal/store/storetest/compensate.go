@@ -142,3 +142,101 @@ func testReopenCompensation(t *testing.T, h Harness) {
 		t.Fatalf("reopen of a non-determinism park: %v", err)
 	}
 }
+
+// T6.3: a compensating parent reopens its completed child for
+// compensation; the child's end answers the parent with
+// CompensationCompleted. A child that did not complete answers at once.
+func testCompensateChildren(t *testing.T, h Harness) {
+	s := h.New(t)
+	n := compensatingParent(t, s, h)
+	if e, _ := s.GetExecution(ctx, "ok"); e.Status != store.StatusCompensating || !e.EndedAt.IsZero() {
+		t.Fatalf("reopened child %+v", e)
+	}
+	if e, _ := s.GetExecution(ctx, "bad"); e.Status != store.StatusFailed {
+		t.Fatalf("failed child %+v", e)
+	}
+	checkChildCompensation(t, s, h, n)
+}
+
+// compensatingParent creates p with children ok (completed) and bad
+// (failed), and records p compensating both; it returns p's last seq.
+func compensatingParent(t *testing.T, s store.Store, h Harness) int64 {
+	t.Helper()
+	mustCreate(t, s, "p")
+	pt := claimOne(t, s, owner, h.TTL)
+	started(t, s, pt, &store.Completion{Children: []store.NewExecution{
+		{InstanceID: "ok", Workflow: "cw", Version: 1, Queue: queue, ParentSched: 1},
+		{InstanceID: "bad", Workflow: "cw", Version: 1, Queue: queue, ParentSched: 2},
+	}})
+	for _, ct := range claim(t, s, owner, h.TTL) {
+		status, typ := store.StatusCompleted, history.ExecutionCompleted
+		if ct.Execution.InstanceID == "bad" {
+			status, typ = store.StatusFailed, history.ExecutionFailed
+		}
+		if _, err := s.CompleteWorkflowTask(ctx, ct.Lease, &store.Completion{
+			History:  []history.Event{{Seq: 1, Type: history.ExecutionStarted}, {Seq: 2, Type: typ}},
+			Consumed: pendingIDs(ct), Status: status,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pt = claimOne(t, s, owner, h.TTL) // both outcomes
+	c := &store.Completion{Consumed: pendingIDs(pt), Status: store.StatusCompensating, Err: "boom", CompensateChildren: []int32{1, 2}}
+	for i, p := range pt.Pending {
+		ev := p.Event
+		ev.Seq = int64(2 + i)
+		c.History = append(c.History, ev)
+	}
+	n := int64(len(c.History))
+	c.History = append(c.History,
+		history.Event{Seq: n + 2, Type: history.ExecutionFailed, Err: "boom"},
+		history.Event{Seq: n + 3, Type: history.CompensationScheduled, ScheduleID: 1, Ref: "ok"},
+		history.Event{Seq: n + 4, Type: history.CompensationScheduled, ScheduleID: 2, Ref: "bad"},
+	)
+	if _, err := s.CompleteWorkflowTask(ctx, pt.Lease, c); err != nil {
+		t.Fatal(err)
+	}
+	return n + 4
+}
+
+// checkChildCompensation runs the reopened child's compensation and checks
+// the parent's answers.
+func checkChildCompensation(t *testing.T, s store.Store, h Harness, last int64) {
+	t.Helper()
+	var parent, child store.WorkflowTask
+	for _, task := range claim(t, s, owner, h.TTL) {
+		switch task.Execution.InstanceID {
+		case "p":
+			parent = task
+		case "ok":
+			child = task
+		}
+	}
+	if len(parent.Pending) != 1 || parent.Pending[0].Event.Type != history.CompensationCompleted || parent.Pending[0].Event.ScheduleID != 2 {
+		t.Fatalf("parent: immediate answer for the failed child %+v", parent.Pending)
+	}
+	if child.Execution.Status != store.StatusCompensating || len(child.Pending) != 1 ||
+		child.Pending[0].Event.Type != history.ExecutionCompensationRequested || child.LastSeq != 2 {
+		t.Fatalf("child task %+v", child)
+	}
+	if _, err := s.CompleteWorkflowTask(ctx, parent.Lease, &store.Completion{
+		History:  []history.Event{{Seq: last + 1, Type: history.CompensationCompleted, ScheduleID: 2}},
+		Consumed: pendingIDs(parent),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CompleteWorkflowTask(ctx, child.Lease, &store.Completion{
+		History:  []history.Event{{Seq: 3, Type: history.ExecutionCompensationRequested}},
+		Consumed: pendingIDs(child), Status: store.StatusCompensated,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	parent = claimOne(t, s, owner, h.TTL)
+	if len(parent.Pending) != 1 || parent.Pending[0].Event.Type != history.CompensationCompleted || parent.Pending[0].Event.ScheduleID != 1 {
+		t.Fatalf("parent: answer at the child's end %+v", parent.Pending)
+	}
+	// Children to compensate in an ending completion are invalid.
+	if _, err := s.CompleteWorkflowTask(ctx, parent.Lease, &store.Completion{Status: store.StatusCompensated, CompensateChildren: []int32{1}}); !errors.Is(err, store.ErrInvalidCompletion) {
+		t.Fatalf("ending with children to compensate: %v", err)
+	}
+}

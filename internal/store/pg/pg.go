@@ -711,6 +711,33 @@ const acquireLock = `
 	            ELSE coalesce((SELECT e.instance_id FROM cur JOIN flows.execution e ON e.id = cur.execution_id),
 	                          'another execution') END`
 
+// compensateChild reopens the completed child of execution $1 at schedule
+// id $2 for compensation, or answers $1 at once (store.Completion
+// .CompensateChildren). Lock order: parent row (fenced), then child row,
+// as cancelChildrenOf.
+const compensateChild = `
+	WITH ch AS (
+		UPDATE flows.execution x
+		SET status = 'compensating', ended_at = NULL, compensate_requested = true,
+		    ready_at = least(coalesce(x.ready_at, now()), now())
+		WHERE x.id = (SELECT id FROM flows.execution
+		              WHERE parent_id = $1 AND parent_id <> 0 AND parent_sched = $2 AND status = 'completed'
+		              ORDER BY id DESC LIMIT 1)
+		RETURNING x.id, x.queue
+	), req AS (
+		INSERT INTO flows.pending_event (execution_id, visible_at, type)
+		SELECT id, now(), ` + typeCompensationRequested + ` FROM ch
+	), done AS (
+		INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id)
+		SELECT $1, now(), ` + typeCompensationCompleted + `, $2 WHERE NOT EXISTS (SELECT 1 FROM ch)
+	)
+	SELECT ` + notifyW + "queue) FROM ch"
+
+const (
+	typeCompensationCompleted = "23" // history.CompensationCompleted
+	typeCompensationRequested = "30" // history.ExecutionCompensationRequested
+)
+
 // sortedLocks orders lock requests by key: two executions taking the same
 // locks in one checkpoint lock their rows in the same order (no deadlock).
 // Answers go by schedule id, so the order is invisible.
@@ -865,14 +892,22 @@ const (
 	// parent.
 	notifyParent = `
 		WITH c AS (
-			SELECT parent_id, parent_sched, instance_id FROM flows.execution WHERE id = $1 AND parent_id <> 0
+			SELECT parent_id, parent_sched, instance_id, compensate_requested FROM flows.execution
+			WHERE id = $1 AND parent_id <> 0
 		), p AS (
 			UPDATE flows.execution x SET ready_at = least(coalesce(x.ready_at, now()), now())
 			FROM c WHERE x.id = c.parent_id AND x.status IN ` + activeStatuses + `
 			RETURNING x.id, x.queue
 		), ins AS (
+			-- A child reopened by its parent's compensation answers that.
 			INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, ref, payload, err, err_kinds)
-			SELECT p.id, now(), $2, c.parent_sched, c.instance_id, $3, $4, $5 FROM p, c
+			SELECT p.id, now(),
+			       CASE WHEN c.compensate_requested THEN ` + typeCompensationCompleted + ` ELSE $2 END,
+			       c.parent_sched, c.instance_id,
+			       CASE WHEN c.compensate_requested THEN NULL ELSE $3::bytea END,
+			       CASE WHEN c.compensate_requested THEN '' ELSE $4 END,
+			       CASE WHEN c.compensate_requested THEN '' ELSE $5 END
+			FROM p, c
 		)
 		SELECT ` + notifyW + "queue) FROM p"
 )
@@ -1011,6 +1046,9 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 	}
 	for _, k := range sortedLocks(c.Locks) {
 		queue(acquireLock, l.ID, k.Key, k.ScheduleID, micros(k.TTL))
+	}
+	for _, sched := range c.CompensateChildren {
+		queue(compensateChild, l.ID, sched)
 	}
 	if !ending {
 		queue(updateRunning, l.ID, lastSeq, string(c.Status), micros(c.KeepFor), micros(c.StickyFor), l.Owner, c.Err, c.ErrKinds)

@@ -125,6 +125,15 @@ func (w *Workflow[I, O]) Handle(e *Engine, instanceID string) *Handle[O] {
 // Child starts the workflow as a child of the running workflow, with
 // instance id instanceID, and returns its future. Canceling c cancels the
 // child. A child whose id is already in use fails with ErrInstanceExists.
+//
+// When the parent fails (or is canceled) and compensates, a child that
+// completed is compensated too, in reverse order with the parent's own
+// activities: it is reopened and undoes its own activities and children,
+// without its locks (released when it completed). Of a child that continued
+// as new, only the last execution is compensated; activities a child
+// started without awaiting them are not. A child still running is canceled
+// (and compensates itself), and the parent waits for it; a child that
+// ignores the cancel and completes afterwards is not compensated.
 func (w *Workflow[I, O]) Child(c Ctx, instanceID string, in I) *Future[O] {
 	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
 		return &Future[O]{err: Permanent(err)}

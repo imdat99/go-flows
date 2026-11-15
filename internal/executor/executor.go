@@ -139,13 +139,18 @@ func (e *Executor) LastSeq() int64 {
 // count updates the MayCompensate counts with an applied event.
 func (e *Executor) count(ev *history.Event) {
 	switch ev.Type {
-	case history.ActivityScheduled:
+	case history.ActivityScheduled, history.ChildScheduled:
 		e.activities++
 	case history.ActivityCompleted, history.ActivityFailed:
 		e.outcomes++
 		if len(ev.CompData) > 0 {
 			e.compensable++
 		}
+	case history.ChildCompleted: // a completed child is compensated with its parent
+		e.outcomes++
+		e.compensable++
+	case history.ChildFailed:
+		e.outcomes++
 	default:
 	}
 }
@@ -343,7 +348,7 @@ func (e *Executor) commit(c *store.Completion) error {
 			return err
 		}
 		for i := before; i < len(st.out); i++ {
-			if st.out[i].Type == history.ActivityScheduled {
+			if t := st.out[i].Type; t == history.ActivityScheduled || t == history.ChildScheduled {
 				e.activities++
 			}
 			sideTables(c, &st.out[i], cmd)

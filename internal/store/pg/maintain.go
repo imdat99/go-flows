@@ -165,6 +165,9 @@ func (s *Store) PurgeEnded(ctx context.Context, olderThan time.Duration, limit i
 		DELETE FROM flows.execution WHERE id IN (
 			SELECT id FROM flows.execution
 			WHERE ended_at < now() - $1 * interval '1 microsecond'
+			  -- a child of an active parent may still have to compensate
+			  AND NOT EXISTS (SELECT 1 FROM flows.execution p
+			                  WHERE p.id = flows.execution.parent_id AND p.status IN `+activeStatuses+`)
 			ORDER BY ended_at
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED)`, micros(olderThan), limit)
@@ -260,7 +263,7 @@ var cancelChildrenOfLatest = strings.Replace(cancelChildrenOf, "x.parent_id = $1
 // of the latest execution of $1.
 const notifyTerminated = `
 	WITH c AS (
-		SELECT parent_id, parent_sched, instance_id FROM flows.execution
+		SELECT parent_id, parent_sched, instance_id, compensate_requested FROM flows.execution
 		WHERE id = ` + latestOf + ` AND parent_id <> 0
 	), p AS (
 		UPDATE flows.execution x SET ready_at = least(coalesce(x.ready_at, now()), now())
@@ -268,7 +271,12 @@ const notifyTerminated = `
 		RETURNING x.id, x.queue
 	), ins AS (
 		INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, ref, err, err_kinds)
-		SELECT p.id, now(), ` + typeChildFailed + `, c.parent_sched, c.instance_id, $2, $3 FROM p, c
+		SELECT p.id, now(),
+		       CASE WHEN c.compensate_requested THEN ` + typeCompensationCompleted + ` ELSE ` + typeChildFailed + ` END,
+		       c.parent_sched, c.instance_id,
+		       CASE WHEN c.compensate_requested THEN '' ELSE $2 END,
+		       CASE WHEN c.compensate_requested THEN '' ELSE $3 END
+		FROM p, c
 	)
 	SELECT ` + notifyW + "queue) FROM p"
 

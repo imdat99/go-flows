@@ -216,6 +216,17 @@ type Completion struct {
 	// (SignalReceived, ExecutionCancelRequested): they are delivered to the
 	// next execution first, before the undelivered ones (GW-3).
 	Carry []history.Event
+	// CompensateChildren are schedule ids of children of this execution to
+	// compensate (nested compensation). A child that completed (the
+	// latest execution of its chain) is reopened: it becomes compensating
+	// with an ExecutionCompensationRequested event, and when it ends the
+	// parent gets CompensationCompleted for the schedule id (whatever its
+	// own compensation did, or if it is terminated). Any other child
+	// (failed or canceled: it compensated itself) has nothing to undo for
+	// the parent: CompensationCompleted is delivered at once. Children of an
+	// active execution are kept from PurgeEnded for this. Of a chain of
+	// continue-as-new executions, only the last one is reopened.
+	CompensateChildren []int32
 	// Locks are business locks to take (LockRequested events). Each gets a
 	// pending answer for this execution, visible at once: LockAcquired when
 	// the lock is free, expired, or already held by this execution (then
@@ -320,7 +331,7 @@ func ValidShape(c *Completion) bool {
 		}
 	}
 	ending := c.Status != "" && !c.Status.Active()
-	if ending && (len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Children) > 0 || len(c.Locks) > 0) {
+	if ending && (len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Children) > 0 || len(c.Locks) > 0 || len(c.CompensateChildren) > 0) {
 		return false // they would be dropped at once
 	}
 	for _, k := range c.Locks {
@@ -439,7 +450,7 @@ type Store interface {
 	RenewLeases(ctx context.Context, owner string, workflows, activities []Lease, ttl time.Duration) (Renewal, error)
 
 	// PurgeEnded deletes up to limit executions that ended before
-	// now - olderThan, with their history, pending events and tasks, and
+	// now - olderThan (but not the children of an active execution), with their history, pending events and tasks, and
 	// returns how many it deleted. Their instance ids become free. Rows
 	// locked elsewhere are skipped, so concurrent purges split the work.
 	PurgeEnded(ctx context.Context, olderThan time.Duration, limit int) (int, error)

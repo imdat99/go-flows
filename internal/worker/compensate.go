@@ -78,26 +78,27 @@ func (d *driver) compensate(task *store.WorkflowTask) (*store.Completion, error)
 		}
 	}
 	d.ledger = nil // until the completion is stored
-	if l.End() == nil {
-		return nil, fmt.Errorf("worker: execution %d is compensating but its workflow has not ended", task.Execution.ID)
-	}
 	c := &store.Completion{}
 	seq := task.LastSeq
 	for i := range task.Pending {
 		p := &task.Pending[i]
 		c.Consumed = append(c.Consumed, p.ID)
 		switch p.Event.Type {
-		case history.ActivityCompleted, history.ActivityFailed, history.CompensationCompleted,
-			history.CompensationFailed, history.CompensationRetryRequested:
+		case history.ActivityCompleted, history.ActivityFailed, history.ChildCompleted, history.ChildFailed,
+			history.CompensationCompleted, history.CompensationFailed, history.CompensationRetryRequested,
+			history.ExecutionCompensationRequested:
 			seq++
 			ev := p.Event
 			ev.Seq = seq
 			c.History = append(c.History, ev)
 			l.Add(&c.History[len(c.History)-1])
 		default:
-			// Signals, cancel requests, timers and child outcomes no longer
-			// matter: the workflow has ended.
+			// Signals, cancel requests and timers no longer matter: the
+			// workflow has ended.
 		}
+	}
+	if l.End() == nil {
+		return nil, fmt.Errorf("worker: execution %d is compensating but its workflow has not ended", task.Execution.ID)
 	}
 	d.plan(l, c, seq)
 	return c, nil
@@ -116,6 +117,11 @@ func (d *driver) plan(l *compensation.Ledger, c *store.Completion, seq int64) {
 	action, s := l.Next()
 	switch action {
 	case compensation.Schedule:
+		if s.Child {
+			add(history.Event{Type: history.CompensationScheduled, ScheduleID: s.ScheduleID, Name: s.Name, Ref: s.Ref})
+			c.CompensateChildren = append(c.CompensateChildren, s.ScheduleID)
+			break
+		}
 		add(history.Event{
 			Type: history.CompensationScheduled, ScheduleID: s.ScheduleID, Name: s.Name, Queue: s.Queue,
 			Payload: s.Data, Uncertain: s.Uncertain,
@@ -140,7 +146,7 @@ func (d *driver) plan(l *compensation.Ledger, c *store.Completion, seq int64) {
 		switch {
 		case end.Type == history.ExecutionCanceled:
 			c.Status = store.StatusCanceled
-		case l.Ran():
+		case l.Ran() || end.Type == history.ExecutionCompensationRequested:
 			c.Status = store.StatusCompensated
 		}
 	case compensation.Wait:

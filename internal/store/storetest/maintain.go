@@ -464,3 +464,26 @@ func testContinueAsNewLeavesChildren(t *testing.T, h Harness) {
 		t.Fatalf("kid %s", e.Status)
 	}
 }
+
+// Review of T6.3 (M1): a child of an active parent is kept from purge (its
+// parent may still have it compensated).
+func testPurgeKeepsChildrenOfActiveParents(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "p")
+	task := claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{Children: []store.NewExecution{{InstanceID: "kid", Workflow: "cw", Version: 1, Queue: queue, ParentSched: 1}}})
+	kid := claimOne(t, s, owner, h.TTL)
+	if _, err := s.CompleteWorkflowTask(ctx, kid.Lease, &store.Completion{
+		History:  []history.Event{{Seq: 1, Type: history.ExecutionStarted}, {Seq: 2, Type: history.ExecutionCompleted}},
+		Consumed: pendingIDs(kid), Status: store.StatusCompleted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.Advance(t, s, h.TTL)
+	if n, err := s.PurgeEnded(ctx, 0, 10); err != nil || n != 0 {
+		t.Fatalf("purged %d %v", n, err)
+	}
+	if _, err := s.GetExecution(ctx, "kid"); err != nil {
+		t.Fatalf("child of an active parent purged: %v", err)
+	}
+}

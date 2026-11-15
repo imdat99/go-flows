@@ -245,7 +245,20 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
       - Cha kết thúc đúng lúc child kết thúc thì có thể deadlock; được retry sau `deadlock_timeout` (đã ghi chú).
       - Trên mem, `cancelChildrenOf` quét toàn bộ execution.
     - **Review:** lần 1 không đạt (H1 cancel bị mất khi continue-as-new; M1 index không được dùng; M2 `sigLog` không giới hạn; M3 deadlock). Lần 2 đạt.
-- [ ] **T6.3** Compensation lồng nhau: cha hoàn tác thì child hoàn tác.
+- [x] **T6.3** Compensation lồng nhau: cha hoàn tác thì child hoàn tác.
+  - T6.3: khi cha compensate, các child đã completed cũng được compensate.
+    - Child completed là một bước trong kế hoạch, xếp xen kẽ ngược thứ tự với activity của cha. Cha gửi `Completion.CompensateChildren`; store mở lại child với trạng thái `compensating`, đặt cờ `compensate_requested` (migration `00007`) và gửi `ExecutionCompensationRequested`.
+    - Child compensate từ history của chính nó, đệ quy xuống cháu. Khi child kết thúc, cha nhận `CompensationCompleted` (kể cả khi child bị terminate). Child không completed thì cha được trả lời ngay.
+    - Child đang chạy khi cha lỗi thì bị huỷ và được chờ. Child bị park sẽ giữ cha ở `compensating` cho tới khi `RetryCompensation` child.
+    - Execution completed được mở lại thì không chờ những gì nó để lại (`settleAbandoned`).
+    - Purge không xoá child của cha còn active.
+    - Giới hạn (đã ghi trong tài liệu):
+      - chỉ execution cuối của chuỗi continue-as-new được compensate;
+      - activity không được await thì không được compensate;
+      - child compensate mà không giữ lock;
+      - child bỏ qua lệnh huỷ rồi completed sau đó thì không được compensate.
+    - **Ghi chú nâng cấp:** drain các execution đang `compensating` trước khi deploy thay đổi này, vì bản cũ không ghi kết quả của child vào history.
+    - Review: lần 1 không đạt (H1 child mở lại treo vì việc nó bỏ lại; M1 purge xoá mất child). Lần 2 đạt.
 
 ### P7 — Công cụ
 - [ ] **T7.1** `flowtest`: store bộ nhớ, đồng hồ ảo tất định, mock activity, phát hiện future còn treo (GW-17). Test các kịch bản #494, #481, #436, #377.

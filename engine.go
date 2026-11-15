@@ -188,7 +188,8 @@ func (e *Engine) Terminate(ctx context.Context, instanceID, reason string) error
 }
 
 // PurgeEnded deletes up to limit executions that ended more than olderThan
-// ago (their histories with them), freeing their instance ids.
+// ago (their histories with them), freeing their instance ids. Children of
+// a running execution are kept until it ends (it may compensate them).
 func (e *Engine) PurgeEnded(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
 	return e.st.PurgeEnded(ctx, olderThan, limit)
 }

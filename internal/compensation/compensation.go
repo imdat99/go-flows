@@ -12,6 +12,13 @@
 // their outcomes, once no activity is still running (its outcome decides).
 // A compensation that fails for good parks the execution until a retry is
 // requested.
+//
+// Children are compensated too (nested compensation): a child that
+// completed is a step, undone by reopening it for compensation (its own
+// activities and children, from its own history); a child still running
+// is awaited (it is canceled, and compensates itself). A completed
+// execution asked to compensate by its parent (ExecutionCompensationRequested)
+// is planned the same way.
 package compensation
 
 import (
@@ -56,6 +63,8 @@ type Step struct {
 	Queue      string
 	Data       []byte // the activity's compensation data
 	Uncertain  bool   // the activity may not have had its effect
+	Child      bool   // a completed child workflow (Name: its workflow, Ref: its instance id)
+	Ref        string
 	Err        string // Park: the compensation's error
 	ErrKinds   string
 }
@@ -80,6 +89,8 @@ const (
 
 type activity struct {
 	name, queue string
+	child       bool
+	ref         string
 	data        []byte
 	outcome     outcome
 	comp        compState
@@ -122,9 +133,16 @@ func (l *Ledger) Add(ev *history.Event) {
 		delete(l.timers, ev.ScheduleID)
 	case history.ChildScheduled:
 		l.children[ev.ScheduleID] = ev.Ref
-	case history.ChildCompleted, history.ChildFailed:
+		l.acts[ev.ScheduleID] = &activity{name: ev.Name, child: true, ref: ev.Ref}
+	case history.ChildCompleted:
 		delete(l.children, ev.ScheduleID)
-	case history.ExecutionFailed, history.ExecutionCanceled:
+		l.outcome(ev, completed)
+	case history.ChildFailed:
+		delete(l.children, ev.ScheduleID)
+		l.outcome(ev, failedCertain) // it compensated itself
+	case history.ExecutionCompleted:
+		l.settleAbandoned()
+	case history.ExecutionFailed, history.ExecutionCanceled, history.ExecutionCompensationRequested:
 		end := *ev
 		l.end = &end
 	case history.CompensationScheduled:
@@ -147,13 +165,41 @@ func (l *Ledger) Add(ev *history.Event) {
 	}
 }
 
+// settleAbandoned resolves what a completed execution left running: no
+// outcome will ever reach it (its tasks were dropped at its end, its
+// children's outcomes went to an ended parent). A child becomes a child
+// step: the store reopens it if it completed, and answers at once
+// otherwise (it was canceled, and compensated itself). An activity is
+// settled as not compensable: whether it ran is unknown, and nothing was
+// recorded for its compensator (a limitation of activities a workflow
+// starts and does not await).
+func (l *Ledger) settleAbandoned() {
+	ids := make([]int32, 0, len(l.acts))
+	for id, a := range l.acts {
+		if a.outcome == running {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids) // deterministic order of the child steps
+	for _, id := range ids {
+		a := l.acts[id]
+		if a.child {
+			a.outcome = completed
+			l.order = append(l.order, id)
+			delete(l.children, id)
+		} else {
+			a.outcome = failedCertain
+		}
+	}
+}
+
 func (l *Ledger) outcome(ev *history.Event, o outcome) {
 	a := l.acts[ev.ScheduleID]
 	if a == nil || a.outcome != running {
 		return
 	}
 	a.outcome = o
-	if o != failedCertain && len(ev.CompData) > 0 { // it has a compensator
+	if o != failedCertain && (a.child || len(ev.CompData) > 0) { // it has a compensator
 		a.data = ev.CompData
 		l.order = append(l.order, ev.ScheduleID)
 	}
@@ -201,6 +247,7 @@ func (l *Ledger) Next() (Action, Step) {
 func (l *Ledger) step(id int32, a *activity) Step {
 	return Step{
 		ScheduleID: id, Name: a.name, Queue: a.queue, Data: a.data, Uncertain: a.outcome == failedUncertain,
+		Child: a.child, Ref: a.ref,
 		Err: a.err, ErrKinds: a.kinds,
 	}
 }
@@ -209,19 +256,19 @@ func (l *Ledger) step(id int32, a *activity) Step {
 // the execution can end at once.
 func (l *Ledger) Trivial() bool {
 	for _, a := range l.acts {
-		if a.outcome == running || len(a.data) > 0 && a.comp != compensated {
+		if a.outcome == running || (a.child && a.outcome == completed || len(a.data) > 0) && a.comp != compensated {
 			return false
 		}
 	}
 	return true
 }
 
-// Running returns the schedule ids of activities without an outcome (to
-// cancel when the workflow ends).
+// Running returns the schedule ids of activities (not children) without an
+// outcome (to cancel when the workflow ends).
 func (l *Ledger) Running() []int32 {
 	var ids []int32
 	for id, a := range l.acts {
-		if a.outcome == running {
+		if a.outcome == running && !a.child {
 			ids = append(ids, id)
 		}
 	}
