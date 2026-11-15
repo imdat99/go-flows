@@ -93,7 +93,7 @@ flows.Migrate(ctx, pool)
   - Partial index `(queue, ready_at) WHERE active`.
 - **`history`:** PK `(instance_pk, seq)`. Cột ánh xạ 1:1 với `internal/history.Event`: `type`, `schedule_id`, `attempt`, `name`, `version`, `ref`, `queue`, `arg_hash`, `payload`, `comp_data`, `err`, `err_kinds`, `uncertain`, `permanent`, `at`, cộng `created_at` (thời điểm ghi, để audit/UI).
 - **`pending_event`:** cùng các cột như `history` (trừ `seq`), `instance_pk` FK cascade, `visible_at` (với `TimerFired` thì bằng `at`). Mỗi lần insert thì cập nhật `instance.ready_at = least(...)`.
-- **`activity_task`:** unique `(instance_pk, schedule_id)`, `kind` (invoke/compensate), `attempt`, `visible_at`, `owner_id`, `lease_version`, `locked_until`, FK cascade.
+- **`activity_task`:** unique `(execution_id, schedule_id, compensate)`, `kind` (invoke/compensate), `attempt`, `visible_at`, `owner_id`, `lease_version`, `locked_until`, FK cascade.
 - **`lock`:** giống `saga.lock`.
 
 Mọi lần ghi của worker đi qua một hàm tương đương `store.Fenced` của saga (`saga/internal/store/store.go:265`): khoá dòng `FOR NO KEY UPDATE`, kiểm tra `owner_id`/`lease_version`. Hoàn tất workflow task là **một transaction**: ghi history, xoá pending đã xử lý, tạo activity_task, timer, signal/child; nhả hoặc giữ lease; NOTIFY.

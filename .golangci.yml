@@ -81,6 +81,7 @@ linters:
             - "!**/test/**"
             - "!$test"
             - "!**/migrate.go"
+            - "!**/internal/store/pg/migrate.go"
           deny:
             - pkg: github.com/imdat99/go-flows/idem
               desc: idem is a module-side helper, the core must not need it
@@ -117,6 +118,11 @@ linters:
     presets:
       - std-error-handling
     rules:
+      # Conformance cases are table entries taking *testing.T, not helpers:
+      # t.Helper() would hide the failing line.
+      - path: internal/store/storetest/
+        linters:
+          - thelper
       - path: _test\.go
         linters:
           - gosec

@@ -90,8 +90,9 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
   - Review T1.3/T1.4: lần 1 không đạt (độ chính xác µs của timer; thiếu trạng thái `Dropped`; side effect không tới `Done`; thiếu Queue và Version). Lần 2 đạt.
 
 ### P2 — Store
-- [ ] **T2.1** Interface `internal/store`, kiểu Task, Lease (`owner`, `version`); bộ test conformance (khung lấy từ `go-workflows/backend/test`).
-- [ ] **T2.2** `internal/store/mem` qua toàn bộ conformance.
+- [x] **T2.1** Interface `internal/store`, kiểu Task, Lease (`owner`, `version`); bộ test conformance (khung lấy từ `go-workflows/backend/test`).
+- [x] **T2.2** `internal/store/mem` qua toàn bộ conformance.
+  - Review T2.1/T2.2: lần 1 không đạt (Keep không dùng được cho vòng eager; signal mất khi completion kết thúc execution; cancel mất khi ContinueAsNew; thứ tự pending; stickiness; copy phòng thủ; ...). Lần 2 đạt; các ghi chú nhỏ của lần 2 (lease của `needs_attention`, `Resume` sai execution, completion kết thúc execution còn tạo activity/timer) đã sửa. Bộ conformance có 39 case.
 - [ ] **T2.3** `migrations/00001` (schema `flows`) cùng `Migrate` có advisory lock và goose (port `saga/migrate.go`, GW-7). Test: 3 instance chạy migrate cùng lúc.
 - [ ] **T2.4** PG tạo instance: unique một phần, idempotency key, xung đột workflow (GW-1). Test tạo đồng thời.
 - [ ] **T2.5** ⚡ PG nhận workflow task: `ready_at`, partial index, `ORDER BY`, lô, `lease_version++`, chỉ dùng `now()` (GW-5, GW-8). Kiểm tra bằng `EXPLAIN`.
@@ -173,4 +174,5 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
 - 2026-11-15: `history.Event` là struct phẳng ánh xạ 1:1 với cột DB, không có codec envelope. Bỏ phần "codec append" của T1.3 vì store bind trực tiếp các field.
 - 2026-11-15: Channel đánh thức mọi receiver khi có thay đổi (không dùng wakeOne), để Select không làm mất wake-up. `TrySend` chỉ thành công khi buffer còn chỗ (khác go-workflows `SendNonblocking`). Workflow dùng `Send` để rendezvous; signal dùng channel không giới hạn.
 - 2026-11-15: Watchdog chung cho cả process, cộng trạng thái `ctl` atomic dùng CAS, thay cho timer theo từng lần chuyển. Sau `ErrStuck` chỉ được gọi `Close`; coroutine đang giữ quyền điều khiển sẽ dọn các coroutine còn lại.
+- 2026-11-15: Contract của store: lease hết hạn nhưng chưa bị cấp lại thì vẫn hợp lệ (ngữ nghĩa saga). Completion kết thúc execution khi còn signal/cancel chưa giao bị từ chối bằng `ErrPendingEvents` (cách Temporal làm), để không bao giờ mất signal. Instance id được giữ chỗ cho tới khi retention xoá.
 - 2026-11-15: sloglint chuyển sang `attr-only`, vì hiệu năng (LogAttrs).
