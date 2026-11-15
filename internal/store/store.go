@@ -388,6 +388,24 @@ type Store interface {
 	RequestCancel(ctx context.Context, instanceID string) error
 }
 
+// EndInfo describes an execution reaching an end (any non-active status
+// but StatusContinued) or a park (StatusNeedsAttention), for hooks.
+type EndInfo struct {
+	ExecutionID int64
+	InstanceID  string
+	Workflow    string
+	Version     int32
+	Status      Status
+	Err         string // the error, or the reason of a park
+	ErrKinds    string
+}
+
+// Ends reports whether a completion with status s ends or parks an
+// execution (what end hooks see).
+func Ends(s Status) bool {
+	return s == StatusNeedsAttention || s != "" && !s.Active() && s != StatusContinued
+}
+
 // ChildOutcome is the event the store delivers to the parent of an ended
 // child execution: ChildCompleted with the output, or ChildFailed with the
 // child's error and kinds plus a kind for the way it ended.

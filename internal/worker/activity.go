@@ -42,6 +42,7 @@ func (p RetryPolicy) Delay(next int32) time.Duration {
 
 // attemptOutcome is the result of one attempt.
 type attemptOutcome struct {
+	err   error         // the attempt's error, for the observer
 	ev    history.Event // ActivityCompleted or ActivityFailed
 	retry bool          // retry after delay instead of recording ev
 	delay time.Duration
@@ -63,7 +64,21 @@ var nullData = []byte("null")
 // lost) and decides what to record: an activity outcome, or for a
 // compensation task, CompensationCompleted or CompensationFailed.
 func (w *Worker) attempt(ctx context.Context, a *Activity, t *store.ActivityTask) attemptOutcome {
+	var start time.Time
+	if w.opts.Observer != nil {
+		start = time.Now()
+	}
 	o := w.attemptOnce(ctx, a, t)
+	if w.opts.Observer != nil && !o.lost {
+		outcome := "completed"
+		switch {
+		case o.retry:
+			outcome = "retrying"
+		case o.ev.Type == history.ActivityFailed:
+			outcome = "failed"
+		}
+		w.observe(func() { w.opts.Observer.ActivityAttempt(t, outcome, time.Since(start), o.err) })
+	}
 	if !t.Compensate && !o.lost && !o.retry && o.ev.Uncertain && len(o.ev.CompData) == 0 {
 		if _, ok := w.acts.Activity(t.Name, true); ok {
 			o.ev.CompData = nullData
@@ -90,7 +105,7 @@ func (w *Worker) attemptOnce(ctx context.Context, a *Activity, t *store.Activity
 		// Canceled by the workflow before this attempt: do not run it. An
 		// earlier attempt (a retry is pending) may have had an effect; its
 		// compensator gets the zero value. Before any attempt, certain.
-		return attemptOutcome{ev: history.Event{
+		return attemptOutcome{err: ErrActivityCanceled, ev: history.Event{
 			Type: history.ActivityFailed, Err: ErrActivityCanceled.Error(), ErrKinds: w.opts.Errors.Kinds(ErrActivityCanceled),
 			Permanent: true, Uncertain: t.Attempt > 1,
 		}}
@@ -105,7 +120,7 @@ func (w *Worker) attemptOnce(ctx context.Context, a *Activity, t *store.Activity
 		// Interrupted by the stop deadline: not a failure. Hand the task
 		// back at once so another instance runs it again (the next claim
 		// counts as an attempt: a shutdown uses one).
-		return attemptOutcome{retry: true}
+		return attemptOutcome{retry: true, err: err}
 	}
 	if err == nil {
 		return attemptOutcome{ev: history.Event{Type: history.ActivityCompleted, Payload: out, CompData: comp}}
@@ -113,7 +128,7 @@ func (w *Worker) attemptOnce(ctx context.Context, a *Activity, t *store.Activity
 	if errors.Is(context.Cause(ctx), ErrActivityCanceled) {
 		// The workflow no longer wants it: no retry. It may have had part
 		// of its effect.
-		return attemptOutcome{ev: history.Event{
+		return attemptOutcome{err: err, ev: history.Event{
 			Type: history.ActivityFailed, Err: w.opts.Errors.Text(err), ErrKinds: w.opts.Errors.Kinds(err),
 			Permanent: true, Uncertain: true, CompData: comp,
 		}}
@@ -123,9 +138,9 @@ func (w *Worker) attemptOnce(ctx context.Context, a *Activity, t *store.Activity
 	uncertain := panicked || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrUncertain)
 	permanent := panicked || w.opts.Errors.Permanent(err)
 	if !permanent && t.Attempt < int32(a.Retry.Attempts) {
-		return attemptOutcome{retry: true, delay: a.Retry.Delay(t.Attempt + 1)}
+		return attemptOutcome{retry: true, delay: a.Retry.Delay(t.Attempt + 1), err: err}
 	}
-	return attemptOutcome{ev: history.Event{
+	return attemptOutcome{err: err, ev: history.Event{
 		Type: history.ActivityFailed, Err: w.opts.Errors.Text(err), ErrKinds: w.opts.Errors.Kinds(err),
 		Permanent: permanent, Uncertain: uncertain, CompData: comp,
 	}}

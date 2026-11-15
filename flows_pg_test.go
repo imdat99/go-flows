@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	flows "github.com/imdat99/go-flows"
 	"github.com/imdat99/go-flows/internal/testdb"
 )
@@ -209,5 +211,54 @@ func TestPostgresLock(t *testing.T) {
 	}
 	if m := maxInside.Load(); m != 1 {
 		t.Fatalf("%d executions inside the critical section at once", m)
+	}
+}
+
+// outbox is a RunHook staging one message per ended execution, in the
+// ending transaction.
+type outbox struct{}
+
+func (outbox) RunEnded(ctx context.Context, tx pgx.Tx, run flows.RunInfo) error {
+	_, err := tx.Exec(ctx, `INSERT INTO outbox (instance, status) VALUES ($1, $2)`, run.InstanceID, string(run.Status))
+	return err
+}
+
+// The run hook writes in the transaction that ends the execution.
+func TestPostgresRunHook(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	if err := flows.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TABLE outbox (instance text PRIMARY KEY, status text)`); err != nil {
+		t.Fatal(err)
+	}
+	e, err := flows.New(pool, flows.Options{InstanceID: "pg-hook", PollMax: 20 * time.Millisecond, Hook: outbox{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Stop(ctx) })
+	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := pickAll.Run(wctx, e, "hook-ok", []item{{"a", 1}}); err != nil {
+		t.Fatal(err)
+	}
+	undone.Delete("hook-comp")
+	if _, err := reserveAll.Run(wctx, e, "hook-comp", []string{"a"}); !errors.Is(err, flows.ErrCompensated) {
+		t.Fatal(err)
+	}
+	rows, err := pool.Query(ctx, `SELECT instance || '=' || status FROM outbox ORDER BY instance`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"hook-comp=compensated", "hook-ok=completed"}) {
+		t.Fatalf("outbox %v", got)
 	}
 }

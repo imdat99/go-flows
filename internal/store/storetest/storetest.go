@@ -33,6 +33,8 @@ type Harness struct {
 	// test step to complete within it on the implementation, and Advance(TTL)
 	// must be affordable. Zero means 1s.
 	TTL time.Duration
+	// SetHook installs an end hook on s (nil: the hook cases are skipped).
+	SetHook func(s store.Store, h func(ctx context.Context, e store.EndInfo) error)
 }
 
 const (
@@ -106,6 +108,8 @@ func Run(t *testing.T, h Harness) {
 		{"LockLostBlocksEnd", testLockLostBlocksEnd},
 		{"LockRace", testLockRace},
 		{"LockNotTakenFromRunningHolder", testLockNotTakenFromRunningHolder},
+		{"EndHook", testEndHook},
+		{"EndHookCalls", testEndHookCalls},
 		{"GW13_ActivityCancelReachesItsWorker", testActivityCancel},
 		{"GW13_CancelBeforeRetry", testCancelBeforeRetry},
 	}

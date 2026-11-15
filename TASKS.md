@@ -192,7 +192,23 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
       - Lần 1 không đạt: H1, lock hết hạn khi activity không chạy eager; M1, claim và cướp lock deadlock lẫn nhau; M2, compensation; M3, `LockLost` bị bỏ khi kết thúc.
       - Lần 2 không đạt: H1-r2, claim `SKIP LOCKED` làm lock bị cướp khi holder đang chạy.
       - Lần 3 đạt.
-- [ ] **T5.5** `RunHook` chạy trong transaction kết thúc, `Observer`, port `idem/`.
+- [x] **T5.5** `RunHook` chạy trong transaction kết thúc, `Observer`, port `idem/`.
+  - T5.5: `RunHook` chạy trong transaction ghi lại việc kết thúc (completed, failed, compensated, canceled, terminated) hoặc park (`needs_attention`); continue-as-new không tính.
+    - Trên pg: chỉ những completion kết thúc mới dùng transaction tường minh (`inTx`), còn lại vẫn đi fast path. Hook chạy sau fence và `noUndelivered`. Hook lỗi hoặc panic thì rollback, task được bàn giao và chạy lại sau `HandBack`. Lỗi của hook không bị hiểu nhầm thành tín hiệu của store (kiểu `hookError`).
+    - Trên mem: hook nhận `tx` nil.
+    - `Observer`: nhận từng attempt của activity và compensator, và các lần kết thúc đã commit (kể cả `Terminate`). Panic được recover và ghi log; khi không cấu hình thì chỉ tốn một phép so nil.
+    - `idem/`: port từ saga, dùng `flows.Key`.
+    - Test:
+      - conformance `EndHook`, `EndHookCalls`;
+      - pg `TestEndHookIsAtomic`, `TestEndHookErrorsAreNotStoreSignals`;
+      - engine `TestRunHookAndObserver`, `TestPanickingObserver`, `TestRunHookFailureIsRetried`;
+      - pg e2e outbox;
+      - bộ test của idem.
+    - Còn mở (thấp):
+      - `Terminate` đọc `GetExecution` riêng để báo cho observer;
+      - khi có hook, `inTx` tốn thêm một round trip `SELECT`;
+      - thiếu test: hook đi cùng `ErrPendingEvents`, park do non-determinism đi tới hook ở mức engine, khẳng định 0 alloc khi không cấu hình gì.
+    - Review: lần 1 không đạt (panic trong observer lọt ra ngoài; mã lỗi của hook bị hiểu nhầm). Lần 2 đạt.
 - [ ] **T5.6** Port test saga: `CompensationReverseOrder`, `review_fixes_test.go`, `lock_test.go`, `async_test.go`.
 
 ### P6 — Sub-workflow và ContinueAsNew

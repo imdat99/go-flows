@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -263,23 +264,34 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 				k AS (DELETE FROM flows.lock WHERE execution_id = `+latestOf+`)
 				DELETE FROM flows.activity_task WHERE execution_id = `+latestOf, instanceID)
 			b.Queue(notifyTerminated, instanceID, ev.Err, ev.ErrKinds)
-			br := s.pool.SendBatch(ctx, b)
-			defer br.Close()
-			var id int64
-			if err := br.QueryRow().Scan(&id); err != nil {
-				return err
-			}
-			for range 2 {
-				if _, err := br.Exec(); err != nil {
-					return err
+			send := func(sb interface {
+				SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+			},
+			) (int64, error) {
+				br := sb.SendBatch(ctx, b)
+				defer br.Close()
+				var id int64
+				if err := br.QueryRow().Scan(&id); err != nil {
+					return 0, err
 				}
+				for range 2 {
+					if _, err := br.Exec(); err != nil {
+						return 0, err
+					}
+				}
+				return id, br.Close()
 			}
-			return br.Close()
+			if s.hook != nil {
+				return s.inTx(ctx, store.EndInfo{Status: store.StatusTerminated, Err: reason},
+					func(tx pgx.Tx) (int64, error) { return send(tx) })
+			}
+			_, err := send(s.pool)
+			return err
 		})
-		if sqlState(err) != codeLeaseLost {
-			if err != nil {
-				return fmt.Errorf("terminate: %w", err)
-			}
+		if he := (*hookError)(nil); err != nil && (errors.As(err, &he) || sqlState(err) != codeLeaseLost) {
+			return fmt.Errorf("terminate: %w", err)
+		}
+		if err == nil {
 			return nil
 		}
 		// Nothing active was terminated: the latest execution ended, or

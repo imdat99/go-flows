@@ -93,6 +93,21 @@ type Options struct {
 	StuckTimeout time.Duration
 	Errors       ErrorCodec
 	Logger       *slog.Logger
+	// Observer, when set, is told of activity attempts and of executions
+	// ending, after the fact (it must not block).
+	Observer Observer
+}
+
+// Observer receives measurements (see Options.Observer).
+type Observer interface {
+	// ActivityAttempt follows each attempt of an activity or compensator,
+	// before its outcome is recorded (an attempt whose recording fails, its
+	// lease lost, may run and be reported again): outcome is "completed",
+	// "failed" or "retrying"; err is the attempt's error (nil when
+	// completed). Panics are recovered and logged.
+	ActivityAttempt(t *store.ActivityTask, outcome string, d time.Duration, err error)
+	// Ended follows a committed end or park of an execution (store.Ends).
+	Ended(e store.EndInfo)
 }
 
 func (o *Options) defaults() {

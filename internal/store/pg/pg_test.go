@@ -54,6 +54,9 @@ func TestConformance(t *testing.T) {
 			time.Sleep(d)
 		},
 		TTL: 1500 * time.Millisecond, // generous: about 50 parallel cases share one Postgres
+		SetHook: func(s store.Store, h func(context.Context, store.EndInfo) error) {
+			s.(*pg.Store).SetHook(func(ctx context.Context, _ pgx.Tx, e store.EndInfo) error { return h(ctx, e) })
+		},
 	})
 }
 

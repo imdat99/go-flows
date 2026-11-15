@@ -7,6 +7,7 @@ package mem
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -58,9 +59,33 @@ type Store struct {
 	latest     map[string]int64 // instance id -> latest execution id
 	tasks      map[int64]*activityTask
 	locks      map[string]*lockRow // business locks by key
+	hook       func(ctx context.Context, e store.EndInfo) error
 
 	watchers map[int]func(store.WorkKind, string)
 	nextW    int
+}
+
+// SetHook installs the end hook (see pg.Hook), before the store is used.
+// It is called with the store locked, before the end is applied; an error
+// rejects the completion. It must not call the store.
+func (s *Store) SetHook(h func(ctx context.Context, e store.EndInfo) error) { s.hook = h }
+
+func (s *Store) callHook(ctx context.Context, e *execution, status store.Status, msg, kinds string) (err error) {
+	if s.hook == nil {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("end hook: panic: %v", r)
+		}
+	}()
+	if err := s.hook(ctx, store.EndInfo{
+		ExecutionID: e.ID, InstanceID: e.InstanceID, Workflow: e.Workflow, Version: e.Version,
+		Status: status, Err: msg, ErrKinds: kinds,
+	}); err != nil {
+		return fmt.Errorf("end hook: %w", err)
+	}
+	return nil
 }
 
 type lockRow struct {
@@ -286,7 +311,7 @@ func (s *Store) fenced(l store.Lease) (*execution, error) {
 }
 
 // CompleteWorkflowTask implements store.Store.
-func (s *Store) CompleteWorkflowTask(_ context.Context, l store.Lease, c *store.Completion) ([]store.Lease, error) {
+func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *store.Completion) ([]store.Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.clock.Now()
@@ -296,6 +321,11 @@ func (s *Store) CompleteWorkflowTask(_ context.Context, l store.Lease, c *store.
 	}
 	if err := s.validate(e, c); err != nil {
 		return nil, err
+	}
+	if store.Ends(c.Status) {
+		if err := s.callHook(ctx, e, c.Status, c.Err, c.ErrKinds); err != nil {
+			return nil, err
+		}
 	}
 	for _, ev := range c.History {
 		e.history = append(e.history, cloneEvent(ev))
@@ -849,7 +879,7 @@ func (s *Store) hint(kind store.WorkKind, queue string) {
 }
 
 // Terminate implements store.Store.
-func (s *Store) Terminate(_ context.Context, instanceID, reason string) error {
+func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id, ok := s.latest[instanceID]
@@ -859,6 +889,9 @@ func (s *Store) Terminate(_ context.Context, instanceID, reason string) error {
 	e := s.executions[id]
 	if !e.Status.Active() {
 		return store.ErrNotActive
+	}
+	if err := s.callHook(ctx, e, store.StatusTerminated, reason, ""); err != nil {
+		return err
 	}
 	now := s.clock.Now()
 	seq := int64(1)

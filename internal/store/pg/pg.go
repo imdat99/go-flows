@@ -36,6 +36,57 @@ import (
 type Store struct {
 	pool *pgxpool.Pool
 	fast bool // hot paths on pgconn (fast.go)
+	hook Hook // nil: no end hook
+}
+
+// Hook runs inside the transaction that ends or parks an execution
+// (store.Ends), after the store's own writes and under the same fence: what
+// it writes commits atomically with the status, and an error (or a panic)
+// rolls everything back: the completion fails, the task is retried later.
+type Hook func(ctx context.Context, tx pgx.Tx, e store.EndInfo) error
+
+// SetHook installs the end hook (before the store is used).
+func (s *Store) SetHook(h Hook) { s.hook = h }
+
+// inTx runs fn in a transaction, then the end hook for the execution fn
+// returns, with info's status and error, then commits.
+func (s *Store) inTx(ctx context.Context, info store.EndInfo, fn func(tx pgx.Tx) (int64, error)) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	id, err := fn(tx)
+	if err != nil {
+		return err
+	}
+	if err := tx.QueryRow(ctx, `SELECT instance_id, workflow, version FROM flows.execution WHERE id = $1`, id).
+		Scan(&info.InstanceID, &info.Workflow, &info.Version); err != nil {
+		return err
+	}
+	info.ExecutionID = id
+	if err := callHook(ctx, s.hook, tx, info); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// hookError wraps an end hook's error (it is not retried as a transient one).
+type hookError struct{ err error }
+
+func (e *hookError) Error() string { return "end hook: " + e.err.Error() }
+func (e *hookError) Unwrap() error { return e.err }
+
+func callHook(ctx context.Context, h Hook, tx pgx.Tx, info store.EndInfo) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &hookError{fmt.Errorf("panic: %v", r)}
+		}
+	}()
+	if err := h(ctx, tx, info); err != nil {
+		return &hookError{err}
+	}
+	return nil
 }
 
 var _ store.Store = (*Store)(nil)
@@ -847,9 +898,10 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 	}
 	ending := c.Status != "" && !c.Status.Active()
 	terminal := ending && c.Status != store.StatusContinued
+	hooked := s.hook != nil && store.Ends(c.Status)
 	var claimed map[actKey]int64
 	err := retry(ctx, func() error {
-		if s.fast {
+		if s.fast && !hooked {
 			var err error
 			claimed, err = s.completeFast(ctx, l, c, ending, terminal, prevSeq, lastSeq)
 			return err
@@ -862,15 +914,28 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 			sh.statements++
 		}
 		s.queueCompletion(b, l, c, ending, lastSeq, &sh)
-		br := s.pool.SendBatch(ctx, b)
-		defer br.Close()
-		var err error
-		if claimed, err = readCompletion(br, sh); err != nil {
-			return err
+		send := func(sb interface {
+			SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+		},
+		) error {
+			br := sb.SendBatch(ctx, b)
+			defer br.Close()
+			var err error
+			if claimed, err = readCompletion(br, sh); err != nil {
+				return err
+			}
+			return br.Close()
 		}
-		return br.Close()
+		if hooked {
+			return s.inTx(ctx, store.EndInfo{Status: c.Status, Err: c.Err, ErrKinds: c.ErrKinds},
+				func(tx pgx.Tx) (int64, error) { return l.ID, send(tx) })
+		}
+		return send(s.pool)
 	})
 	if err != nil {
+		if he := (*hookError)(nil); errors.As(err, &he) {
+			return nil, fmt.Errorf("complete workflow task: %w", err) // the hook's own codes mean nothing here
+		}
 		err = mapErr(err)
 		if sqlState(err) == "23505" { // a second task for one schedule id
 			return nil, store.ErrInvalidCompletion

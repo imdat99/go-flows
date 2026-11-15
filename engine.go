@@ -11,6 +11,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/imdat99/go-flows/internal/store"
@@ -48,14 +49,19 @@ type Options struct {
 	// EagerWindow is how long an execution waits for its eager activities
 	// before letting signals and timers in (default 200ms).
 	EagerWindow time.Duration
+	// Hook, when set, runs in the transaction of every end or park.
+	Hook RunHook
+	// Observer, when set, receives activity attempts and ends.
+	Observer Observer
 }
 
 // Engine runs the workflows and activities defined in this binary against
 // a Postgres database. Several processes can run engines on the same
 // database: tasks are leased, and every write is fenced.
 type Engine struct {
-	st store.Store
-	w  *worker.Worker
+	st  store.Store
+	w   *worker.Worker
+	obs Observer
 }
 
 // New returns a stopped engine on pool. Run Migrate first.
@@ -77,16 +83,31 @@ func newEngine(st store.Store, opts Options) (*Engine, error) {
 	if len(opts.Queues) == 0 {
 		opts.Queues = []string{DefaultQueue}
 	}
+	if h := opts.Hook; h != nil {
+		switch s := st.(type) {
+		case *pg.Store:
+			s.SetHook(func(ctx context.Context, tx pgx.Tx, e store.EndInfo) error { return h.RunEnded(ctx, tx, runInfo(e)) })
+		case interface { // the memory store (tests): no transaction
+			SetHook(func(context.Context, store.EndInfo) error)
+		}:
+			s.SetHook(func(ctx context.Context, e store.EndInfo) error { return h.RunEnded(ctx, nil, runInfo(e)) })
+		}
+	}
+	var obs worker.Observer
+	if opts.Observer != nil {
+		obs = observer{opts.Observer}
+	}
 	w, err := worker.New(st, workerRegistry{}, workerRegistry{}, worker.Options{
 		Owner: opts.InstanceID, Queues: opts.Queues, LeaseTTL: opts.LeaseTTL,
 		MaxWorkflowTasks: opts.MaxWorkflowTasks, MaxActivities: opts.MaxActivities,
 		Eager: !opts.DisableEager, EagerWindow: opts.EagerWindow, StickyFor: opts.StickyFor,
 		PollMax: opts.PollMax, CacheSize: opts.CacheSize, Errors: errorCodec{}, Logger: opts.Logger,
+		Observer: obs,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("flows: %w", err)
 	}
-	return &Engine{st: st, w: w}, nil
+	return &Engine{st: st, w: w, obs: opts.Observer}, nil
 }
 
 // Start starts running tasks. Without Start, an engine still starts
@@ -148,7 +169,22 @@ func (e *Engine) Terminate(ctx context.Context, instanceID, reason string) error
 	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
 		return err
 	}
-	return e.st.Terminate(ctx, instanceID, text.Safe(reason, maxErrorText))
+	reason = text.Safe(reason, maxErrorText)
+	if err := e.st.Terminate(ctx, instanceID, reason); err != nil {
+		return err
+	}
+	if e.obs != nil {
+		if ex, err := e.st.GetExecution(ctx, instanceID); err == nil {
+			func() {
+				defer func() { _ = recover() }() // a broken observer must not fail Terminate
+				e.obs.RunEnded(RunInfo{
+					InstanceID: instanceID, Workflow: ex.Workflow, Version: int(ex.Version),
+					Status: StatusTerminated, Error: reason,
+				})
+			}()
+		}
+	}
+	return nil
 }
 
 // PurgeEnded deletes up to limit executions that ended more than olderThan

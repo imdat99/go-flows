@@ -1,6 +1,7 @@
 package mem_test
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -26,6 +27,9 @@ func TestConformance(t *testing.T) {
 				t.Fatal("unknown store")
 			}
 			c.(*mem.ManualClock).Advance(d)
+		},
+		SetHook: func(s store.Store, h func(context.Context, store.EndInfo) error) {
+			s.(*mem.Store).SetHook(h)
 		},
 	})
 }

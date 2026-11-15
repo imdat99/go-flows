@@ -321,6 +321,9 @@ func (d *driver) completed(task *store.WorkflowTask, c *store.Completion, eager 
 	} else {
 		w.hb.renewedAt(false, d.lease.ID, sent) // the completion extended it to sent+KeepFor at least
 	}
+	if store.Ends(c.Status) {
+		w.ended(&task.Execution, c.Status, c.Err, c.ErrKinds)
+	}
 	if c.Status != "" && (!c.Status.Active() || c.Status == store.StatusNeedsAttention) {
 		d.evict()
 	} else if d.ex != nil && !d.held && d.inflight == 0 && len(eager) == 0 {
@@ -428,13 +431,17 @@ func (d *driver) fail(task *store.WorkflowTask, err error) {
 		w.log.LogAttrs(d.ctx, slog.LevelError, "flows: non-deterministic workflow, parking",
 			slog.String("instance", task.Execution.InstanceID), slog.Any("error", err))
 		c := &store.Completion{Status: store.StatusNeedsAttention, Err: w.opts.Errors.Text(err)}
-		if _, cerr := w.st.CompleteWorkflowTask(d.ctx, d.lease, c); cerr != nil && !errors.Is(cerr, store.ErrLeaseLost) {
+		_, cerr := w.st.CompleteWorkflowTask(d.ctx, d.lease, c)
+		if cerr != nil && !errors.Is(cerr, store.ErrLeaseLost) {
 			w.log.LogAttrs(d.ctx, slog.LevelError, "flows: park", slog.Any("error", cerr))
 			d.release(w.opts.HandBack)
 			return
 		}
 		d.held = false
 		d.untrack()
+		if cerr == nil {
+			w.ended(&task.Execution, c.Status, c.Err, c.ErrKinds)
+		}
 		return
 	}
 	if errors.Is(err, coro.ErrStuck) {
@@ -443,6 +450,29 @@ func (d *driver) fail(task *store.WorkflowTask, err error) {
 	w.log.LogAttrs(d.ctx, slog.LevelError, "flows: workflow task failed, handing back",
 		slog.String("instance", task.Execution.InstanceID), slog.Any("error", err))
 	d.release(w.opts.HandBack)
+}
+
+// ended tells the observer of a committed end or park.
+func (w *Worker) ended(e *store.Execution, status store.Status, msg, kinds string) {
+	if w.opts.Observer != nil {
+		w.observe(func() {
+			w.opts.Observer.Ended(store.EndInfo{
+				ExecutionID: e.ID, InstanceID: e.InstanceID, Workflow: e.Workflow, Version: e.Version,
+				Status: status, Err: msg, ErrKinds: kinds,
+			})
+		})
+	}
+}
+
+// observe calls the observer, recovering (and logging) its panics: a
+// broken metrics hook must not lose a result nor crash the process.
+func (w *Worker) observe(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.log.LogAttrs(context.Background(), slog.LevelError, "flows: panic in observer", slog.Any("panic", r))
+		}
+	}()
+	fn()
 }
 
 func (d *driver) evict() {
