@@ -99,6 +99,13 @@ func Run(t *testing.T, h Harness) {
 		{"CompensationTask", testCompensationTask},
 		{"ActivityResultTypes", testActivityResultTypes},
 		{"ReopenCompensation", testReopenCompensation},
+		{"Locks", testLocks},
+		{"LockRenewal", testLockRenewal},
+		{"LockValidation", testLockValidation},
+		{"LockHeldDuringActivity", testLockHeldDuringActivity},
+		{"LockLostBlocksEnd", testLockLostBlocksEnd},
+		{"LockRace", testLockRace},
+		{"LockNotTakenFromRunningHolder", testLockNotTakenFromRunningHolder},
 		{"GW13_ActivityCancelReachesItsWorker", testActivityCancel},
 		{"GW13_CancelBeforeRetry", testCancelBeforeRetry},
 	}

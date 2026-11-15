@@ -22,6 +22,7 @@ var (
 	nInsertChild    = stmtName(insertChild)
 	nCancelChildren = stmtName(cancelChildren)
 	nCancelActs     = stmtName(cancelActivities)
+	nAcquireLock    = stmtName(acquireLock)
 	nUpdateRunning  = stmtName(updateRunning)
 	nEndExecution   = stmtName(endExecution)
 	nContinueAsNew  = stmtName(continueAsNew)
@@ -171,6 +172,16 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 		fb.stmt(cancelActivities, nCancelActs, func() {
 			fb.Int(l.ID)
 			fb.Ints(len(c.CanceledActivities), func(i int) int64 { return int64(c.CanceledActivities[i]) })
+		})
+	}
+	locks := sortedLocks(c.Locks)
+	for i := range locks {
+		k := &locks[i]
+		fb.stmt(acquireLock, nAcquireLock, func() {
+			fb.Int(l.ID)
+			fb.Str(k.Key)
+			fb.Int(int64(k.ScheduleID))
+			fb.Int(micros(k.TTL))
 		})
 	}
 	s.endFast(fb, l, c, ending, lastSeq)

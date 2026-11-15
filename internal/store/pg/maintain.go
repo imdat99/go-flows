@@ -30,6 +30,12 @@ const (
 			UPDATE flows.execution e SET locked_until = now() + $4 * interval '1 microsecond'
 			FROM locked WHERE e.id = locked.id
 			RETURNING e.id
+		), locks AS (
+			-- Business locks of running executions live as long as their
+			-- lease (SKIP LOCKED: never wait on a contender's lock row).
+			UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
+			WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id IN (SELECT id FROM renewed)
+			                FOR UPDATE SKIP LOCKED)
 		)
 		SELECT id, true, false FROM renewed
 		UNION ALL
@@ -48,7 +54,12 @@ const (
 			UPDATE flows.activity_task t
 			SET locked_until = now() + $4 * interval '1 microsecond', visible_at = now() + $4 * interval '1 microsecond'
 			FROM locked WHERE t.id = locked.id
-			RETURNING t.id, t.cancel_requested
+			RETURNING t.id, t.cancel_requested, t.execution_id
+		), locks AS (
+			-- An execution's locks live while its activities run.
+			UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
+			WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id IN (SELECT execution_id FROM renewed)
+			                FOR UPDATE SKIP LOCKED)
 		)
 		SELECT id, true, cancel_requested FROM renewed
 		UNION ALL
@@ -248,7 +259,8 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 		err := retry(ctx, func() error {
 			b := &pgx.Batch{}
 			b.Queue(terminate, instanceID, reason)
-			b.Queue(`WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = `+latestOf+`)
+			b.Queue(`WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = `+latestOf+`),
+				k AS (DELETE FROM flows.lock WHERE execution_id = `+latestOf+`)
 				DELETE FROM flows.activity_task WHERE execution_id = `+latestOf, instanceID)
 			b.Queue(notifyTerminated, instanceID, ev.Err, ev.ErrKinds)
 			br := s.pool.SendBatch(ctx, b)

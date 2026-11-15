@@ -9,9 +9,9 @@ import (
 )
 
 // GW-8: the claim statements can use their partial indexes (go-workflows
-// scanned every active instance). With seq scans disabled, the plan must
-// name the index; a planner that cannot use it falls back to a seq scan and
-// fails the test.
+// scanned every active instance), and their lock extension the lock index.
+// With seq scans disabled, the plan must name each index; a planner that
+// cannot use one falls back to a seq scan and fails the test.
 func TestGW8_ClaimsUseTheirIndexes(t *testing.T) {
 	pool := testdb.New(t)
 	ctx := context.Background()
@@ -27,14 +27,15 @@ func TestGW8_ClaimsUseTheirIndexes(t *testing.T) {
 		t.Fatal(err)
 	}
 	cases := []struct {
-		name, sql, index string
-		args             []any
+		name, sql string
+		indexes   []string
+		args      []any
 	}{
-		{"workflow claim", claimWorkflow, "execution_ready_idx", []any{[]string{"q"}, "o", 10, int64(1e6)}},
-		{"activity claim", claimActivities, "activity_task_ready_idx", []any{[]string{"q"}, "o", 10, int64(1e6)}},
+		{"workflow claim", claimWorkflow, []string{"execution_ready_idx", "lock_execution"}, []any{[]string{"q"}, "o", 10, int64(1e6)}},
+		{"activity claim", claimActivities, []string{"activity_task_ready_idx", "lock_execution"}, []any{[]string{"q"}, "o", 10, int64(1e6)}},
 		{
 			"latest execution", `SELECT ` + executionColumns + ` FROM flows.execution WHERE instance_id = $1 ORDER BY id DESC LIMIT 1`,
-			"execution_instance_idx",
+			[]string{"execution_instance_idx"},
 			[]any{"i"},
 		},
 	}
@@ -52,8 +53,10 @@ func TestGW8_ClaimsUseTheirIndexes(t *testing.T) {
 			plan.WriteString(line + "\n")
 		}
 		rows.Close()
-		if !strings.Contains(plan.String(), c.index) {
-			t.Errorf("%s does not use %s:\n%s", c.name, c.index, plan.String())
+		for _, index := range c.indexes {
+			if !strings.Contains(plan.String(), index) {
+				t.Errorf("%s does not use %s:\n%s", c.name, index, plan.String())
+			}
 		}
 	}
 }

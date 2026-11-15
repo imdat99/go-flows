@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -128,6 +129,47 @@ func (c *timerCall) resolve(ev *history.Event) error {
 	}
 	c.f.Set(struct{}{}, nil)
 	return nil
+}
+
+// lockCall is a lock request: the store answers it in the same checkpoint.
+type lockCall struct {
+	cmd command.Command
+	f   coro.Future[struct{}]
+}
+
+func (c *lockCall) command() *command.Command { return &c.cmd }
+
+func (c *lockCall) resolve(ev *history.Event) error {
+	switch ev.Type {
+	case history.LockAcquired:
+		c.f.Set(struct{}{}, nil)
+	case history.LockHeld:
+		c.f.Set(struct{}{}, &LockHeldError{Key: c.cmd.Name, Holder: ev.Err})
+	default:
+		return fmt.Errorf("%w: %v for a lock", ErrNonDeterministic, ev.Type)
+	}
+	return nil
+}
+
+// LockHeldError is the error of a lock request answered LockHeld.
+type LockHeldError struct{ Key, Holder string }
+
+func (e *LockHeldError) Error() string {
+	return "lock " + strconv.Quote(e.Key) + " held by " + e.Holder
+}
+
+// Unwrap makes errors.Is(err, ErrLockHeld) match.
+func (e *LockHeldError) Unwrap() error { return ErrLockHeld }
+
+// Lock asks for the business lock key for ttl (see store.Completion.Locks):
+// nil once held, a *LockHeldError when another execution holds it. Not
+// cancelable: the store answers in the checkpoint that records it.
+func (st *State) Lock(ctx coro.Context, key string, ttl time.Duration) error {
+	p := strconv.AppendInt(nil, ttl.Microseconds(), 10)
+	c := &lockCall{cmd: command.Command{Kind: command.Lock, Name: key, Payload: p, ArgHash: history.HashArgs(p)}}
+	st.issue(c)
+	_, err := c.f.Get(ctx)
+	return err
 }
 
 // sideCall is a side effect: its value comes with its own event.

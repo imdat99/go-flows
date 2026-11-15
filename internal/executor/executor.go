@@ -20,6 +20,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/imdat99/go-flows/internal/command"
@@ -35,6 +36,12 @@ var (
 	// ErrCanceled is the error of an activity, timer or child whose context
 	// was canceled.
 	ErrCanceled = coro.ErrCanceled
+	// ErrLockHeld is wrapped by the error of a lock request answered
+	// LockHeld (*LockHeldError).
+	ErrLockHeld = errors.New("lock held by another execution")
+	// ErrLockLost ends a workflow whose business lock lapsed while it was
+	// not running and was taken by another execution.
+	ErrLockLost = errors.New("lock lost")
 	// ErrContinueAsNew is returned (wrapped by ContinueAsNewError) by a
 	// workflow that continues as new.
 	ErrContinueAsNew = errors.New("continue as new")
@@ -360,6 +367,9 @@ func sideTables(c *store.Completion, ev *history.Event, cmd *command.Command) {
 		c.ChildCancels = append(c.ChildCancels, cmd.Ref)
 	case history.ActivityCancelRequested:
 		c.CanceledActivities = append(c.CanceledActivities, cmd.ID)
+	case history.LockRequested:
+		us, _ := strconv.ParseInt(string(ev.Payload), 10, 64) // written by State.Lock
+		c.Locks = append(c.Locks, store.LockRequest{ScheduleID: cmd.ID, Key: cmd.Name, TTL: time.Duration(us) * time.Microsecond})
 	}
 }
 
@@ -405,6 +415,10 @@ func (e *Executor) apply(ev *history.Event) error {
 		_, _ = st.signal(ev.Name).TrySend(ev.Payload) // unbounded and never closed: cannot fail
 	case history.ExecutionCancelRequested:
 		st.cancelRoot()
+	case history.LockLost:
+		// The section the lock protected was not exclusive: the workflow
+		// fails (and compensates).
+		st.finish(fmt.Errorf("%w: %q was taken by another execution while this one was not running", ErrLockLost, ev.Name))
 	case history.ExecutionCompleted, history.ExecutionFailed, history.ExecutionContinuedAsNew,
 		history.ExecutionCanceled:
 		if st.end == nil || st.end.event.Type != ev.Type {

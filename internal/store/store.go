@@ -52,8 +52,8 @@ var (
 	// ErrInvalidCompletion reports an executor bug, and nothing is applied.
 	// Causes: history sequence numbers that do not continue the history,
 	// ContinueAsNew without StatusContinued, two activity tasks for one
-	// schedule id, activities, timers or children in a completion that ends
-	// the execution, or an activity result that is neither ActivityCompleted
+	// schedule id, activities, timers, children or locks in a completion
+	// that ends the execution, a lock with TTL <= 0, or an activity result that is neither ActivityCompleted
 	// nor ActivityFailed.
 	ErrInvalidCompletion = errors.New("store: invalid completion")
 	// ErrPendingEvents rejects a completion that would end the execution
@@ -209,6 +209,21 @@ type Completion struct {
 	// requests move to it. Unfired timers, activity tasks and the link to
 	// running children do not: their outcomes are dropped.
 	ContinueAsNew *NewExecution
+	// Locks are business locks to take (LockRequested events). Each gets a
+	// pending answer for this execution, visible at once: LockAcquired when
+	// the lock is free, expired, or already held by this execution (then
+	// extended), else LockHeld with the holder's instance id in Err (or
+	// "another execution" when a concurrent request just created it).
+	// Taking an expired lock from another active execution delivers
+	// LockLost (its acquiring schedule id, the key as Name) to that one; an
+	// expired holder that runs (a live lease or a running activity, or
+	// being claimed or completed at that moment) keeps it (LockHeld). An execution's locks are extended by their TTL when it
+	// or one of its activity tasks is claimed and when RenewLeases renews
+	// its lease or an activity lease, so they lapse only while it neither
+	// runs nor has a running activity; they are released when it ends
+	// (continue-as-new included) or is terminated. A pending LockLost blocks
+	// a terminal completion like a signal (ErrPendingEvents).
+	Locks []LockRequest
 	// KeepFor > 0 keeps the lease, extended to now + KeepFor, after a task
 	// that leaves the execution running or compensating: the owner runs the next task itself (eager execution) and gets
 	// its events from ResumeWorkflowTask or CompleteActivityTask. Otherwise
@@ -216,6 +231,13 @@ type Completion struct {
 	// StickyFor (0 clears stickiness).
 	KeepFor   time.Duration
 	StickyFor time.Duration
+}
+
+// LockRequest asks for the business lock Key for TTL.
+type LockRequest struct {
+	ScheduleID int32
+	Key        string
+	TTL        time.Duration
 }
 
 // NewActivityTask is an activity task to create.

@@ -201,8 +201,12 @@ func (d *driver) step(pollCtx context.Context, task *store.WorkflowTask) *store.
 	}
 	stopping := pollCtx.Err() != nil
 	eager := d.eager(c, stopping)
+	for i := range c.Locks {
+		// A lock outlives a lease of this worker (saga: raised to LeaseTTL).
+		c.Locks[i].TTL = max(c.Locks[i].TTL, w.opts.LeaseTTL)
+	}
 	switch {
-	case d.inflight+len(eager) > 0 && !stopping:
+	case (d.inflight+len(eager) > 0 || len(c.Locks) > 0) && !stopping:
 		c.KeepFor = w.opts.LeaseTTL
 	case !stopping: // a stopping worker must not keep the next task to itself
 		c.StickyFor = w.opts.StickyFor
@@ -216,6 +220,18 @@ func (d *driver) step(pollCtx context.Context, task *store.WorkflowTask) *store.
 		return d.completeFailed(task, err)
 	}
 	d.completed(task, c, eager, leases, sent)
+	if len(c.Locks) > 0 && d.held {
+		// The answers are pending already: run the next task at once.
+		next, err := w.st.ResumeWorkflowTask(d.ctx, d.lease, w.opts.LeaseTTL)
+		if err == nil {
+			return &next
+		}
+		if errors.Is(err, store.ErrLeaseLost) {
+			d.lost()
+		} else {
+			d.release(0)
+		}
+	}
 	return nil
 }
 

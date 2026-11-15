@@ -39,6 +39,8 @@ const (
 	Child
 	// SideEffect records a value computed by the workflow.
 	SideEffect
+	// Lock asks for a business lock (Name; Payload is its TTL).
+	Lock
 )
 
 func (k Kind) String() string {
@@ -51,11 +53,13 @@ func (k Kind) String() string {
 		return "child workflow"
 	case SideEffect:
 		return "side effect"
+	case Lock:
+		return "lock"
 	}
 	return fmt.Sprintf("Kind(%d)", uint8(k))
 }
 
-func (k Kind) valid() bool { return k >= Activity && k <= SideEffect }
+func (k Kind) valid() bool { return k >= Activity && k <= Lock }
 
 // State of a command.
 type State uint8
@@ -164,6 +168,9 @@ func (c *Command) scheduledEvent() history.Event {
 	case SideEffect:
 		ev.Type = history.SideEffectResult
 		ev.Payload = c.Payload
+	case Lock:
+		ev.Type = history.LockRequested
+		ev.Payload, ev.ArgHash = c.Payload, c.ArgHash
 	}
 	return ev
 }
@@ -176,13 +183,13 @@ func (c *Command) cancelType() history.Type {
 		return history.TimerCanceled
 	case Child:
 		return history.ChildCancelRequested
-	case SideEffect:
+	case SideEffect, Lock:
 	}
 	return 0
 }
 
 // Cancelable reports whether the kind can be canceled.
-func (c *Command) Cancelable() bool { return c.Kind != SideEffect && c.Kind.valid() }
+func (c *Command) Cancelable() bool { return c.Kind != SideEffect && c.Kind != Lock && c.Kind.valid() }
 
 // Cancel cancels the command:
 //   - a pending command is dropped: nothing is written and no outcome

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -284,6 +286,13 @@ const claimWorkflow = `
 		LIMIT $3
 		FOR NO KEY UPDATE SKIP LOCKED
 	)
+	, k AS (
+		-- The locks of a running execution do not lapse (store.Completion.Locks).
+		-- It waits for a lock row a contender holds (acquireLock never waits
+		-- on an execution row: no cycle) and re-checks its holder.
+		UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
+		FROM c WHERE k.execution_id = c.id
+	)
 	UPDATE flows.execution e
 	SET owner_id = $2, lease_version = e.lease_version + 1,
 	    locked_until = now() + $4 * interval '1 microsecond', not_before = NULL
@@ -560,7 +569,7 @@ const fence = `
 const noUndelivered = `
 	SELECT CASE WHEN EXISTS (
 		SELECT 1 FROM flows.pending_event p
-		WHERE p.execution_id = $1 AND p.type IN (` + typeCancelRequested + `, ` + typeSignal + `)
+		WHERE p.execution_id = $1 AND p.type IN (` + typeCancelRequested + `, ` + typeSignal + `, ` + typeLockLost + `)
 		  AND p.id <> ALL($2::bigint[]))
 	THEN ln(0 * random())::int ELSE 0 END`
 
@@ -605,6 +614,66 @@ const insertActivities = `
 	WHERE e.id = $1
 	RETURNING id, schedule_id, compensate, owner_id,
 	          CASE WHEN owner_id = '' THEN ` + notifyA + "queue)" + ` END`
+
+// acquireLock answers lock request $2 (schedule id $3, ttl $4 µs) of
+// execution $1 with a pending LockAcquired or LockHeld; taking over an
+// expired lock of another active execution delivers LockLost to it. The
+// conflict clause re-checks the row a concurrent request may have created.
+const acquireLock = `
+	WITH cur AS (
+		SELECT execution_id, sched, until > now() AS live FROM flows.lock WHERE key = $2 FOR UPDATE
+	), prev AS (
+		-- The expired holder's row, unless it runs: its row is locked (being
+		-- claimed or completed), its lease is live, or one of its activities
+		-- runs. Then the lock stays its own (its renewals extend it).
+		SELECT x.id, x.queue, x.locked_until, cur.sched FROM flows.execution x, cur
+		WHERE x.id = cur.execution_id AND cur.execution_id <> $1 AND NOT cur.live
+		  AND (x.locked_until IS NULL OR x.locked_until <= now())
+		  AND NOT EXISTS (SELECT 1 FROM flows.activity_task t
+		                  WHERE t.execution_id = x.id AND t.owner_id <> '' AND t.locked_until > now())
+		FOR NO KEY UPDATE OF x SKIP LOCKED
+	), take AS (
+		INSERT INTO flows.lock AS k (key, execution_id, sched, until, ttl_us)
+		SELECT $2, $1, $3, now() + $4::bigint * interval '1 microsecond', $4
+		WHERE NOT EXISTS (SELECT 1 FROM cur WHERE execution_id <> $1 AND (live OR NOT EXISTS (SELECT 1 FROM prev)))
+		ON CONFLICT (key) DO UPDATE
+		SET execution_id = excluded.execution_id, sched = excluded.sched, until = excluded.until, ttl_us = excluded.ttl_us
+		WHERE k.until <= now() OR k.execution_id = $1
+		RETURNING 1
+	), lost AS (
+		UPDATE flows.execution x SET ready_at = least(coalesce(x.ready_at, now()), now())
+		FROM prev
+		WHERE x.id = prev.id AND EXISTS (SELECT 1 FROM take) AND x.status IN ` + activeStatuses + `
+		RETURNING x.id, prev.sched,
+		          CASE WHEN x.locked_until IS NULL OR x.locked_until <= now() THEN ` + notifyW + "x.queue)" + ` END AS n
+	), lost_event AS (
+		INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, name)
+		SELECT id, now(), ` + typeLockLost + `, sched, $2 FROM lost
+	)
+	INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, name, err)
+	SELECT $1, now(),
+	       CASE WHEN EXISTS (SELECT 1 FROM take) THEN ` + typeLockAcquired + ` ELSE ` + typeLockHeld + ` END, $3, $2,
+	       CASE WHEN EXISTS (SELECT 1 FROM take) THEN ''
+	            ELSE coalesce((SELECT e.instance_id FROM cur JOIN flows.execution e ON e.id = cur.execution_id),
+	                          'another execution') END`
+
+// sortedLocks orders lock requests by key: two executions taking the same
+// locks in one checkpoint lock their rows in the same order (no deadlock).
+// Answers go by schedule id, so the order is invisible.
+func sortedLocks(locks []store.LockRequest) []store.LockRequest {
+	if len(locks) < 2 {
+		return locks
+	}
+	s := slices.Clone(locks)
+	slices.SortFunc(s, func(a, b store.LockRequest) int { return strings.Compare(a.Key, b.Key) })
+	return s
+}
+
+const (
+	typeLockAcquired = "27" // history.LockAcquired
+	typeLockHeld     = "28" // history.LockHeld
+	typeLockLost     = "29" // history.LockLost
+)
 
 // insertChild creates a child execution, or delivers ChildFailed
 // (instance_exists) to the parent $5 when the id is taken.
@@ -705,12 +774,15 @@ const (
 		ORDER BY p.visible_at, p.id`
 	// dropEnded removes what an ended execution can no longer use: its
 	// pending events and its activity tasks, so their workers learn of the
-	// end at their next heartbeat (ErrLeaseLost) instead of running on. No
-	// lock-order cycle: activity completions lock the execution row before
-	// the task row (wakeForTask), and claims, extensions and renewals only
-	// lock task rows, briefly.
+	// end at their next heartbeat (ErrLeaseLost) instead of running on, and
+	// its business locks. No lock-order cycle: activity completions lock the
+	// execution row before the task row (wakeForTask); claims and renewals
+	// lock execution or task rows, then lock rows with SKIP LOCKED; a lock
+	// takeover (acquireLock) locks a lock row, then the previous holder's
+	// execution row with SKIP LOCKED.
 	dropEnded = `
-		WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = $1)
+		WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = $1),
+		     k AS (DELETE FROM flows.lock WHERE execution_id = $1)
 		DELETE FROM flows.activity_task WHERE execution_id = $1`
 	// notifyParent delivers the child's outcome ($2..$7) to its active
 	// parent.
@@ -738,8 +810,13 @@ func validateCompletion(c *store.Completion) error {
 		return store.ErrInvalidCompletion
 	}
 	ending := c.Status != "" && !c.Status.Active()
-	if ending && (len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Children) > 0) {
+	if ending && (len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Children) > 0 || len(c.Locks) > 0) {
 		return store.ErrInvalidCompletion
+	}
+	for _, k := range c.Locks {
+		if k.TTL <= 0 {
+			return store.ErrInvalidCompletion
+		}
 	}
 	type key struct {
 		sched int32
@@ -867,6 +944,9 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 	if len(c.CanceledActivities) > 0 {
 		queue(cancelActivities, l.ID, c.CanceledActivities)
 	}
+	for _, k := range sortedLocks(c.Locks) {
+		queue(acquireLock, l.ID, k.Key, k.ScheduleID, micros(k.TTL))
+	}
 	if !ending {
 		queue(updateRunning, l.ID, lastSeq, string(c.Status), micros(c.KeepFor), micros(c.StickyFor), l.Owner, c.Err, c.ErrKinds)
 		return
@@ -937,11 +1017,16 @@ func readCompletion(br pgx.BatchResults, sh completionShape) (map[actKey]int64, 
 // expiry, so the ready index only holds claimable tasks.
 const claimActivities = `
 	WITH c AS (
-		SELECT id FROM flows.activity_task
+		SELECT id, execution_id FROM flows.activity_task
 		WHERE queue = ANY($1) AND visible_at <= now()
 		ORDER BY visible_at, id
 		LIMIT $3
 		FOR UPDATE SKIP LOCKED
+	), k AS (
+		-- An execution's locks live while its activities run (store.Completion.Locks);
+		-- waits for a contender's lock row, as the workflow claim.
+		UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
+		FROM c WHERE k.execution_id = c.execution_id
 	)
 	UPDATE flows.activity_task t
 	SET owner_id = $2, lease_version = t.lease_version + 1, attempt = t.attempt + 1,

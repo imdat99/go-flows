@@ -97,6 +97,18 @@ const (
 	// fixed the cause).
 	CompensationRetryRequested
 
+	// LockRequested asks for the business lock Name: Payload is its TTL in
+	// microseconds (decimal), ArgHash its hash. The store answers with a
+	// pending LockAcquired or LockHeld (Err: the holder's instance id).
+	LockRequested
+	// LockAcquired reports that the lock of ScheduleID is held.
+	LockAcquired
+	// LockHeld reports that another execution holds the lock of ScheduleID.
+	LockHeld
+	// LockLost reports that another execution took the lock Name (acquired
+	// by ScheduleID) after it expired: the workflow fails with it.
+	LockLost
+
 	typeCount // keep last
 )
 
@@ -126,6 +138,10 @@ var typeNames = [typeCount]string{
 	CompensationCompleted:      "CompensationCompleted",
 	CompensationFailed:         "CompensationFailed",
 	CompensationRetryRequested: "CompensationRetryRequested",
+	LockRequested:              "LockRequested",
+	LockAcquired:               "LockAcquired",
+	LockHeld:                   "LockHeld",
+	LockLost:                   "LockLost",
 }
 
 func (t Type) String() string {
@@ -144,7 +160,7 @@ func (t Type) Valid() bool { return t > 0 && t < typeCount }
 func (t Type) IsCommand() bool {
 	switch t {
 	case ActivityScheduled, ActivityCancelRequested, TimerScheduled, TimerCanceled,
-		SideEffectResult, ChildScheduled, ChildCancelRequested:
+		SideEffectResult, ChildScheduled, ChildCancelRequested, LockRequested:
 		return true
 	}
 	return false

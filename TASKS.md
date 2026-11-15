@@ -169,7 +169,29 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
       - Mỗi bước compensation chạy ở driver mới phải đọc lại history (chỉ trên đường lỗi).
       - Hoàn tác child đã hoàn thành: để T6.3.
     - **Review:** lần 1 không đạt (H1 compensation bị bỏ qua khi deploy trộn; M1 activity trong backoff chặn compensation; M2 đọc lại history; L1–L5). Lần 2 đạt; ba ghi chú thấp đã sửa: tài liệu `Terminate`, lỗi của workflow sau `RetryCompensation`, comment của test.
-- [ ] **T5.4** `Lock`/`LockWait` gắn với lease (port `saga/lock.go`).
+- [x] **T5.4** `Lock`/`LockWait` gắn với lease (port `saga/lock.go`).
+  - T5.4: lock là một command của workflow (`LockRequested`; TTL nằm trong payload nên replay so khớp được).
+    - **Lấy lock:** store lấy lock trong transaction checkpoint (`acquireLock`, migration `00004`, bảng `flows.lock`). Kết quả là pending `LockAcquired`/`LockHeld`; driver resume ngay sau khi nhận. TTL tối thiểu bằng `LeaseTTL`. Các yêu cầu lock được sắp theo key.
+    - **Giữ lock:** lock được gia hạn khi claim workflow hoặc activity của execution, và khi gia hạn lease của workflow hoặc activity (kể cả compensator). Lock hết hạn chỉ khi execution không chạy, cũng không có activity nào đang chạy. Holder đang chạy (lease còn sống, activity đang chạy, hoặc row đang bị khoá) thì không bị cướp lock.
+    - **Mất lock:** khi bị cướp, store gửi `LockLost` cho holder cũ trong cùng statement. Workflow fail với `ErrLockLost` rồi compensate. `LockLost` chưa giao sẽ chặn completion kết thúc, giống signal.
+    - **Nhả lock:** khi execution kết thúc, kể cả continue-as-new và terminate.
+    - **API:** `flows.Lock`, `LockWait` (delay tối thiểu 10ms, được ghi vào history), `ErrLockHeld`, `ErrLockLost`, kind `invalid_argument`.
+    - **Test:**
+      - conformance gồm `Locks`, `LockRenewal`, `LockValidation`, `LockHeldDuringActivity`, `LockLostBlocksEnd`, `LockRace`, `LockNotTakenFromRunningHolder`;
+      - `TestLockReplay`; EXPLAIN dùng `lock_execution`;
+      - test engine gồm loại trừ, chờ, mất lock, tham số, activity chạy qua poll dưới lock;
+      - pg e2e: 2 engine với 6 workflow, không lúc nào có quá 1 cái trong vùng găng.
+    - **Bench:** alloc không đổi (`BenchmarkActivityRun` khoảng 1384–1587 alloc/run). Có lúc một run mất khoảng 1.2–1.4s, đã có từ trước (đo trên commit cũ cũng thấy). Có thể do hand-over phải chờ poll 1s. Điều tra ở T8.2.
+    - **Còn mở (thấp):**
+      - Lấy lock tốn 2 round trip (completion rồi resume).
+      - Claim, `dropEnded` và Terminate khoá lock row theo thứ tự quét, không theo key. Khi execution giữ từ 2 lock trở lên, có thể deadlock; được retry sau `deadlock_timeout`.
+      - Activity đang nằm hàng đợi hoặc chờ retry thì không tính là đang chạy: lock có thể hết hạn trước khi nó chạy (đã ghi trong tài liệu).
+      - `TestLockLost` dùng sleep thật.
+      - Thiếu test: holder đang ở `needs_attention`, replay của `LockWait`.
+    - **Review:**
+      - Lần 1 không đạt: H1, lock hết hạn khi activity không chạy eager; M1, claim và cướp lock deadlock lẫn nhau; M2, compensation; M3, `LockLost` bị bỏ khi kết thúc.
+      - Lần 2 không đạt: H1-r2, claim `SKIP LOCKED` làm lock bị cướp khi holder đang chạy.
+      - Lần 3 đạt.
 - [ ] **T5.5** `RunHook` chạy trong transaction kết thúc, `Observer`, port `idem/`.
 - [ ] **T5.6** Port test saga: `CompensationReverseOrder`, `review_fixes_test.go`, `lock_test.go`, `async_test.go`.
 

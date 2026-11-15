@@ -2,6 +2,7 @@ package executor_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -250,5 +251,57 @@ func TestMayCompensate(t *testing.T) {
 	}
 	if !r.MayCompensate() {
 		t.Fatal("replayed outcome with data")
+	}
+}
+
+// Lock commands replay deterministically: answers, a held lock's error,
+// and a lost lock failing the workflow; the completion carries the request.
+func TestLockReplay(t *testing.T) {
+	wf := executor.Workflow{Name: "wf", Version: 1, Run: func(ctx coro.Context, _ []byte) ([]byte, error) {
+		st := executor.FromContext(ctx)
+		if err := st.Lock(ctx, "a", time.Second); err != nil {
+			return nil, err
+		}
+		err := st.Lock(ctx, "b", time.Second)
+		var held *executor.LockHeldError
+		if !errors.As(err, &held) || held.Holder != "other" || !errors.Is(err, executor.ErrLockHeld) {
+			return nil, errors.New("unexpected answer")
+		}
+		_, err = st.NewTimer(ctx, time.Hour, "t").Get(ctx)
+		return nil, err
+	}}
+	ex := executor.New(wf, 1, executor.Options{})
+	defer ex.Close()
+	c, err := ex.Execute(&store.WorkflowTask{Pending: []store.PendingEvent{{ID: 1, Event: startEvent()}}, Now: time.Unix(1000, 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Locks) != 1 || c.Locks[0].Key != "a" || c.Locks[0].TTL != time.Second || c.Locks[0].ScheduleID != 1 {
+		t.Fatalf("locks %+v", c.Locks)
+	}
+	tasks := [][]history.Event{
+		{startEvent()},
+		{{Type: history.LockAcquired, ScheduleID: 1}},
+		{{Type: history.LockHeld, ScheduleID: 2, Err: "other"}},
+		{{Type: history.LockLost, ScheduleID: 1, Name: "a"}},
+	}
+	if err := liveThenReplay(t, wf, tasks); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	// The lost lock ended the workflow.
+	ex2 := executor.New(wf, 1, executor.Options{})
+	defer ex2.Close()
+	var last *store.Completion
+	for i, evs := range tasks {
+		task := &store.WorkflowTask{LastSeq: ex2.LastSeq(), Now: time.Unix(1000+int64(i), 0)}
+		for j, ev := range evs {
+			task.Pending = append(task.Pending, store.PendingEvent{ID: int64(j + 1), Event: ev})
+		}
+		if last, err = ex2.Execute(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if last.Status != store.StatusFailed || !strings.Contains(last.Err, "lock lost") {
+		t.Fatalf("after LockLost: %s %q", last.Status, last.Err)
 	}
 }

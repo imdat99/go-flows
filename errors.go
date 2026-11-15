@@ -95,6 +95,9 @@ var kinds = struct {
 	{"activity_canceled", ErrActivityCanceled},
 	{store.KindCompensated, ErrCompensated},
 	{store.KindCompensationFailed, ErrCompensationFailed},
+	{"invalid_argument", ErrInvalidArgument},
+	{"lock_held", ErrLockHeld},
+	{"lock_lost", ErrLockLost},
 }}
 
 type errorKind struct {

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,5 +144,70 @@ func TestPostgresCompensation(t *testing.T) {
 			t.Fatalf("eager=%v: undone %v", eager, got)
 		}
 		_ = e.Stop(ctx)
+	}
+}
+
+var (
+	inside, maxInside atomic.Int32
+
+	critical = flows.DefineActivity("pgtest.critical", func(context.Context, flows.Key, int) (int, struct{}, error) {
+		n := inside.Add(1)
+		for {
+			m := maxInside.Load()
+			if n <= m || maxInside.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		inside.Add(-1)
+		return 0, struct{}{}, nil
+	}, nil)
+	exclusive = flows.DefineWorkflow("pgtest.exclusive", 1, func(c flows.Ctx, _ int) (int, error) {
+		if err := flows.Lock(c, "shared", time.Second, flows.LockWait(flows.RetryPolicy{Attempts: 1000, Initial: 10 * time.Millisecond})); err != nil {
+			return 0, err
+		}
+		return critical.Run(c, 0)
+	})
+)
+
+// Business locks on Postgres: workflows on two engines contending for one
+// lock never run its critical section at the same time.
+func TestPostgresLock(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	if err := flows.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	var engines []*flows.Engine
+	for i := range 2 {
+		e, err := flows.New(pool, flows.Options{InstanceID: "pg-lock-" + strconv.Itoa(i), PollMax: 20 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = e.Stop(ctx) })
+		engines = append(engines, e)
+	}
+	inside.Store(0)
+	maxInside.Store(0)
+	wctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	var hs []*flows.Handle[int]
+	for i := range 6 {
+		h, err := exclusive.Start(ctx, engines[i%2], "excl-"+strconv.Itoa(i), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hs = append(hs, h)
+	}
+	for _, h := range hs {
+		if _, err := h.Wait(wctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if m := maxInside.Load(); m != 1 {
+		t.Fatalf("%d executions inside the critical section at once", m)
 	}
 }

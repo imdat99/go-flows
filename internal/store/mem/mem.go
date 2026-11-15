@@ -57,9 +57,17 @@ type Store struct {
 	executions map[int64]*execution
 	latest     map[string]int64 // instance id -> latest execution id
 	tasks      map[int64]*activityTask
+	locks      map[string]*lockRow // business locks by key
 
 	watchers map[int]func(store.WorkKind, string)
 	nextW    int
+}
+
+type lockRow struct {
+	exec  int64 // holder execution id
+	sched int32 // its acquiring schedule id
+	until time.Time
+	ttl   time.Duration
 }
 
 type execution struct {
@@ -103,6 +111,7 @@ func New(clock Clock) *Store {
 		executions: make(map[int64]*execution),
 		latest:     make(map[string]int64),
 		tasks:      make(map[int64]*activityTask),
+		locks:      make(map[string]*lockRow),
 	}
 }
 
@@ -243,6 +252,7 @@ func (s *Store) ClaimWorkflowTasks(_ context.Context, owner string, queues []str
 		e := c.e
 		e.lease = store.Lease{ID: e.ID, Owner: owner, Version: e.lease.Version + 1}
 		e.lockedUntil = now.Add(ttl)
+		s.extendLocks(e.ID, now)
 		out = append(out, e.task(now))
 	}
 	return out, nil
@@ -301,6 +311,7 @@ func (s *Store) CompleteWorkflowTask(_ context.Context, l store.Lease, c *store.
 	leases := s.createActivities(e, l.Owner, c.Activities, now)
 	s.createChildren(e, c.Children, now)
 	s.cancelRequests(e, c, now)
+	s.acquireLocks(e, c.Locks, now)
 
 	if c.Status != "" && c.Status != e.Status {
 		e.Status = c.Status
@@ -363,8 +374,13 @@ func (s *Store) validate(e *execution, c *store.Completion) error {
 	if c.ContinueAsNew != nil && c.Status != store.StatusContinued {
 		return store.ErrInvalidCompletion
 	}
-	if c.Status != "" && !c.Status.Active() && (len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Children) > 0) {
+	if c.Status != "" && !c.Status.Active() && (len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Children) > 0 || len(c.Locks) > 0) {
 		return store.ErrInvalidCompletion // they would be dropped at once
+	}
+	for _, l := range c.Locks {
+		if l.TTL <= 0 {
+			return store.ErrInvalidCompletion
+		}
 	}
 	if s.duplicateActivity(e, c.Activities) {
 		return store.ErrInvalidCompletion
@@ -401,7 +417,7 @@ func (s *Store) duplicateActivity(e *execution, acts []store.NewActivityTask) bo
 // undelivered reports pending signals or cancel requests not in consumed.
 func undelivered(e *execution, consumed []int64) bool {
 	for _, p := range e.pending {
-		if (p.ev.Type == history.SignalReceived || p.ev.Type == history.ExecutionCancelRequested) &&
+		if (p.ev.Type == history.SignalReceived || p.ev.Type == history.ExecutionCancelRequested || p.ev.Type == history.LockLost) &&
 			!slices.Contains(consumed, p.id) {
 			return true
 		}
@@ -456,6 +472,7 @@ func (s *Store) end(e *execution, c *store.Completion, now time.Time) {
 		}
 	}
 	e.pending = nil
+	s.releaseLocks(e.ID)
 	// Activity tasks of an ended execution can never deliver: drop them.
 	for id, t := range s.tasks {
 		if t.ExecutionID == e.ID {
@@ -555,6 +572,7 @@ func (s *Store) ClaimActivityTasks(_ context.Context, owner string, queues []str
 		t.Lease.Owner, t.Lease.Version = owner, t.Lease.Version+1
 		t.Attempt++
 		t.lockedUntil = now.Add(ttl)
+		s.extendLocks(t.ExecutionID, now)
 		at := t.ActivityTask
 		at.Input = clone(at.Input)
 		at.CancelRequested = t.cancelRequested
@@ -641,6 +659,58 @@ func (s *Store) RequestCancel(_ context.Context, instanceID string) error {
 	return s.deliver(instanceID, history.Event{Type: history.ExecutionCancelRequested})
 }
 
+// acquireLocks answers the lock requests of e.
+func (s *Store) acquireLocks(e *execution, reqs []store.LockRequest, now time.Time) {
+	for _, r := range reqs {
+		k, ok := s.locks[r.Key]
+		switch {
+		case ok && k.exec != e.ID && (k.until.After(now) || s.running(k.exec, now)):
+			holder := s.executions[k.exec].InstanceID
+			s.addPending(e, history.Event{Type: history.LockHeld, ScheduleID: r.ScheduleID, Name: r.Key, Err: holder}, now)
+			continue
+		case ok && k.exec != e.ID: // expired: taken over; its holder learns it
+			if prev := s.executions[k.exec]; prev != nil && prev.Status.Active() {
+				s.addPending(prev, history.Event{Type: history.LockLost, ScheduleID: k.sched, Name: r.Key}, now)
+				s.hint(store.WorkflowWork, prev.Queue)
+			}
+		}
+		s.locks[r.Key] = &lockRow{exec: e.ID, sched: r.ScheduleID, until: now.Add(r.TTL), ttl: r.TTL}
+		s.addPending(e, history.Event{Type: history.LockAcquired, ScheduleID: r.ScheduleID, Name: r.Key}, now)
+	}
+}
+
+// running reports whether execution id holds a live lease or has an
+// activity running: its expired locks are still its own.
+func (s *Store) running(id int64, now time.Time) bool {
+	if e := s.executions[id]; e != nil && e.lease.Owner != "" && e.lockedUntil.After(now) {
+		return true
+	}
+	for _, t := range s.tasks {
+		if t.ExecutionID == id && t.Lease.Owner != "" && t.lockedUntil.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+// extendLocks extends the locks held by execution id by their TTL.
+func (s *Store) extendLocks(id int64, now time.Time) {
+	for _, k := range s.locks {
+		if k.exec == id {
+			k.until = now.Add(k.ttl)
+		}
+	}
+}
+
+// releaseLocks releases the locks held by execution id.
+func (s *Store) releaseLocks(id int64) {
+	for key, k := range s.locks {
+		if k.exec == id {
+			delete(s.locks, key)
+		}
+	}
+}
+
 // ReopenCompensation implements store.Store.
 func (s *Store) ReopenCompensation(_ context.Context, instanceID string) error {
 	s.mu.Lock()
@@ -705,6 +775,7 @@ func (s *Store) RenewLeases(_ context.Context, owner string, workflows, activiti
 			continue
 		}
 		e.lockedUntil = now.Add(ttl)
+		s.extendLocks(e.ID, now)
 	}
 	for _, l := range activities {
 		t, err := s.fencedTask(l)
@@ -713,6 +784,7 @@ func (s *Store) RenewLeases(_ context.Context, owner string, workflows, activiti
 			continue
 		}
 		t.lockedUntil = now.Add(ttl)
+		s.extendLocks(t.ExecutionID, now) // locks live while their execution's activities run
 		if t.cancelRequested {
 			r.CanceledActivities = append(r.CanceledActivities, l.ID)
 		}
@@ -795,6 +867,7 @@ func (s *Store) Terminate(_ context.Context, instanceID, reason string) error {
 	}
 	e.history = append(e.history, history.Event{Seq: seq, Type: history.ExecutionTerminated, Err: reason})
 	e.Status = store.StatusTerminated
+	s.releaseLocks(e.ID)
 	// The holder's lease is gone: a new version fences its writes.
 	e.lease = store.Lease{ID: e.ID, Version: e.lease.Version + 1}
 	e.lockedUntil, e.stickyOwner, e.stickyUntil = time.Time{}, "", time.Time{}
