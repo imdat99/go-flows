@@ -80,10 +80,14 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
   - review P0: lần 1 không đạt (thiếu target `race`/`chaos`, benchgate fail khi budget rỗng, còn sót tham chiếu saga); lần 2 đạt.
 
 ### P1 — Runtime tất định
-- [ ] **T1.1** ⚡ Port future, channel, selector, waitgroup, context từ `go-workflows/internal/sync`; bỏ `any` khỏi API nội bộ; test đơn vị gốc chạy được.
-- [ ] **T1.2** ⚡ Viết lại scheduler theo hàng đợi sẵn sàng; watchdog chung; deadlock → `ErrDeadlock`; panic coroutine → lỗi có stack (GW-10, GW-16). Bench `BenchmarkScheduler`.
-- [ ] **T1.3** ⚡ `internal/history`: kiểu event, codec append, `arg_hash` (FNV-1a 64 trên bytes input). Bench encode/decode.
-- [ ] **T1.4** Port `internal/command`: `invalidStateTransition` → lỗi; thêm command huỷ activity; test state machine gốc.
+- [x] **T1.1** ⚡ Port future, channel, selector, waitgroup, context từ `go-workflows/internal/sync`; bỏ `any` khỏi API nội bộ; test đơn vị gốc chạy được.
+- [x] **T1.2** ⚡ Viết lại scheduler theo hàng đợi sẵn sàng; watchdog chung; deadlock → `ErrDeadlock`; panic coroutine → lỗi có stack (GW-10, GW-16). Bench `BenchmarkScheduler`.
+- [x] **T1.3** ⚡ `internal/history`: kiểu event, codec append, `arg_hash` (FNV-1a 64 trên bytes input). Bench encode/decode.
+- [x] **T1.4** Port `internal/command`: `invalidStateTransition` → lỗi; thêm command huỷ activity; test state machine gốc.
+
+  - Số liệu P1 (Xeon E5-4669 v3, 6 CPU): `BenchmarkScheduler` 0 allocs, khoảng 650 ns mỗi lần chuyển (go-workflows có timer và đi qua scheduler: đo bản đầu tiên được 1.9 µs). Ping-pong channel 1.1 µs, 0 allocs. `CommitActivity` 0 allocs. `HashArgs` 0 allocs, 1.5 GB/s.
+  - Review T1.1/T1.2: lần 1 không đạt (Select mất wake-up; unbuffered send hoàn tất khi chưa có receiver; Close rò goroutine; Close một scheduler broken gây race). Lần 2 không đạt (race giữa yield và watchdog; Close không có watchdog bảo vệ). Lần 3 đạt sau khi chuyển sang trạng thái điều khiển atomic dùng CAS (`ctl`).
+  - Review T1.3/T1.4: lần 1 không đạt (độ chính xác µs của timer; thiếu trạng thái `Dropped`; side effect không tới `Done`; thiếu Queue và Version). Lần 2 đạt.
 
 ### P2 — Store
 - [ ] **T2.1** Interface `internal/store`, kiểu Task, Lease (`owner`, `version`); bộ test conformance (khung lấy từ `go-workflows/backend/test`).
@@ -166,4 +170,7 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
 - 2026-11-15: Compose Postgres chạy trên cổng 5433, để chạy song song với compose của repo saga (5432).
 - 2026-11-15: Perf gate trong CI là `benchgate`, so với ngân sách tuyệt đối (median của `-count 6`), thay cho so sánh tương đối bằng benchstat. Lý do: so tương đối giữa hai lần chạy CI quá nhiễu; allocs/op gần như tất định nên giới hạn chặt. Mỗi khi một thay đổi cải thiện số liệu thì hạ ngân sách xuống. `benchstat` (`make benchcmp`) dùng khi review task ⚡.
 - 2026-11-15: Gói runtime tất định đặt tên `internal/coro` thay vì `internal/sync`, để không trùng tên với `sync` của thư viện chuẩn.
+- 2026-11-15: `history.Event` là struct phẳng ánh xạ 1:1 với cột DB, không có codec envelope. Bỏ phần "codec append" của T1.3 vì store bind trực tiếp các field.
+- 2026-11-15: Channel đánh thức mọi receiver khi có thay đổi (không dùng wakeOne), để Select không làm mất wake-up. `TrySend` chỉ thành công khi buffer còn chỗ (khác go-workflows `SendNonblocking`). Workflow dùng `Send` để rendezvous; signal dùng channel không giới hạn.
+- 2026-11-15: Watchdog chung cho cả process, cộng trạng thái `ctl` atomic dùng CAS, thay cho timer theo từng lần chuyển. Sau `ErrStuck` chỉ được gọi `Close`; coroutine đang giữ quyền điều khiển sẽ dọn các coroutine còn lại.
 - 2026-11-15: sloglint chuyển sang `attr-only`, vì hiệu năng (LogAttrs).

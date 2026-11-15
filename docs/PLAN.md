@@ -91,8 +91,8 @@ flows.Migrate(ctx, pool)
 - **`instance`:** `id`, `instance_id`, `execution_id`, `workflow`, `version`, `parent_*`, `status` (active, completed, failed, canceled, terminated, compensating, compensated, needs_attention), `queue`, `input`/`output`/`error`, `error_kinds`, `owner_id`, `lease_version`, `locked_until`, `sticky_owner`, `sticky_until`, `ready_at`, `created_at`, `completed_at`.
   - Unique `(instance_id) WHERE status IN active-like`.
   - Partial index `(queue, ready_at) WHERE active`.
-- **`history`:** PK `(instance_pk, seq)`, `type`, `schedule_id`, `name`, `arg_hash`, `payload`, `comp_data`, `uncertain`.
-- **`pending_event`:** `instance_pk` FK cascade, `visible_at`. Mỗi lần insert thì cập nhật `instance.ready_at = least(...)`.
+- **`history`:** PK `(instance_pk, seq)`. Cột ánh xạ 1:1 với `internal/history.Event`: `type`, `schedule_id`, `attempt`, `name`, `version`, `ref`, `queue`, `arg_hash`, `payload`, `comp_data`, `err`, `err_kinds`, `uncertain`, `permanent`, `at`, cộng `created_at` (thời điểm ghi, để audit/UI).
+- **`pending_event`:** cùng các cột như `history` (trừ `seq`), `instance_pk` FK cascade, `visible_at` (với `TimerFired` thì bằng `at`). Mỗi lần insert thì cập nhật `instance.ready_at = least(...)`.
 - **`activity_task`:** unique `(instance_pk, schedule_id)`, `kind` (invoke/compensate), `attempt`, `visible_at`, `owner_id`, `lease_version`, `locked_until`, FK cascade.
 - **`lock`:** giống `saga.lock`.
 

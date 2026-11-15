@@ -7,3 +7,14 @@
 #   BenchmarkActivityRun   allocs/op <= 80 (10 activities), B/op <= 8192
 #   BenchmarkScheduler     allocs/op 0 in steady state
 # Rules are added by the task that introduces each benchmark.
+
+# internal/coro (T1.1/T1.2): hand-offs never allocate. ns/switch is a loose
+# ceiling (measured ~650 on the dev box: Xeon E5-4669 v3, 6 CPUs).
+BenchmarkScheduler allocs/op <= 0
+BenchmarkScheduler B/op <= 8
+BenchmarkScheduler ns/switch <= 2000
+BenchmarkChannelPingPong allocs/op <= 0
+
+# internal/command, internal/history (T1.3/T1.4)
+BenchmarkCommitActivity allocs/op <= 0
+BenchmarkHashArgs allocs/op <= 0
