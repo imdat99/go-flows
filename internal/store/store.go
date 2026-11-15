@@ -266,8 +266,14 @@ type ActivityTask struct {
 	Queue       string
 	Input       []byte
 	Compensate  bool
-	Uncertain   bool  // compensation of an activity that may not have had its effect
-	Attempt     int32 // 1 for the first attempt
+	// Uncertain, for an invocation: an earlier attempt may have had its
+	// effect (it timed out, panicked, was interrupted, or its holder died
+	// mid-attempt; conservatively, also an eagerly claimed task whose
+	// holder died before starting it), so a final failure is uncertain
+	// too. For a
+	// compensation: the activity it undoes may not have had its effect.
+	Uncertain bool
+	Attempt   int32 // 1 for the first attempt
 	// CancelRequested reports that the workflow canceled the activity
 	// before this attempt: the worker records the cancel instead of running
 	// it.
@@ -347,8 +353,16 @@ type Store interface {
 	// result is still recorded and the returned task is nil.
 	CompleteActivityTask(ctx context.Context, l Lease, r ActivityResult) (*WorkflowTask, error)
 	// RetryActivityTask releases lease l and makes the task visible again
-	// after delay, for another attempt.
-	RetryActivityTask(ctx context.Context, l Lease, delay time.Duration) error
+	// after delay, for another attempt. uncertain records that the attempt
+	// may have had its effect (ActivityTask.Uncertain of later attempts; not
+	// for compensation tasks). Claiming a task whose lease expired without a
+	// result marks it so too (its holder died mid-attempt).
+	RetryActivityTask(ctx context.Context, l Lease, delay time.Duration, uncertain bool) error
+
+	// Unstick clears every execution's stickiness to owner: a stopping
+	// owner hands them over at once instead of keeping them for StickyFor.
+	// Stickiness is only a claim preference, so this is not a fenced write.
+	Unstick(ctx context.Context, owner string) error
 
 	// RenewLeases extends by ttl from now every workflow and activity lease
 	// of owner that is still held, in one round trip. Rows locked by

@@ -1095,6 +1095,8 @@ const claimActivities = `
 	)
 	UPDATE flows.activity_task t
 	SET owner_id = $2, lease_version = t.lease_version + 1, attempt = t.attempt + 1,
+	    -- A lease that expired without a result: its attempt may have run.
+	    uncertain = t.uncertain OR (t.owner_id <> '' AND NOT t.compensate),
 	    locked_until = now() + $4 * interval '1 microsecond',
 	    visible_at = now() + $4 * interval '1 microsecond'
 	FROM c WHERE t.id = c.id
@@ -1145,13 +1147,14 @@ func (s *Store) ExtendActivityTask(ctx context.Context, l store.Lease, ttl time.
 }
 
 // RetryActivityTask implements store.Store.
-func (s *Store) RetryActivityTask(ctx context.Context, l store.Lease, delay time.Duration) error {
+func (s *Store) RetryActivityTask(ctx context.Context, l store.Lease, delay time.Duration, uncertain bool) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE flows.activity_task
-		SET owner_id = '', locked_until = NULL, visible_at = now() + $4::bigint * interval '1 microsecond'
+		SET owner_id = '', locked_until = NULL, visible_at = now() + $4::bigint * interval '1 microsecond',
+		    uncertain = uncertain OR ($5 AND NOT compensate)
 		WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''
 		RETURNING CASE WHEN $4::bigint <= 0 THEN `+notifyA+`queue) END`,
-		l.ID, l.Owner, l.Version, micros(delay))
+		l.ID, l.Owner, l.Version, micros(delay), uncertain)
 	if err != nil {
 		return fmt.Errorf("retry activity task: %w", err)
 	}

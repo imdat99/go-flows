@@ -209,7 +209,28 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
       - khi có hook, `inTx` tốn thêm một round trip `SELECT`;
       - thiếu test: hook đi cùng `ErrPendingEvents`, park do non-determinism đi tới hook ở mức engine, khẳng định 0 alloc khi không cấu hình gì.
     - Review: lần 1 không đạt (panic trong observer lọt ra ngoài; mã lỗi của hook bị hiểu nhầm). Lần 2 đạt.
-- [ ] **T5.6** Port test saga: `CompensationReverseOrder`, `review_fixes_test.go`, `lock_test.go`, `async_test.go`.
+- [x] **T5.6** Port test saga: `CompensationReverseOrder`, `review_fixes_test.go`, `lock_test.go`, `async_test.go`.
+  - T5.6: `saga_port_test.go` port những hành vi chưa có test tương đương:
+    - start đồng thời cùng một instance id;
+    - retry phía engine, lỗi permanent;
+    - panic trong activity và trong workflow;
+    - `Await` timeout, signal tới trước `Await`, payload signal sai;
+    - text lỗi không lưu được;
+    - bàn giao sau Stop (mem và pg);
+    - replay khác history thì park;
+    - lock bị nhả khi kết thúc, được giữ khi park;
+    - timeout rồi lỗi chắc chắn vẫn được compensate;
+    - replay lạnh không báo sai.
+  - Bảng đối chiếu saga → go-flows nằm trong review. Những phần không áp dụng cho mô hình này: run timeout, interrupt của checkpoint, `AsyncStepStart`, job đánh thức.
+  - `examples/order`: saga đặt hàng có lock, compensation theo thứ tự ngược, và hoàn tiền uncertain theo key.
+  - Lỗi engine tìm ra khi port test, đã sửa:
+    - park do non-determinism không ghi error kind;
+    - Stop để execution còn sticky tới 10s. Thêm `store.Unstick(owner)` và migration `00005` (index); không set sticky khi đang compensating;
+    - **tính uncertain bị mất qua các lần retry.** Activity timeout rồi lỗi chắc chắn thì không được compensate; holder chết giữa chừng cũng vậy. Sửa: `activity_task.uncertain` cũng dùng cho invocation. `RetryActivityTask(..., uncertain)` và claim sau khi lease hết hạn đều set cờ này, và lỗi cuối cùng OR thêm nó. Huỷ trước một attempt thì chỉ uncertain nếu cờ đã được set.
+  - Còn mở (thấp):
+    - comp data của attempt uncertain trước đó không được giữ: compensator nhận data của attempt cuối, thường là zero; ví dụ hoàn tiền theo `Key`;
+    - chưa có test cho việc bỏ sticky khi đang compensating.
+  - Review: lần 1 không đạt (H1 tính uncertain qua các lần retry; M2 `Unstick` chỉ xử lý theo cache; M3–M4 độ tin cậy của test bàn giao; L5–L9). Lần 2 đạt; đã sửa M (Unstick chỉ đụng các execution còn sticky) và L2/L3/L5.
 
 ### P6 — Sub-workflow và ContinueAsNew
 - [ ] **T6.1** Child workflow: tạo, kết quả, huỷ theo cây, nhắm theo `instance_id`.

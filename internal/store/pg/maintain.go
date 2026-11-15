@@ -217,6 +217,20 @@ const reopenCompensation = `
 	)
 	SELECT ` + notifyW + "queue)" + ` FROM e`
 
+// Unstick implements store.Store.
+func (s *Store) Unstick(ctx context.Context, owner string) error {
+	err := retry(ctx, func() error {
+		_, err := s.pool.Exec(ctx, `
+			UPDATE flows.execution SET sticky_owner = '', sticky_until = NULL
+			WHERE sticky_owner = $1 AND sticky_until > now()`, owner)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("unstick: %w", err)
+	}
+	return nil
+}
+
 // ReopenCompensation implements store.Store.
 func (s *Store) ReopenCompensation(ctx context.Context, instanceID string) error {
 	var tag pgconn.CommandTag

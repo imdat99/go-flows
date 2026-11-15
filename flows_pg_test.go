@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	flows "github.com/imdat99/go-flows"
+	"github.com/imdat99/go-flows/internal/history"
 	"github.com/imdat99/go-flows/internal/testdb"
 )
 
@@ -260,5 +261,79 @@ func TestPostgresRunHook(t *testing.T) {
 	}
 	if !slices.Equal(got, []string{"hook-comp=compensated", "hook-ok=completed"}) {
 		t.Fatalf("outbox %v", got)
+	}
+}
+
+var (
+	handoffCalls atomic.Int32
+	handoffStep  = flows.DefineActivity("pgtest.handoff-step", func(context.Context, flows.Key, int) (int, struct{}, error) {
+		handoffCalls.Add(1)
+		return 0, struct{}{}, nil
+	}, nil)
+	handoffWF = flows.DefineWorkflow("pgtest.handoff", 1, func(c flows.Ctx, _ int) (int, error) {
+		if _, err := handoffStep.Run(c, 0); err != nil {
+			return 0, err
+		}
+		return flows.Await[int](c, "go", time.Hour)
+	})
+)
+
+// On Postgres, an engine that stops hands its waiting executions over at
+// once (Unstick), and completed activities are not run again.
+func TestPostgresStopHandOver(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	if err := flows.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	a, err := flows.New(pool, flows.Options{InstanceID: "pg-a", PollMax: 20 * time.Millisecond, StickyFor: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Stop(ctx) }) // a no-op after the Stop below
+	handoffCalls.Store(0)
+	h, err := handoffWF.Start(ctx, a, "pg-handoff", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the workflow to reach Await (its timer is recorded): the
+	// execution is then released, sticky to a.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var n int
+		_ = pool.QueryRow(ctx, `SELECT count(*) FROM flows.history h JOIN flows.execution e ON e.id = h.execution_id
+			WHERE e.instance_id = 'pg-handoff' AND h.type = $1`, int16(history.TimerScheduled)).Scan(&n)
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the workflow did not reach Await")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := a.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b, err := flows.New(pool, flows.Options{InstanceID: "pg-b", PollMax: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Stop(ctx) })
+	if err := b.Signal(ctx, "pg-handoff", "go", 9); err != nil {
+		t.Fatal(err)
+	}
+	wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if v, err := h.Wait(wctx); err != nil || v != 9 {
+		t.Fatalf("%d %v", v, err)
+	}
+	if n := handoffCalls.Load(); n != 1 {
+		t.Fatalf("activity ran %d times", n)
 	}
 }

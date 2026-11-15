@@ -208,7 +208,7 @@ func (d *driver) step(pollCtx context.Context, task *store.WorkflowTask) *store.
 	switch {
 	case (d.inflight+len(eager) > 0 || len(c.Locks) > 0) && !stopping:
 		c.KeepFor = w.opts.LeaseTTL
-	case !stopping: // a stopping worker must not keep the next task to itself
+	case !stopping && w.opts.CacheSize > 0 && !d.compensating: // only an executor kept in the cache gains from it
 		c.StickyFor = w.opts.StickyFor
 	}
 	sent := time.Now()
@@ -430,7 +430,7 @@ func (d *driver) fail(task *store.WorkflowTask, err error) {
 	if errors.Is(err, executor.ErrNonDeterministic) {
 		w.log.LogAttrs(d.ctx, slog.LevelError, "flows: non-deterministic workflow, parking",
 			slog.String("instance", task.Execution.InstanceID), slog.Any("error", err))
-		c := &store.Completion{Status: store.StatusNeedsAttention, Err: w.opts.Errors.Text(err)}
+		c := &store.Completion{Status: store.StatusNeedsAttention, Err: w.opts.Errors.Text(err), ErrKinds: w.opts.Errors.Kinds(err)}
 		_, cerr := w.st.CompleteWorkflowTask(d.ctx, d.lease, c)
 		if cerr != nil && !errors.Is(cerr, store.ErrLeaseLost) {
 			w.log.LogAttrs(d.ctx, slog.LevelError, "flows: park", slog.Any("error", cerr))

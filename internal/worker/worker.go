@@ -246,7 +246,14 @@ func (w *Worker) Stop(ctx context.Context) error {
 	}
 	taskCancel(errStopping)
 	w.beat.Wait()
+	// The cached executions are sticky to this worker: hand them over now,
+	// not when their stickiness expires.
 	w.cache.close()
+	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	if uerr := w.st.Unstick(uctx, w.opts.Owner); uerr != nil {
+		w.log.LogAttrs(uctx, slog.LevelWarn, "flows: unstick on stop", slog.Any("error", uerr))
+	}
+	cancel()
 	return err
 }
 

@@ -46,6 +46,7 @@ type attemptOutcome struct {
 	ev    history.Event // ActivityCompleted or ActivityFailed
 	retry bool          // retry after delay instead of recording ev
 	delay time.Duration
+	maybe bool // the retried attempt may have had its effect
 	lost  bool // the lease was lost: record nothing
 }
 
@@ -107,7 +108,7 @@ func (w *Worker) attemptOnce(ctx context.Context, a *Activity, t *store.Activity
 		// compensator gets the zero value. Before any attempt, certain.
 		return attemptOutcome{err: ErrActivityCanceled, ev: history.Event{
 			Type: history.ActivityFailed, Err: ErrActivityCanceled.Error(), ErrKinds: w.opts.Errors.Kinds(ErrActivityCanceled),
-			Permanent: true, Uncertain: t.Attempt > 1,
+			Permanent: true, Uncertain: t.Uncertain && !t.Compensate,
 		}}
 	}
 	out, comp, err, panicked := safeRun(actx, a, t)
@@ -120,7 +121,7 @@ func (w *Worker) attemptOnce(ctx context.Context, a *Activity, t *store.Activity
 		// Interrupted by the stop deadline: not a failure. Hand the task
 		// back at once so another instance runs it again (the next claim
 		// counts as an attempt: a shutdown uses one).
-		return attemptOutcome{retry: true, err: err}
+		return attemptOutcome{retry: true, err: err, maybe: true}
 	}
 	if err == nil {
 		return attemptOutcome{ev: history.Event{Type: history.ActivityCompleted, Payload: out, CompData: comp}}
@@ -138,8 +139,11 @@ func (w *Worker) attemptOnce(ctx context.Context, a *Activity, t *store.Activity
 	uncertain := panicked || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrUncertain)
 	permanent := panicked || w.opts.Errors.Permanent(err)
 	if !permanent && t.Attempt < int32(a.Retry.Attempts) {
-		return attemptOutcome{retry: true, delay: a.Retry.Delay(t.Attempt + 1), err: err}
+		return attemptOutcome{retry: true, delay: a.Retry.Delay(t.Attempt + 1), err: err, maybe: uncertain}
 	}
+	// An earlier attempt that may have had its effect makes the failure
+	// uncertain too (a timeout, then a decline: the charge may stand).
+	uncertain = uncertain || t.Uncertain && !t.Compensate
 	return attemptOutcome{err: err, ev: history.Event{
 		Type: history.ActivityFailed, Err: w.opts.Errors.Text(err), ErrKinds: w.opts.Errors.Kinds(err),
 		Permanent: permanent, Uncertain: uncertain, CompData: comp,
@@ -178,7 +182,7 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 	a, ok := w.acts.Activity(t.Name, t.Compensate)
 	if !ok {
 		// Another instance may have it: give the task back for a while.
-		if err := w.st.RetryActivityTask(tctx, t.Lease, w.opts.HandBack); err != nil && !errors.Is(err, store.ErrLeaseLost) {
+		if err := w.st.RetryActivityTask(tctx, t.Lease, w.opts.HandBack, false); err != nil && !errors.Is(err, store.ErrLeaseLost) {
 			w.log.LogAttrs(ctx, slog.LevelWarn, "flows: hand back activity", slog.String("activity", t.Name), slog.Any("error", err))
 		}
 		return
@@ -211,7 +215,7 @@ func (w *Worker) recordOnce(ctx context.Context, t *store.ActivityTask, o attemp
 	case o.lost:
 		return nil, false, nil
 	case o.retry:
-		err := w.st.RetryActivityTask(ctx, t.Lease, o.delay)
+		err := w.st.RetryActivityTask(ctx, t.Lease, o.delay, o.maybe)
 		if errors.Is(err, store.ErrLeaseLost) {
 			err = nil
 		}

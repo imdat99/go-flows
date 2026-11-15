@@ -167,8 +167,8 @@ func TestPanickingCompensatorParks(t *testing.T) {
 }
 
 // When the workflow ends, its open child is canceled, its timer dropped,
-// and an activity waiting an hour for its retry is canceled at once (and
-// compensated as uncertain: its first attempt ran).
+// and an activity waiting an hour for its retry is canceled at once (not
+// compensated: its only attempt failed for certain).
 func TestOpenWorkAtTheEnd(t *testing.T) {
 	e := testEngine(t)
 	comps.reset("open")
@@ -189,7 +189,9 @@ func TestOpenWorkAtTheEnd(t *testing.T) {
 	if !errors.As(err, &re) || re.Status != StatusCanceled {
 		t.Fatalf("%v", err)
 	}
-	wantJournal(t, "open", "undo backoff?", "undo a")
+	// The backoff activity's only attempt failed for certain (no effect):
+	// canceled before its retry, it has nothing to undo.
+	wantJournal(t, "open", "undo a")
 	waitFor(t, func() bool {
 		st, _ := waitForeverWF.Handle(e, "open-child").Status(bg)
 		return st == StatusCanceled

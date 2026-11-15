@@ -599,6 +599,9 @@ func (s *Store) ClaimActivityTasks(_ context.Context, owner string, queues []str
 		if len(out) == limit {
 			break
 		}
+		if t.Lease.Owner != "" && !t.Compensate {
+			t.Uncertain = true // its lease expired without a result: the attempt may have run
+		}
 		t.Lease.Owner, t.Lease.Version = owner, t.Lease.Version+1
 		t.Attempt++
 		t.lockedUntil = now.Add(ttl)
@@ -664,7 +667,7 @@ func (s *Store) CompleteActivityTask(_ context.Context, l store.Lease, r store.A
 }
 
 // RetryActivityTask implements store.Store.
-func (s *Store) RetryActivityTask(_ context.Context, l store.Lease, delay time.Duration) error {
+func (s *Store) RetryActivityTask(_ context.Context, l store.Lease, delay time.Duration, uncertain bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.clock.Now()
@@ -673,6 +676,7 @@ func (s *Store) RetryActivityTask(_ context.Context, l store.Lease, delay time.D
 		return err
 	}
 	t.Lease.Owner, t.lockedUntil, t.visibleAt = "", time.Time{}, now.Add(delay)
+	t.Uncertain = t.Uncertain || uncertain && !t.Compensate
 	if delay <= 0 {
 		s.hint(store.ActivityWork, t.Queue)
 	}
@@ -739,6 +743,19 @@ func (s *Store) releaseLocks(id int64) {
 			delete(s.locks, key)
 		}
 	}
+}
+
+// Unstick implements store.Store.
+func (s *Store) Unstick(_ context.Context, owner string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.clock.Now()
+	for _, e := range s.executions {
+		if e.stickyOwner == owner && e.stickyUntil.After(now) {
+			e.stickyOwner, e.stickyUntil = "", time.Time{}
+		}
+	}
+	return nil
 }
 
 // ReopenCompensation implements store.Store.

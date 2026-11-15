@@ -247,7 +247,7 @@ func testCancelBeforeRetry(t *testing.T, h Harness) {
 	}
 	// A long retry delay: the cancel makes the task claimable at once, so
 	// the workflow learns of it without waiting out the backoff.
-	if err := s.RetryActivityTask(ctx, a.Lease, time.Hour); err != nil {
+	if err := s.RetryActivityTask(ctx, a.Lease, time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Signal(ctx, "i1", "x", nil); err != nil {
@@ -262,5 +262,76 @@ func testCancelBeforeRetry(t *testing.T, h Harness) {
 	again := claimActivity(t, s, other, h.TTL)
 	if len(again) != 1 || !again[0].CancelRequested {
 		t.Fatalf("claim after cancel: %+v", again)
+	}
+}
+
+// Unstick hands an owner's sticky executions over at once; another owner's
+// stickiness stays.
+func testUnstick(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "i1")
+	task := claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{StickyFor: time.Hour})
+	if err := s.Signal(ctx, "i1", "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := claim(t, s, other, h.TTL); len(got) != 0 {
+		t.Fatalf("sticky execution claimed by another owner: %+v", got)
+	}
+	if err := s.Unstick(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	if got := claim(t, s, other, h.TTL); len(got) != 0 {
+		t.Fatal("another owner unstuck it")
+	}
+	if err := s.Unstick(ctx, owner); err != nil {
+		t.Fatal(err)
+	}
+	if got := claim(t, s, other, h.TTL); len(got) != 1 {
+		t.Fatalf("after unstick: %+v", got)
+	}
+}
+
+// Uncertainty survives retries: an attempt that may have had its effect
+// (retried with uncertain, or whose holder died) makes later attempts
+// uncertain; a certain retry does not; compensation tasks keep their own
+// meaning.
+func testUncertainAcrossAttempts(t *testing.T, h Harness) {
+	s := h.New(t)
+	scheduleActivity(t, s, h, "i1", store.NewActivityTask{ScheduleID: 1, Name: "a", Queue: queue})
+	a := claimActivity(t, s, owner, h.TTL)[0]
+	if a.Uncertain {
+		t.Fatal("first attempt uncertain")
+	}
+	if err := s.RetryActivityTask(ctx, a.Lease, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	a = claimActivity(t, s, owner, h.TTL)[0]
+	if a.Uncertain {
+		t.Fatal("uncertain after a certain retry")
+	}
+	if err := s.RetryActivityTask(ctx, a.Lease, 0, true); err != nil {
+		t.Fatal(err)
+	}
+	a = claimActivity(t, s, owner, h.TTL)[0]
+	if !a.Uncertain || a.Attempt != 3 {
+		t.Fatalf("after an uncertain retry: %+v", a)
+	}
+	// Its holder dies: the next claim is uncertain as well.
+	scheduleActivity(t, s, h, "i2", store.NewActivityTask{ScheduleID: 1, Name: "b", Queue: queue})
+	var b store.ActivityTask
+	for _, x := range claimActivity(t, s, owner, h.TTL) {
+		if x.InstanceID == "i2" {
+			b = x
+		}
+	}
+	if b.Uncertain {
+		t.Fatal("fresh task uncertain")
+	}
+	h.Advance(t, s, h.TTL+h.TTL/2)
+	for _, x := range claimActivity(t, s, other, h.TTL) {
+		if x.InstanceID == "i2" && !x.Uncertain {
+			t.Fatalf("claim after a dead holder: %+v", x)
+		}
 	}
 }
