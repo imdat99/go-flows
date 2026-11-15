@@ -305,7 +305,19 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
     - **Review:** lần 1 không đạt (M1 status của span chưa commit; M2 cause của cancel phụ thuộc ctx của tracer; M3 bucket; M4 test). Lần 2 đạt.
 
 ### P8 — Chất lượng và phát hành
-- [ ] **T8.1** Port `test/chaos`: SIGKILL, SIGSTOP, 3 instance, `assertOnce`.
+- [x] **T8.1** Port `test/chaos`: SIGKILL, SIGSTOP, 3 instance, `assertOnce`.
+  - T8.1: `test/chaos` (build tag `chaos`, `make chaos`). Test tự chạy lại chính mình thành tiến trình con, rồi bị SIGKILL hoặc SIGSTOP; engine ở tiến trình cha khôi phục. Có `Pdeathsig` để con không sống sót sau cha.
+    - **A:** con bị kill giữa activity (khi đang giữ lease).
+    - **B:** con bị đóng băng lâu hơn lease. Engine khác giữ task qua một cổng chặn; khi con được rã đông, nó ghi kết quả muộn và bị fence của store từ chối. Đã kiểm tra bằng mutation: bỏ predicate owner/version trong `finishTask` thì B fail.
+    - **C:** 3 engine tranh nhau khôi phục 30 execution.
+    - **D:** con bị kill giữa compensation: chạy lại cùng key và comp data, undo có hiệu lực đúng 1 lần, kết thúc `compensated`.
+    - **E:** con bị kill khi đang giữ business lock: holder được khôi phục chạy xong vùng găng rồi bên chờ mới vào.
+    - **Còn mở:**
+      - fencing ở mức workflow lease trong chaos (làm được bằng kỹ thuật ngủ ngắn hơn thời gian đóng băng như B);
+      - các kịch bản cha/con, continue-as-new, timer;
+      - chứng minh nhiều racer thực sự tham gia ở C;
+      - một lần A chạy mất 11s (vẫn đạt).
+    - **Review:** lần 1 không đạt (B không kiểm tra fencing). Lần 2 không đạt (lập luận sai về heartbeat). Lần 3 đạt.
 - [ ] **T8.2** (bổ sung từ P3) Giảm alloc của vòng eager trên Postgres xuống gần mục tiêu ≤ 80 mỗi lần chạy 10 activity:
     - gộp các câu lệnh trong batch (fence + history + xoá pending; resume);
     - tự ghi Bind/Execute thay cho `pgconn.Batch`, vì pgconn không cho tái dùng batch;
