@@ -275,7 +275,20 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
       - activity chờ cancel do timer của workflow gửi thì không thể kết thúc được (đã ghi trong tài liệu, kèm `ErrNeverIdle`);
       - **T8:** test conformance pg `LockRenewal` dùng sleep thật, từng flake một lần khi máy tải nặng; cần làm chắc lại.
     - **Review:** lần 1 không đạt (H1 alloc/task trên đường nóng; H2 test #494 và #481 không tái hiện lỗi; M2 hàng đợi không ai phục vụ treo 30s; M3/M4 mock; M6 WaitGroup). Lần 2 không đạt (`Wait` bỏ qua cancel). Lần 3 đạt.
-- [ ] **T7.2** Port `analyzer` theo API mới.
+- [x] **T7.2** Port `analyzer` theo API mới.
+  - T7.2: `analyzer/` (module riêng, `flowsvet`; dùng làm plugin golangci-lint hoặc `go vet -vettool`).
+    - Code workflow được nhận diện theo kiểu: hàm hoặc closure có tham số đầu là `flows.Ctx`.
+    - Báo:
+      - lệnh `go`, `select`, channel;
+      - range trên map (kể cả qua `maps.All`/`Keys`/`Values`), trên type param map;
+      - `time.*` (kể cả khi dùng làm giá trị hàm);
+      - `math/rand`, `crypto/rand` và method của `rand.Rand`;
+      - `sync.Map.Range`, `os.Getenv`;
+      - `sync.WaitGroup`/`Mutex`/`RWMutex`/`Once`/`Cond`.
+    - Bỏ qua hàm truyền cho `SideEffect` (nhưng vẫn kiểm tra đối số `Ctx`), các activity, và chính package `flows`.
+    - Có `LICENSE`/`NOTICE` riêng. `make test`, `lint`, `fmt`, `lint-fix` đã bao phủ module này. Chạy trên repo: sạch.
+    - Còn mở (thấp): channel không gán vào biến (`foo(make(chan int))`), field kiểu channel hoặc mutex; hàm `SideEffect` để trong biến bị báo nhầm (tài liệu ghi: viết literal trực tiếp).
+    - Review: lần 1 đạt; các ghi chú M1–M6 (method của rand, iterator của maps, giá trị hàm, `Args[0]` của `SideEffect`, license, test) và L1/L2/L5/L6 đã sửa.
 - [ ] **T7.3** ⚡ OpenTelemetry tracing và metrics (tắt thì không tốn alloc).
 
 ### P8 — Chất lượng và phát hành
