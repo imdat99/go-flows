@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -186,4 +188,215 @@ func TestRunHookFailureIsRetried(t *testing.T) {
 	if f.calls != 2 || len(f.ok) != 1 || f.ok[0].Status != StatusCompleted {
 		t.Fatalf("calls %d, committed %+v", f.calls, f.ok)
 	}
+}
+
+type traceKey struct{}
+
+type fakeTracer struct {
+	mu       sync.Mutex
+	attempts []string
+	tasks    []string
+	boom     bool
+}
+
+func (f *fakeTracer) StartActivity(ctx context.Context, a ActivityInfo) (context.Context, func(error)) {
+	if f.boom {
+		panic("tracer bug")
+	}
+	return context.WithValue(ctx, traceKey{}, "span:"+a.Activity), func(err error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.attempts = append(f.attempts, a.Activity+"/"+strconv.FormatBool(a.Compensation)+"/"+strconv.FormatBool(err == nil))
+	}
+}
+
+func (f *fakeTracer) StartWorkflowTask(_ context.Context, w WorkflowTaskInfo) func(Status, error) {
+	if f.boom {
+		panic("tracer bug")
+	}
+	return func(s Status, _ error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.tasks = append(f.tasks, w.Workflow+":"+string(s))
+	}
+}
+
+var (
+	sawSpan  atomic.Value
+	spanStep = DefineActivity("trace.step", func(ctx context.Context, _ Key, s string) (string, string, error) {
+		if v, ok := ctx.Value(traceKey{}).(string); ok {
+			sawSpan.Store(v)
+		}
+		return s, s, nil
+	}, func(context.Context, Key, string) error { return nil })
+	traced = DefineWorkflow("trace.wf", 1, func(c Ctx, _ int) (int, error) {
+		if _, err := spanStep.Run(c, "x"); err != nil {
+			return 0, err
+		}
+		return 0, errNoStock
+	})
+)
+
+// T7.3: the tracer wraps attempts (its context reaches the activity) and
+// workflow tasks; its panics are harmless.
+func TestTracer(t *testing.T) {
+	for _, boom := range []bool{false, true} {
+		f := &fakeTracer{boom: boom}
+		e, err := newEngine(mem.New(nil), Options{InstanceID: "trace", PollMax: 20 * time.Millisecond, Tracer: f})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Start(bg); err != nil {
+			t.Fatal(err)
+		}
+		sawSpan.Store("")
+		if _, err := traced.Run(waitCtx(t), e, "traced", 0); !errors.Is(err, ErrCompensated) {
+			t.Fatalf("boom=%v: %v", boom, err)
+		}
+		ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+		_ = e.Stop(ctx)
+		cancel()
+		if boom {
+			continue
+		}
+		if v := sawSpan.Load(); v != "span:trace.step" {
+			t.Fatalf("activity context %v", v)
+		}
+		f.mu.Lock()
+		if !slices.Equal(f.attempts, []string{"trace.step/false/true", "trace.step/true/true"}) {
+			t.Fatalf("attempts %v", f.attempts)
+		}
+		if n := len(f.tasks); n < 2 || f.tasks[n-1] != "trace.wf:compensated" {
+			t.Fatalf("tasks %v", f.tasks)
+		}
+		f.mu.Unlock()
+	}
+}
+
+// balanceTracer counts starts and ends, and records how attempts and tasks
+// ended. mode "nilctx" returns a nil context, "nilend" a nil end.
+type balanceTracer struct {
+	mode         string
+	mu           sync.Mutex
+	starts, ends int
+	attemptErrs  []bool // per ended attempt: had an error
+	taskEnds     []string
+}
+
+func (b *balanceTracer) StartActivity(ctx context.Context, a ActivityInfo) (context.Context, func(error)) {
+	b.mu.Lock()
+	b.starts++
+	b.mu.Unlock()
+	end := func(err error) {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.ends++
+		b.attemptErrs = append(b.attemptErrs, err != nil)
+	}
+	switch b.mode {
+	case "nilctx":
+		return nil, end
+	case "nilend":
+		b.mu.Lock()
+		b.ends++ // no end will come
+		b.mu.Unlock()
+		return ctx, nil
+	}
+	return ctx, end
+}
+
+func (b *balanceTracer) StartWorkflowTask(_ context.Context, w WorkflowTaskInfo) func(Status, error) {
+	b.mu.Lock()
+	b.starts++
+	b.mu.Unlock()
+	return func(s Status, err error) {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.ends++
+		b.taskEnds = append(b.taskEnds, string(s)+"/"+strconv.FormatBool(err != nil))
+	}
+}
+
+func tracedEngine(t *testing.T, tr Tracer, opts Options) *Engine {
+	t.Helper()
+	opts.InstanceID, opts.PollMax, opts.Tracer = "balance", 20*time.Millisecond, tr
+	e, err := newEngine(mem.New(nil), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+		defer cancel()
+		_ = e.Stop(ctx)
+	})
+	return e
+}
+
+// Review of T7.3: every span started ends once, on every path; attempts
+// that failed (retried, panicked) end with an error; a park ends its task
+// needs_attention with an error.
+func TestTracerSpansBalance(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		opts Options
+		mode string
+	}{{"eager", Options{}, ""}, {"polled", Options{DisableEager: true}, ""}, {"nilctx", Options{}, "nilctx"}, {"nilend", Options{}, "nilend"}} {
+		b := &balanceTracer{mode: c.mode}
+		e := tracedEngine(t, b, c.opts)
+		id := "balance-" + c.name
+		resetCalls(id)
+		if out, err := portWF.Run(waitCtx(t), e, id, []string{"flaky"}); err != nil || out != "flaky@3" {
+			t.Fatalf("%s: %q %v", c.name, out, err)
+		}
+		comps.reset(id + "-p")
+		if _, err := portWF.Run(waitCtx(t), e, id+"-p", []string{"a", "panic"}); !errors.Is(err, ErrPanic) {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		waitFor(t, func() bool {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			return b.starts == b.ends
+		})
+		if c.mode != "" {
+			continue
+		}
+		b.mu.Lock()
+		failed := 0
+		for _, e := range b.attemptErrs {
+			if e {
+				failed++
+			}
+		}
+		// flaky: 2 failed + 1 ok; a: ok; panic (permanent): 1 failed; undo
+		// panic, undo a: ok.
+		if len(b.attemptErrs) != 7 || failed != 3 {
+			t.Fatalf("%s: attempts %v", c.name, b.attemptErrs)
+		}
+		b.mu.Unlock()
+	}
+	// A park ends its task needs_attention, with the reason.
+	shortReplay.Store(false)
+	defer shortReplay.Store(false)
+	b := &balanceTracer{}
+	e := tracedEngine(t, b, Options{CacheSize: -1})
+	h, err := changingWF.Start(bg, e, "balance-park", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return historyHas(e, "balance-park", "TimerScheduled") })
+	shortReplay.Store(true)
+	if err := e.Signal(bg, "balance-park", "go", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Wait(waitCtx(t)); !errors.Is(err, ErrNonDeterministic) {
+		t.Fatalf("%v", err)
+	}
+	waitFor(t, func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return b.starts == b.ends && slices.Contains(b.taskEnds, "needs_attention/true")
+	})
 }

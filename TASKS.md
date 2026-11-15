@@ -289,7 +289,20 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
     - Có `LICENSE`/`NOTICE` riêng. `make test`, `lint`, `fmt`, `lint-fix` đã bao phủ module này. Chạy trên repo: sạch.
     - Còn mở (thấp): channel không gán vào biến (`foo(make(chan int))`), field kiểu channel hoặc mutex; hàm `SideEffect` để trong biến bị báo nhầm (tài liệu ghi: viết literal trực tiếp).
     - Review: lần 1 đạt; các ghi chú M1–M6 (method của rand, iterator của maps, giá trị hàm, `Args[0]` của `SideEffect`, license, test) và L1/L2/L5/L6 đã sửa.
-- [ ] **T7.3** ⚡ OpenTelemetry tracing và metrics (tắt thì không tốn alloc).
+- [x] **T7.3** ⚡ OpenTelemetry tracing và metrics (tắt thì không tốn alloc).
+  - T7.3: hook `flows.Tracer` không phụ thuộc thư viện ngoài, đi qua `worker.Tracer`.
+    - **Span:** một span cho mỗi attempt (context của tracer đi vào activity; cause của cancel vẫn đọc từ ctx của worker) và một span cho mỗi workflow task (kết thúc bằng status đã commit và lỗi; park = `needs_attention`). Panic của tracer được recover.
+    - **Module `otelflows/` (riêng):**
+      - `NewTracer` và `NewObserver`;
+      - metric `flows.activity.attempts`, `flows.activity.duration` (bucket tính bằng giây), `flows.runs.ended`;
+      - không dùng instance id làm thuộc tính metric.
+    - **Tắt thì không tốn gì:** `-gcflags=-m` không thấy escape mới; `BenchmarkActivityRun` 1325–1575 alloc/run (trong dải nhiễu); `BenchmarkReplay` 129.
+    - **Test:** `TestTracer`, `TestTracerSpansBalance` (eager và poll, retry, panic, ctx/end nil, park); test SDK của otelflows (span, quan hệ cha con, metric).
+    - **Kèm theo:**
+      - `make race10` có `-timeout 30m`;
+      - hai test conformance lock dựa vào thời gian thật (`LockRenewal`, `LockHeldDuringActivity`) đã làm chắc lại: dùng 2×TTL và chừa 45% dư. pg 10 lần liên tiếp: sạch.
+    - **Còn mở (thấp):** span không được nối với nhau qua các task (chỉ gắn với nhau bằng `flows.instance_id`); chưa có test cho attempt mất lease.
+    - **Review:** lần 1 không đạt (M1 status của span chưa commit; M2 cause của cancel phụ thuộc ctx của tracer; M3 bucket; M4 test). Lần 2 đạt.
 
 ### P8 — Chất lượng và phát hành
 - [ ] **T8.1** Port `test/chaos`: SIGKILL, SIGSTOP, 3 instance, `assertOnce`.

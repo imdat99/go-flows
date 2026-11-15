@@ -53,6 +53,9 @@ type Options struct {
 	Hook RunHook
 	// Observer, when set, receives activity attempts and ends.
 	Observer Observer
+	// Tracer, when set, wraps activity attempts and workflow tasks in spans
+	// (OpenTelemetry: package otelflows).
+	Tracer Tracer
 }
 
 // Engine runs the workflows and activities defined in this binary against
@@ -101,12 +104,16 @@ func newEngineWith(st store.Store, acts worker.Activities, opts Options) (*Engin
 	if opts.Observer != nil {
 		obs = observer{opts.Observer}
 	}
+	var tr worker.Tracer
+	if opts.Tracer != nil {
+		tr = tracer{opts.Tracer}
+	}
 	w, err := worker.New(st, workerRegistry{}, acts, worker.Options{
 		Owner: opts.InstanceID, Queues: opts.Queues, LeaseTTL: opts.LeaseTTL,
 		MaxWorkflowTasks: opts.MaxWorkflowTasks, MaxActivities: opts.MaxActivities,
 		Eager: !opts.DisableEager, EagerWindow: opts.EagerWindow, StickyFor: opts.StickyFor,
 		PollMax: opts.PollMax, CacheSize: opts.CacheSize, Errors: errorCodec{}, Logger: opts.Logger,
-		Observer: obs,
+		Observer: obs, Tracer: tr,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("flows: %w", err)

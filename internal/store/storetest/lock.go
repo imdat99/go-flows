@@ -137,6 +137,10 @@ func testLocks(t *testing.T, h Harness) {
 // A running execution keeps its locks: claims and lease renewals extend
 // them.
 func testLockRenewal(t *testing.T, h Harness) {
+	// Real sleeps on Postgres: twice the TTL, in steps leaving 45% of it
+	// as slack for a loaded machine (the three steps still outlast one TTL,
+	// so only the extensions keep the lock).
+	h.TTL *= 2
 	s := h.New(t)
 	seq := lockSeq{}
 	for _, id := range []string{"i1", "i2"} {
@@ -146,13 +150,13 @@ func testLockRenewal(t *testing.T, h Harness) {
 	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i1"), 1, "k"); ev.Type != history.LockAcquired {
 		t.Fatalf("free lock: %+v", ev)
 	}
-	h.Advance(t, s, h.TTL*6/10)
+	h.Advance(t, s, h.TTL*55/100)
 	held := wakeTask(t, s, h, "i1") // the claim extends the lock
-	h.Advance(t, s, h.TTL*6/10)
+	h.Advance(t, s, h.TTL*55/100)
 	if _, err := s.RenewLeases(ctx, owner, []store.Lease{held.Lease}, nil, h.TTL); err != nil {
 		t.Fatal(err)
 	}
-	h.Advance(t, s, h.TTL*6/10)
+	h.Advance(t, s, h.TTL*55/100)
 	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 1, "k"); ev.Type != history.LockHeld {
 		t.Fatalf("lock of a running execution taken: %+v", ev)
 	}
@@ -177,6 +181,10 @@ func testLockValidation(t *testing.T, h Harness) {
 // Review of T5.4 (H1): locks live while the execution's activities run,
 // though the execution itself does not (its lease released).
 func testLockHeldDuringActivity(t *testing.T, h Harness) {
+	// Real sleeps on Postgres: twice the TTL, in steps leaving 45% of it
+	// as slack for a loaded machine (the three steps still outlast one TTL,
+	// so only the extensions keep the lock).
+	h.TTL *= 2
 	s := h.New(t)
 	seq := lockSeq{}
 	for _, id := range []string{"i1", "i2"} {
@@ -202,16 +210,16 @@ func testLockHeldDuringActivity(t *testing.T, h Harness) {
 	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, c); err != nil {
 		t.Fatal(err)
 	}
-	h.Advance(t, s, h.TTL*6/10)
+	h.Advance(t, s, h.TTL*55/100)
 	act := claimActivity(t, s, other, h.TTL) // the claim extends the lock
 	if len(act) != 1 {
 		t.Fatalf("activities %+v", act)
 	}
-	h.Advance(t, s, h.TTL*6/10)
+	h.Advance(t, s, h.TTL*55/100)
 	if _, err := s.RenewLeases(ctx, other, nil, []store.Lease{act[0].Lease}, h.TTL); err != nil {
 		t.Fatal(err)
 	}
-	h.Advance(t, s, h.TTL*6/10)
+	h.Advance(t, s, h.TTL*55/100)
 	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 1, "k"); ev.Type != history.LockHeld || ev.Err != "i1" {
 		t.Fatalf("lock taken while its holder's activity runs: %+v", ev)
 	}

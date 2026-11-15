@@ -97,6 +97,22 @@ type Options struct {
 	// Observer, when set, is told of activity attempts and of executions
 	// ending, after the fact (it must not block).
 	Observer Observer
+	// Tracer, when set, wraps activity attempts and workflow tasks (spans).
+	Tracer Tracer
+}
+
+// Tracer wraps work in spans (OpenTelemetry: package otelflows). Its
+// panics are recovered and logged.
+type Tracer interface {
+	// StartAttempt starts an activity or compensator attempt: the returned
+	// context is the attempt's (spans the activity makes are children);
+	// end gets the attempt's error.
+	StartAttempt(ctx context.Context, t *store.ActivityTask) (context.Context, func(err error))
+	// StartTask starts a workflow task of e; end gets the status the task
+	// committed ("" when unchanged or nothing was stored; needs_attention
+	// for a park) and the error that ended it early (handed back, the
+	// completion refused, a park's reason).
+	StartTask(ctx context.Context, e *store.Execution) func(status store.Status, err error)
 }
 
 // Observer receives measurements (see Options.Observer).

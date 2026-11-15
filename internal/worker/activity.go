@@ -50,6 +50,24 @@ type attemptOutcome struct {
 	lost  bool // the lease was lost: record nothing
 }
 
+// startAttempt calls the tracer, recovering its panics.
+func (w *Worker) startAttempt(ctx context.Context, t *store.ActivityTask) (actx context.Context, end func(error)) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.log.LogAttrs(context.Background(), slog.LevelError, "flows: panic in tracer", slog.Any("panic", r))
+			actx, end = ctx, func(error) {}
+		}
+	}()
+	actx, end = w.opts.Tracer.StartAttempt(ctx, t)
+	if end == nil {
+		end = func(error) {}
+	}
+	if actx == nil {
+		actx = ctx
+	}
+	return actx, end
+}
+
 // ErrUncertain is wrapped by an activity's error to mark a failure after
 // which the activity may still have had its effect (its compensator runs).
 var ErrUncertain = errors.New("outcome uncertain")
@@ -69,7 +87,20 @@ func (w *Worker) attempt(ctx context.Context, a *Activity, t *store.ActivityTask
 	if w.opts.Observer != nil {
 		start = time.Now()
 	}
-	o := w.attemptOnce(ctx, a, t)
+	runCtx := ctx // the tracer's context runs the activity; ctx keeps the cancel causes
+	var o attemptOutcome
+	if w.opts.Tracer != nil {
+		var end func(error)
+		runCtx, end = w.startAttempt(ctx, t)
+		defer func() {
+			err := o.err
+			if o.lost {
+				err = ErrLeaseLost // another owner records the outcome
+			}
+			w.observe(func() { end(err) })
+		}()
+	}
+	o = w.attemptOnce(ctx, runCtx, a, t)
 	if w.opts.Observer != nil && !o.lost {
 		outcome := "completed"
 		switch {
@@ -95,11 +126,13 @@ func (w *Worker) attempt(ctx context.Context, a *Activity, t *store.ActivityTask
 	return o
 }
 
-func (w *Worker) attemptOnce(ctx context.Context, a *Activity, t *store.ActivityTask) attemptOutcome {
-	actx := ctx
+// attemptOnce runs the activity under runCtx (derived from ctx, possibly by
+// a tracer) and classifies its outcome from ctx's cancel cause.
+func (w *Worker) attemptOnce(ctx, runCtx context.Context, a *Activity, t *store.ActivityTask) attemptOutcome {
+	actx := runCtx
 	if a.Timeout > 0 {
 		var cancel context.CancelFunc
-		actx, cancel = context.WithTimeout(ctx, a.Timeout)
+		actx, cancel = context.WithTimeout(runCtx, a.Timeout)
 		defer cancel()
 	}
 	if t.CancelRequested {

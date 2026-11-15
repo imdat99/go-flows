@@ -86,3 +86,65 @@ func (o observer) ActivityAttempt(t *store.ActivityTask, outcome string, d time.
 }
 
 func (o observer) Ended(e store.EndInfo) { o.o.RunEnded(runInfo(e)) }
+
+// Tracer wraps engine work in spans; package otelflows implements it with
+// OpenTelemetry. Unset, it costs nothing. Its panics are recovered and
+// logged. Workflow code itself is replayed and not traced: a span covers a
+// whole workflow task. Spans are not linked across tasks and attempts
+// (each is a root, tied to the others by the instance id).
+type Tracer interface {
+	// StartActivity starts an attempt of an activity or compensator. The
+	// returned context is the attempt's: spans the activity makes are its
+	// children. It must derive from ctx (context.WithValue), or the
+	// activity is no longer interrupted by a lost lease, a stop or a cancel.
+	// end gets the attempt's error (nil when it completed).
+	StartActivity(ctx context.Context, a ActivityInfo) (context.Context, func(err error))
+	// StartWorkflowTask starts a workflow task (a run of workflow code up
+	// to its next wait, or a compensation step). end gets the status the
+	// task committed ("" when it still runs, or nothing was stored;
+	// needs_attention for a park) and the error that ended it early (handed
+	// back to another instance, the completion refused, a park's reason).
+	StartWorkflowTask(ctx context.Context, w WorkflowTaskInfo) func(status Status, err error)
+}
+
+// ActivityInfo describes an activity attempt.
+type ActivityInfo struct {
+	InstanceID   string
+	Activity     string
+	Attempt      int
+	Compensation bool
+	// Uncertain: for an invocation, an earlier attempt may have had its
+	// effect; for a compensation, the activity may not have had one.
+	Uncertain bool
+}
+
+// WorkflowTaskInfo describes a workflow task.
+type WorkflowTaskInfo struct {
+	InstanceID string
+	Workflow   string
+	Version    int
+	// Status is the execution's status when the task starts (running or
+	// compensating).
+	Status Status
+}
+
+// tracer adapts a Tracer to the worker.
+type tracer struct{ t Tracer }
+
+var _ worker.Tracer = tracer{}
+
+func (t tracer) StartAttempt(ctx context.Context, a *store.ActivityTask) (context.Context, func(error)) {
+	return t.t.StartActivity(ctx, ActivityInfo{
+		InstanceID: a.InstanceID, Activity: a.Name, Attempt: int(a.Attempt), Compensation: a.Compensate, Uncertain: a.Uncertain,
+	})
+}
+
+func (t tracer) StartTask(ctx context.Context, e *store.Execution) func(store.Status, error) {
+	end := t.t.StartWorkflowTask(ctx, WorkflowTaskInfo{
+		InstanceID: e.InstanceID, Workflow: e.Workflow, Version: int(e.Version), Status: e.Status,
+	})
+	if end == nil {
+		return nil
+	}
+	return end
+}

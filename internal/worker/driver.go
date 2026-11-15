@@ -48,7 +48,16 @@ type driver struct {
 	compensating bool
 	ledger       *compensation.Ledger
 	ledgerSeq    int64
+	// The outcome of the current task, for its span: the status committed
+	// (needs_attention for a park; "" if unchanged or not stored) and the
+	// error that ended it early (handed back, completion refused).
+	taskStatus store.Status
+	taskErr    error
 }
+
+// errHandedBack reports a task given back to the store for another
+// instance (unknown workflow version) or a later retry.
+var errHandedBack = errors.New("worker: task handed back")
 
 type eagerResult struct {
 	task    store.ActivityTask
@@ -195,12 +204,26 @@ func (d *driver) lost() {
 
 // step executes one task and completes it; it returns the next task when
 // the store asks for a re-run (undelivered signals), else nil.
-func (d *driver) step(pollCtx context.Context, task *store.WorkflowTask) *store.WorkflowTask {
+func (d *driver) step(pollCtx context.Context, task *store.WorkflowTask) (next *store.WorkflowTask) {
 	w := d.w
+	if w.opts.Tracer != nil {
+		var end func(store.Status, error)
+		w.observe(func() { end = w.opts.Tracer.StartTask(d.ctx, &task.Execution) })
+		if end != nil {
+			d.taskStatus, d.taskErr = "", nil
+			defer func() { w.observe(func() { end(d.taskStatus, d.taskErr) }) }()
+		}
+	}
 	c := d.execute(task)
 	if c == nil {
 		return nil
 	}
+	return d.complete(pollCtx, task, c)
+}
+
+// complete stores a task's completion and follows it up.
+func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *store.Completion) *store.WorkflowTask {
+	w := d.w
 	stopping := pollCtx.Err() != nil
 	eager := d.eager(c, stopping)
 	for i := range c.Locks {
@@ -219,8 +242,12 @@ func (d *driver) step(pollCtx context.Context, task *store.WorkflowTask) *store.
 		for range eager {
 			release(w.actSlots, 1)
 		}
+		if !errors.Is(err, store.ErrPendingEvents) { // a normal re-run, not a failure
+			d.taskErr = err
+		}
 		return d.completeFailed(task, err)
 	}
+	d.taskStatus = c.Status
 	d.completed(task, c, eager, leases, sent)
 	if len(c.Locks) > 0 && d.held {
 		// The answers are pending already: run the next task at once.
@@ -250,6 +277,7 @@ func (d *driver) execute(task *store.WorkflowTask) *store.Completion {
 		}
 		c, err := d.compensate(task)
 		if err != nil {
+			d.taskErr = err
 			w.log.LogAttrs(d.ctx, slog.LevelError, "flows: compensation task failed, handing back",
 				slog.String("instance", task.Execution.InstanceID), slog.Any("error", err))
 			d.release(w.opts.HandBack)
@@ -404,6 +432,7 @@ func (d *driver) build(task *store.WorkflowTask) bool {
 		// execution back instead of failing it (GW-12).
 		w.log.LogAttrs(d.ctx, slog.LevelWarn, "flows: unknown workflow, handing back",
 			slog.String("workflow", e.Workflow), slog.Int("version", int(e.Version)))
+		d.taskErr = fmt.Errorf("%w: unknown workflow %s@%d", errHandedBack, e.Workflow, e.Version)
 		d.release(w.opts.HandBack)
 		return false
 	}
@@ -428,6 +457,7 @@ func (d *driver) build(task *store.WorkflowTask) bool {
 // execution back.
 func (d *driver) fail(task *store.WorkflowTask, err error) {
 	w := d.w
+	d.taskErr = err
 	d.evict()
 	if errors.Is(err, executor.ErrNonDeterministic) {
 		w.log.LogAttrs(d.ctx, slog.LevelError, "flows: non-deterministic workflow, parking",
@@ -442,6 +472,7 @@ func (d *driver) fail(task *store.WorkflowTask, err error) {
 		d.held = false
 		d.untrack()
 		if cerr == nil {
+			d.taskStatus = c.Status
 			w.ended(&task.Execution, c.Status, c.Err, c.ErrKinds)
 		}
 		return
