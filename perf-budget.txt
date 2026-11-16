@@ -28,6 +28,12 @@ BenchmarkHashArgs allocs/op <= 0
 BenchmarkEagerActivity allocs/op <= 8
 BenchmarkEagerActivity B/op <= 1024
 
+# T9.7: a step taking a lock, its answer returned with the completion (one
+# round trip). Measured 0 allocs, ~130 B (was 77 allocs, 7.4 KiB, 2 round
+# trips).
+BenchmarkLockStep allocs/op <= 1
+BenchmarkLockStep B/op <= 512
+
 # internal/executor (T3.1): cold replay of a 100-activity history (302
 # events): measured 30 allocs (T8.2: reused completion, calls in blocks,
 # state with its first buffers; was 130), ~0.85 us/event.

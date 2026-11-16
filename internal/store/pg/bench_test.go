@@ -2,6 +2,7 @@ package pg_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -72,4 +73,50 @@ func BenchmarkEagerActivity(b *testing.B) {
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(b.Elapsed().Microseconds())/float64(b.N), "µs/activity")
+}
+
+// BenchmarkLockStep measures a workflow step that takes a business lock
+// and runs on with its answer under the kept lease (T9.7): the completion
+// (history + lock request) returns the next task with the answer pending,
+// one round trip (was a completion, then ResumeWorkflowTask: 2 round trips,
+// 77 allocs, 7.4 KiB per op).
+func BenchmarkLockStep(b *testing.B) {
+	s := newStoreB(b)
+	ctx := context.Background()
+	if _, _, err := s.CreateExecution(ctx, store.NewExecution{InstanceID: "bench", Workflow: "w", Queue: "q"}); err != nil {
+		b.Fatal(err)
+	}
+	tasks, err := s.ClaimWorkflowTasks(ctx, "o", []string{"q"}, 1, time.Minute)
+	if err != nil || len(tasks) != 1 {
+		b.Fatal(err)
+	}
+	task := tasks[0]
+	seq := task.LastSeq
+	events := make([]history.Event, 0, 4)
+	consumed := make([]int64, 0, 2)
+	locks := make([]store.LockRequest, 1)
+	var next store.WorkflowTask
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		sched := int32(i + 1)
+		events, consumed = events[:0], consumed[:0]
+		for _, p := range task.Pending {
+			seq++
+			p.Event.Seq = seq
+			events = append(events, p.Event)
+			consumed = append(consumed, p.ID)
+		}
+		seq++
+		events = append(events, history.Event{Seq: seq, Type: history.LockRequested, ScheduleID: sched, Name: "k"})
+		locks[0] = store.LockRequest{ScheduleID: sched, Key: "k", TTL: time.Minute}
+		c := store.Completion{History: events, Consumed: consumed, Locks: locks, KeepFor: time.Minute, Resume: &next}
+		if _, err := s.CompleteWorkflowTask(ctx, task.Lease, &c); err != nil || !c.Resumed {
+			b.Fatal(err, errors.New("not resumed"))
+		}
+		task, next = next, task // two buffers in turn (task's events are still read above)
+		if len(task.Pending) != 1 || task.Pending[0].Event.Type != history.LockAcquired {
+			b.Fatalf("answer %+v", task.Pending)
+		}
+	}
 }

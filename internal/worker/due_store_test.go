@@ -267,7 +267,10 @@ func TestKeptExecutionsAreNotDue(t *testing.T) {
 	// A long eager window: B never hands a chain over (a hand-over notifies,
 	// rightly, and would wake A for reasons this test is not about).
 	b, err := worker.New(pg.New(pool), reg, reg, worker.Options{
-		Owner: "b", Queues: []string{q}, Eager: true, LeaseTTL: 600 * time.Millisecond, EagerWindow: time.Minute,
+		// 2s: under a loaded test run, a shorter lease of B lapsed now and then
+		// (a claimable execution, rightly reported); still well inside the 4s
+		// below, so reported expiries would show.
+		Owner: "b", Queues: []string{q}, Eager: true, LeaseTTL: 2 * time.Second, EagerWindow: time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)

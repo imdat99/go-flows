@@ -520,7 +520,14 @@ Các mục được rút ra từ phần "Còn mở" của T8.x, xếp theo thứ
     - Test: `TestWatchListensOnItsOwnConnection` (pool 1 kết nối bị giữ, hint vẫn tới; đỏ trước khi sửa), `TestListenDSN` (engine, DSN sai bị từ chối, session LISTEN theo application_name).
     - Tài liệu vi+en: hook của pool không áp dụng, `sslmode=verify-full`, lỗi kết nối hiện trong log.
     - Review 1 lần: đạt.
-- [ ] **T9.7** ⚡ Lấy lock trong 1 round trip: kết quả lock được trả về ngay trong completion, không cần resume riêng. Bench `BenchmarkEagerActivity` và một bench có lock.
+- [x] **T9.7** ⚡ Lấy lock trong 1 round trip: kết quả lock được trả về ngay trong completion, không cần resume riêng. Bench `BenchmarkEagerActivity` và một bench có lock.
+    - `store.Completion.Resume`/`Resumed`: completion giữ lease (KeepFor > 0, không kết thúc) trả về task kế tiếp trong cùng pipeline (resumeExtend, resumeWorkflow, resumePending; cùng transaction nên thấy ngay câu trả lời của lock). Fast path (`resumeAfter`, `decodeResumed`), pgx path (`completeWithPgx`), mem. Driver dùng khi completion có lock; bỏ `ResumeWorkflowTask` sau đó. Hai buffer resume dùng chung qua `nextResumeBuffer`.
+    - Bench `BenchmarkLockStep` (mới): 77 → 0 allocs/op, 7.4 KiB → ~140 B, 2 → 1 round trip, −10.5% thời gian (p=0.015; bị chi phối bởi commit). `BenchmarkEagerActivity` không đổi (6 allocs, ~780 B). ActivityRun 77, Public 142, Replay 30. Ngân sách: LockStep allocs ≤ 1, B/op ≤ 512.
+    - Lưu ý: một lần tách hàm (gocyclo) bằng struct `resumeRows` làm tăng 1 alloc/~400 B mỗi completion; đã bisect và viết lại bằng biến cục bộ + hàm nhận giá trị.
+    - Test: conformance `LockAnswerInCompletion`, `ResumeParity` (giống hệt `ResumeWorkflowTask`, LockHeld + LockAcquired + signal, bỏ timer tương lai, buffer cũ), `ResumeCompensating`, `ResumeParked`, `ResumeWithEager`; worker `TestLockAnswerComesWithTheCompletion` (0 lần `ResumeWorkflowTask`; driver cũ: 3).
+    - Sửa test lỏng `TestKeptExecutionsAreNotDue` (lease của B 600ms → 2s; trượt 1 lần khi cả bộ test chạy tải nặng, cả ở HEAD).
+    - Review 1 lần: đạt (sửa thêm: reset `Resumed` ở đường pgx, xoá `c.Resume` khi lỗi; gộp các probe của reviewer).
+    - Còn lỏng khi máy tải nặng: `TestDelayedWorkOfAnotherWorkerIsOnTime`, `TestDelayedWorkIsNotPollMaxLate/pg` (test thời gian thực).
 - [ ] **T9.8** Phục vụ waiter của lock theo thứ tự FIFO: bảng hàng đợi waiter; khi nhả lock thì đánh thức waiter đầu hàng thay vì để các bên poll bằng `LockWait`. Test: N waiter nhận lock đúng thứ tự.
 
 ## File và hàm tái sử dụng

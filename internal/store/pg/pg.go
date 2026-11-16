@@ -1114,6 +1114,7 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 	}
 	ending := c.Status != "" && !c.Status.Active()
 	terminal := ending && c.Status != store.StatusContinued
+	c.Resumed = false
 	hooked := s.hook != nil && store.Ends(c.Status)
 	var claimed map[actKey]int64
 	var fastLeases []store.Lease
@@ -1124,34 +1125,9 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 			fastLeases, err = s.completeFast(ctx, l, c, ending, terminal, prevSeq, lastSeq)
 			return err
 		}
-		b := &pgx.Batch{}
-		sh := completionShape{activityAt: -1, parentFirst: terminal}
-		if terminal {
-			b.Queue(lockParent, l.ID)
-		}
-		b.Queue(fence, l.ID, l.Owner, l.Version, prevSeq, len(c.History) > 0)
-		if terminal {
-			b.Queue(noUndelivered, l.ID, nonNil(c.Consumed)) // NULL would disable the check
-			sh.statements++
-		}
-		s.queueCompletion(b, l, c, ending, lastSeq, &sh)
-		send := func(sb interface {
-			SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
-		},
-		) error {
-			br := sb.SendBatch(ctx, b)
-			defer br.Close()
-			var err error
-			if claimed, err = readCompletion(br, sh); err != nil {
-				return err
-			}
-			return br.Close()
-		}
-		if hooked {
-			return s.inTx(ctx, store.EndInfo{Status: c.Status, Err: c.Err, ErrKinds: c.ErrKinds},
-				func(tx pgx.Tx) (int64, error) { return l.ID, send(tx) })
-		}
-		return send(s.pool)
+		var err error
+		claimed, err = s.completeWithPgx(ctx, l, c, hooked, ending, terminal, prevSeq, lastSeq)
+		return err
 	})
 	if err != nil {
 		if he := (*hookError)(nil); errors.As(err, &he) {
@@ -1172,6 +1148,57 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 	return eagerLeases(c, l.Owner, claimed), nil
 }
 
+// completeWithPgx is CompleteWorkflowTask on the pgx path: one batch (in
+// a transaction of its own when hooked).
+func (s *Store) completeWithPgx(ctx context.Context, l store.Lease, c *store.Completion, hooked, ending, terminal bool,
+	prevSeq, lastSeq int64,
+) (map[actKey]int64, error) {
+	c.Resumed = false // set again below on success (retry may run this twice)
+	b := &pgx.Batch{}
+	sh := completionShape{activityAt: -1, parentFirst: terminal}
+	if terminal {
+		b.Queue(lockParent, l.ID)
+	}
+	b.Queue(fence, l.ID, l.Owner, l.Version, prevSeq, len(c.History) > 0)
+	if terminal {
+		b.Queue(noUndelivered, l.ID, nonNil(c.Consumed)) // NULL would disable the check
+		sh.statements++
+	}
+	s.queueCompletion(b, l, c, ending, lastSeq, &sh)
+	resume := resumes(c, ending)
+	if resume {
+		queueResume(b, l, c.KeepFor) // T9.7: in the same round trip
+	}
+	var claimed map[actKey]int64
+	send := func(sb interface {
+		SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+	},
+	) error {
+		br := sb.SendBatch(ctx, b)
+		defer br.Close()
+		var err error
+		if claimed, err = readCompletion(br, sh); err != nil {
+			return err
+		}
+		if resume {
+			t, ok, err := readResume(br, l.Owner)
+			if err != nil {
+				return err
+			}
+			if ok {
+				*c.Resume, c.Resumed = t, true
+			}
+		}
+		return br.Close()
+	}
+	if hooked {
+		err := s.inTx(ctx, store.EndInfo{Status: c.Status, Err: c.Err, ErrKinds: c.ErrKinds},
+			func(tx pgx.Tx) (int64, error) { return l.ID, send(tx) })
+		return claimed, err
+	}
+	return claimed, send(s.pool)
+}
+
 // eagerLeases lists the leases of the eagerly claimed activity tasks, in the
 // order of c.Activities.
 func eagerLeases(c *store.Completion, owner string, claimed map[actKey]int64) []store.Lease {
@@ -1182,6 +1209,12 @@ func eagerLeases(c *store.Completion, owner string, claimed map[actKey]int64) []
 		}
 	}
 	return leases
+}
+
+// resumes reports whether completion c returns the next task under its
+// kept lease (store.Completion.Resume).
+func resumes(c *store.Completion, ending bool) bool {
+	return c.Resume != nil && c.KeepFor > 0 && !ending
 }
 
 // completionShape tells readCompletion which statements were queued after

@@ -299,6 +299,44 @@ func testLockKeptWhileActivityWaits(t *testing.T, h Harness) {
 	}
 }
 
+// T9.7: a completion that takes locks and keeps its lease can return the
+// next task under that lease, with the answers pending, in the same call
+// (one round trip): Completion.Resume and Resumed.
+func testLockAnswerInCompletion(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "i1")
+	task := claimOne(t, s, owner, h.TTL)
+	var next store.WorkflowTask
+	c := &store.Completion{
+		History: []history.Event{
+			{Seq: 1, Type: history.ExecutionStarted},
+			{Seq: 2, Type: history.LockRequested, ScheduleID: 1, Name: "k"},
+		},
+		Consumed: pendingIDs(task),
+		Locks:    []store.LockRequest{{ScheduleID: 1, Key: "k", TTL: h.TTL}},
+		KeepFor:  h.TTL, Resume: &next,
+	}
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, c); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Resumed || next.Lease != task.Lease || next.LastSeq != 2 || len(next.Pending) != 1 {
+		t.Fatalf("resumed %v: %+v", c.Resumed, next)
+	}
+	if ev := next.Pending[0].Event; ev.Type != history.LockAcquired || ev.ScheduleID != 1 || ev.Name != "k" {
+		t.Fatalf("answer %+v", ev)
+	}
+	// Without KeepFor, nothing is resumed (the lease is released).
+	c = &store.Completion{
+		History:  []history.Event{{Seq: 3, Type: history.LockAcquired, ScheduleID: 1, Name: "k"}, {Seq: 4, Type: history.LockRequested, ScheduleID: 2, Name: "k2"}},
+		Consumed: pendingIDs(next),
+		Locks:    []store.LockRequest{{ScheduleID: 2, Key: "k2", TTL: h.TTL}},
+		Resume:   &next,
+	}
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, c); err != nil || c.Resumed {
+		t.Fatalf("released: resumed %v, %v", c.Resumed, err)
+	}
+}
+
 // Review of T5.4 (M3): an undelivered LockLost blocks the end, like a
 // signal; continue-as-new releases locks.
 func testLockLostBlocksEnd(t *testing.T, h Harness) {

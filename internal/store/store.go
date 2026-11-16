@@ -260,6 +260,15 @@ type Completion struct {
 	// StickyFor (0 clears stickiness).
 	KeepFor   time.Duration
 	StickyFor time.Duration
+	// Resume, when set with KeepFor > 0 on an execution left running or
+	// compensating, has the store return the next task under the kept lease
+	// in the same round trip, written into *Resume (its Pending capacity
+	// reused), its pending events those the completion made visible at
+	// once (the answers to Locks) and any others: Resumed tells whether it
+	// did (false when nothing was kept). The caller runs it as if from
+	// ResumeWorkflowTask.
+	Resume  *WorkflowTask
+	Resumed bool
 	// Leases is scratch space: CompleteWorkflowTask may return the leases
 	// of the eagerly claimed activities in its capacity (a completion
 	// reused across tasks then allocates none).

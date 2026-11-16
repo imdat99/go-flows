@@ -386,6 +386,7 @@ func (s *Store) fenced(l store.Lease) (*execution, error) {
 func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *store.Completion) ([]store.Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	c.Resumed = false
 	now := s.clock.Now()
 	e, err := s.fenced(l)
 	if err != nil {
@@ -427,6 +428,9 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 	}
 	if c.KeepFor > 0 && claimable(e.Status) {
 		e.lockedUntil = now.Add(c.KeepFor)
+		if c.Resume != nil {
+			*c.Resume, c.Resumed = e.task(now), true
+		}
 		return leases, nil
 	}
 	e.lockedUntil = time.Time{}

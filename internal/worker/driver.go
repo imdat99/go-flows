@@ -198,13 +198,7 @@ func (d *driver) recordResult(r eagerResult, resume bool) *store.WorkflowTask {
 	if d.detached == nil {
 		d.detached = d.w.detachedCtx // d.ctx's values (none of its own), never canceled
 	}
-	// The resumed task goes to one of two buffers in turn: the task this
-	// one follows may still be referenced while it is recorded.
-	d.flip = !d.flip
-	into := &d.resumed[0]
-	if d.flip {
-		into = &d.resumed[1]
-	}
+	into := d.nextResumeBuffer()
 	next, resumeLost, err := d.w.record(d.detached, &r.task, r.outcome, lease, into)
 	if err != nil {
 		d.w.log.LogAttrs(d.ctx, slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
@@ -243,6 +237,17 @@ func (d *driver) step(pollCtx context.Context, task *store.WorkflowTask) (next *
 	return d.complete(pollCtx, task, c)
 }
 
+// nextResumeBuffer returns the buffer for the next resumed task: one of
+// two in turn, never the last one written (the task running now may be it,
+// and still referenced while its follower is stored).
+func (d *driver) nextResumeBuffer() *store.WorkflowTask {
+	d.flip = !d.flip
+	if d.flip {
+		return &d.resumed[1]
+	}
+	return &d.resumed[0]
+}
+
 // complete stores a task's completion and follows it up.
 func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *store.Completion) *store.WorkflowTask {
 	w := d.w
@@ -253,9 +258,15 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		c.Locks[i].TTL = max(c.Locks[i].TTL, w.opts.LeaseTTL)
 		c.Locks[i].Hold = w.opts.LockHold
 	}
+	c.Resume = nil
 	switch {
 	case (d.inflight+len(eager) > 0 || len(c.Locks) > 0) && !stopping:
 		c.KeepFor = w.opts.LeaseTTL
+		if len(c.Locks) > 0 {
+			// The answers are pending as soon as it commits: the next task
+			// comes back with the completion (T9.7, one round trip).
+			c.Resume = d.nextResumeBuffer()
+		}
 	case !stopping && w.opts.CacheSize > 0 && !d.compensating: // only an executor kept in the cache gains from it
 		c.StickyFor = w.opts.StickyFor
 	}
@@ -266,6 +277,7 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 	// cancels it).
 	leases, err := w.st.CompleteWorkflowTask(w.taskCtx(), d.lease, c)
 	if err != nil {
+		c.Resume = nil // a resume buffer: not c's to keep
 		for range eager {
 			release(w.actSlots, 1)
 		}
@@ -281,19 +293,16 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		// the local due time is never before the store's.
 		w.wfDue.add(sent.Add(c.Timers[i].At.Sub(task.Now)))
 	}
-	locks := len(c.Locks) > 0 // read before completed: it may hand c's executor to the cache
+	// Read before completed: it may hand c's executor to the cache.
+	locks, next, resumed := len(c.Locks) > 0, c.Resume, c.Resumed
+	c.Resume = nil
 	d.completed(task, c, eager, leases, sent)
 	if locks && d.held {
 		// The answers are pending already: run the next task at once.
-		next, err := w.st.ResumeWorkflowTask(d.ctx, d.lease, w.opts.LeaseTTL)
-		if err == nil {
-			return &next
+		if resumed {
+			return next
 		}
-		if errors.Is(err, store.ErrLeaseLost) {
-			d.lost()
-		} else {
-			d.release(0)
-		}
+		d.lost() // kept, yet not resumed: the lease moved on meanwhile
 	}
 	return nil
 }

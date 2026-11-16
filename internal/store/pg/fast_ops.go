@@ -210,21 +210,68 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 		})
 	}
 	s.endFast(fb, l, c, ending, lastSeq)
+	c.Resumed = false // set again below on success (retry may run this twice)
+	resumeAt, prevID := fb.resumeAfter(l, c, ending)
+	leases := eagerLeaseSlots(c, l.Owner)
+	err = fb.exec(func(i int, v [][]byte) error {
+		if i == activityAt {
+			if len(v[3]) == 0 { // owner_id empty: not claimed eagerly
+				return nil
+			}
+			return setEagerLease(c, leases, v)
+		}
+		if resumeAt >= 0 && i > resumeAt {
+			return decodeResumed(i-resumeAt, v, c, l.Owner, prevID)
+		}
+		return nil
+	})
+	return leases, err
+}
 
-	leases := c.Leases[:0] // the completion's scratch space (store.Completion)
+// resumeAfter queues the resume of c's kept lease when c asks for it
+// (T9.7: the next task in the same round trip; the answers to c.Locks are
+// visible, same transaction, same now()) and returns the index of its
+// first statement (-1: none) and the instance id c.Resume held.
+func (fb *fastBatch) resumeAfter(l store.Lease, c *store.Completion, ending bool) (at int, prevID string) {
+	if !resumes(c, ending) {
+		return -1, ""
+	}
+	at, prevID = fb.stmts, c.Resume.Execution.InstanceID
+	*c.Resume = store.WorkflowTask{Pending: c.Resume.Pending[:0]} // keep its capacity
+	fb.resume(l, c.KeepFor)
+	return at, prevID
+}
+
+// decodeResumed decodes row v of the k-th statement of fb.resume into
+// c.Resume (1: resumeWorkflow, 2: resumePending).
+func decodeResumed(k int, v [][]byte, c *store.Completion, owner, prevID string) error {
+	switch k {
+	case 1:
+		if err := decodeTask(v, c.Resume, owner, prevID); err != nil {
+			return err
+		}
+		c.Resumed = true
+	case 2:
+		p, err := decodePending(v)
+		if err != nil {
+			return err
+		}
+		c.Resume.Pending = append(c.Resume.Pending, p)
+	}
+	return nil
+}
+
+// eagerLeaseSlots returns c's leases of eager activities (ids set from the
+// rows), in c.Leases' capacity (the completion's scratch space).
+func eagerLeaseSlots(c *store.Completion, owner string) []store.Lease {
+	leases := c.Leases[:0]
 	for _, a := range c.Activities {
 		if a.ClaimFor > 0 {
-			leases = append(leases, store.Lease{Owner: l.Owner, Version: 1})
+			leases = append(leases, store.Lease{Owner: owner, Version: 1})
 		}
 	}
 	c.Leases = leases
-	err = fb.exec(func(i int, v [][]byte) error {
-		if i != activityAt || len(v[3]) == 0 { // owner_id empty: not claimed eagerly
-			return nil
-		}
-		return setEagerLease(c, leases, v)
-	})
-	return leases, err
+	return leases
 }
 
 // setEagerLease sets the id of the lease of the eagerly claimed activity
