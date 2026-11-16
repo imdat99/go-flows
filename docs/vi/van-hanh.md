@@ -16,7 +16,11 @@ defer engine.Stop(shutdownCtx)
 ```
 
 - **Migration.** `Migrate` tạo schema `flows` và áp dụng các migration goose
-  nhúng sẵn, chỉ đi tới. Mỗi thay đổi là một file mới.
+  nhúng sẵn, chỉ đi tới. Mỗi thay đổi là một file mới. `CHANGELOG.md` liệt
+  kê migration của từng bản phát hành và ghi chú nâng cấp khi deploy cuốn
+  chiếu. Migration đã áp dụng thì không bao giờ sửa, nên vài comment trong
+  đó đã cũ; mục Corrections của `CHANGELOG.md` đính chính lại (ví dụ claim
+  không xoá `sticky_owner`).
 - **Process chỉ làm client.** Engine không được start vẫn bắt đầu workflow,
   gửi signal, huỷ, terminate và chờ kết quả được. Một process API có thể
   dùng engine như vậy mà không chạy task.

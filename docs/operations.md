@@ -17,6 +17,10 @@ defer engine.Stop(shutdownCtx)
 
 - **Migrations.** `Migrate` creates the schema `flows` and applies the
   embedded goose migrations, forward only. Each change is a new file.
+  `CHANGELOG.md` lists the migrations of each release and the upgrade notes
+  for rolling deploys. Applied migrations are never edited, so a few of
+  their comments are out of date; the Corrections of `CHANGELOG.md` give
+  the right behaviour (for example, a claim does not clear `sticky_owner`).
 - **Client-only processes.** An engine that is not started can still start
   workflows, send signals, cancel, terminate and wait. An API process can use
   one without running tasks.
