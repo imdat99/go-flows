@@ -307,3 +307,19 @@ func TestContinueAsNewStartsALinkedTrace(t *testing.T) {
 		}
 	}
 }
+
+// T10.10 review: a start made by a task whose completion was refused for
+// undelivered signals (a normal re-run) is not an error: outcome rerun.
+func TestRerunStartIsNoError(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	tr := otelflows.NewTracer(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)))
+	_, end := tr.StartWorkflow(context.Background(), flows.StartInfo{InstanceID: "kid", Workflow: "wf", Version: 1, Parent: "p"})
+	end(false, fmt.Errorf("complete: %w", flows.ErrRerun))
+	s := one(t, spansOf(rec, "kid", "flows.start"), "start")
+	if s.Status().Code == codes.Error {
+		t.Fatalf("status %v", s.Status())
+	}
+	if v, _ := attr(s, otelflows.AttrOutcome); v.AsString() != "rerun" {
+		t.Fatalf("outcome %q", v.AsString())
+	}
+}

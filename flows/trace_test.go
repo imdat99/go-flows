@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/imdat99/go-flows/internal/store"
 	"github.com/imdat99/go-flows/internal/store/mem"
 )
 
@@ -369,4 +370,110 @@ func (s *syncBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.b.String()
+}
+
+var traceRerun = DefineWorkflow("trace.rerun", 1, func(c Ctx, n int) (int, error) {
+	if n > 0 {
+		return n, nil
+	}
+	_ = traceKid.Child(c, "rerun-kid", "r") // runs on, detached (T9.2)
+	return 0, ContinueAsNew(c, n+1)
+})
+
+// refuseOnce refuses the first completion that continues as new with
+// store.ErrPendingEvents, as a store does when signals arrived meanwhile
+// (today only ends are refused: a continue-as-new carries them).
+type refuseOnce struct {
+	store.Store
+	done atomic.Bool
+}
+
+func (r *refuseOnce) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *store.Completion) ([]store.Lease, error) {
+	if c.ContinueAsNew != nil && r.done.CompareAndSwap(false, true) {
+		return nil, store.ErrPendingEvents
+	}
+	return r.Store.CompleteWorkflowTask(ctx, l, c)
+}
+
+// T10.10 review: a completion refused for undelivered events
+// (ErrPendingEvents: a normal re-run) is no failed start: the starts it
+// made (a child, the continue-as-new) end with ErrRerun and created false,
+// and the re-run makes them again, created.
+func TestTracerRerunIsNoFailedStart(t *testing.T) {
+	l := newSpanLog()
+	st := &refuseOnce{Store: mem.New(nil)}
+	e, err := newEngine(st, Options{InstanceID: "trace-rerun", PollMax: 20 * time.Millisecond, Tracer: l})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+		defer cancel()
+		_ = e.Stop(ctx)
+	})
+	if out, err := traceRerun.Run(waitCtx(t), e, "rerun", 0); err != nil || out != 1 {
+		t.Fatalf("%d %v", out, err)
+	}
+	if !st.done.Load() {
+		t.Fatal("no completion was refused")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var cont []startRec
+	for _, r := range l.startsOf("rerun") {
+		if r.prev != "" {
+			cont = append(cont, r)
+		}
+	}
+	for what, rs := range map[string][]startRec{"child": l.startsOf("rerun-kid"), "continue-as-new": cont} {
+		if len(rs) != 2 {
+			t.Fatalf("%s starts %+v", what, rs)
+		}
+		if !rs[0].ended || rs[0].created || !errors.Is(rs[0].err, ErrRerun) {
+			t.Fatalf("%s start of the refused completion %+v", what, rs[0])
+		}
+		if !rs[1].ended || !rs[1].created || rs[1].err != nil {
+			t.Fatalf("%s start of the re-run %+v", what, rs[1])
+		}
+	}
+}
+
+// childPanics is a tracer whose StartWorkflow panics for children.
+type childPanics struct{ spanLog }
+
+func (c *childPanics) StartWorkflow(ctx context.Context, w StartInfo) ([]byte, func(bool, error)) {
+	if w.Parent != "" {
+		panic("tracer bug")
+	}
+	return c.spanLog.StartWorkflow(ctx, w)
+}
+
+// T10.10 review: the worker logs the tracer's panics (a child's start) as
+// the tracer's, not the observer's; the child starts untraced.
+func TestTracerPanicAtChildStartIsLogged(t *testing.T) {
+	var buf syncBuffer
+	e, err := newEngine(mem.New(nil), Options{
+		InstanceID: "trace-child-panic", PollMax: 20 * time.Millisecond, Tracer: &childPanics{},
+		Logger: slog.New(slog.NewTextHandler(&buf, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+		defer cancel()
+		_ = e.Stop(ctx)
+	})
+	if v, err := parentWF.Run(waitCtx(t), e, "panic-parent", 1); err != nil || v != 30 {
+		t.Fatalf("%d %v", v, err)
+	}
+	if s := buf.String(); !strings.Contains(s, "panic in tracer") || strings.Contains(s, "panic in observer") {
+		t.Fatalf("log %q", s)
+	}
 }

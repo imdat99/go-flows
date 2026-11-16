@@ -136,7 +136,9 @@ type Execution struct {
 	CreatedAt   time.Time
 	EndedAt     time.Time // zero while active
 	// Trace is the execution's trace context: opaque bytes a tracer gave
-	// when it was started (nil without one), carried to continue-as-new.
+	// when it was started (nil without one). Continue-as-new does not carry
+	// it: the next execution gets its own (Completion.ContinueAsNew.Trace, a
+	// new trace the tracer links to this one).
 	Trace []byte
 }
 

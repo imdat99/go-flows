@@ -140,7 +140,7 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // ended over 30 days ag
   - Traces follow executions. `Workflow.Start` emits a short span
     `flows.start <workflow>`, a child of the span in the caller's context
     (a new root without one). Its span context (26 bytes) is stored with the
-    execution (column `trace`, migration 00016) and returned by the claims,
+    execution (column `trace`, migration 00015) and returned by the claims,
     so every workflow task and activity attempt, in any process, is a child
     of it. A child workflow's start span is a child of the parent's task
     that started it.
@@ -156,6 +156,9 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // ended over 30 days ag
     second `Workflow.Start` of an instance id (not an error; nothing is
     stored, the execution keeps its own trace), or a child whose instance
     id is taken (error status; the child fails with `ErrInstanceExists`).
+    A start whose completion was refused because signals arrived meanwhile
+    ends with `flows.outcome=rerun` (not an error): the task runs again
+    and starts it again.
   - Sampling is decided once, at the start, by your sampler; the decision
     stored with the execution holds for all its spans (`ParentBased`). The
     trace state is not stored: vendor entries and OpenTelemetry's

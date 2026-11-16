@@ -21,7 +21,8 @@ must take care of.
   execution and carried to every workflow task and activity attempt;
   `flows.ErrLeaseLost`; `ExecutionID` and `Trace` on `ActivityInfo` and
   `WorkflowTaskInfo`; otelflows marks lost leases `flows.outcome=lease_lost`
-  and starts that create nothing `flows.outcome=existing`. A trace lasts as
+  and starts that create nothing `flows.outcome=existing` (`rerun` for a
+  start whose task runs again, `flows.ErrRerun`). A trace lasts as
   long as its execution; continue-as-new starts a new trace linked to the
   previous one. The trace state (including `ot=th`) is not kept.
 

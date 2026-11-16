@@ -98,7 +98,7 @@ func (w *Worker) attempt(ctx context.Context, a *Activity, t *store.ActivityTask
 			if o.lost {
 				err = ErrLeaseLost // another owner records the outcome
 			}
-			w.observe(func() { end(err) })
+			w.traced(func() { end(err) })
 		}()
 	}
 	o = w.attemptOnce(ctx, runCtx, a, t)

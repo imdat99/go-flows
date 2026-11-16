@@ -31,6 +31,10 @@
 // execution it continues, so a workflow looping through continue-as-new
 // makes one bounded trace per execution.
 //
+// A start made by a task whose completion was refused because signals
+// arrived meanwhile ends with flows.outcome "rerun" (not an error): the
+// task runs again and makes the start again.
+//
 // A start that creates nothing (the instance id was in use) ends with
 // flows.outcome "existing": a second Workflow.Start is not an error (no
 // trace is stored; the execution keeps its own), a child whose id is taken
@@ -100,6 +104,8 @@ func (t tracer) StartWorkflow(ctx context.Context, w flows.StartInfo) ([]byte, f
 	_, span := t.t.Start(ctx, "flows.start "+w.Workflow, opts...)
 	return encode(span.SpanContext()), func(created bool, err error) {
 		switch {
+		case errors.Is(err, flows.ErrRerun): // not stored: the task runs again and starts it again
+			span.SetAttributes(AttrOutcome.String("rerun"))
 		case err != nil:
 			fail(span, err)
 		case !created:

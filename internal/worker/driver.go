@@ -243,7 +243,7 @@ func (d *driver) step(pollCtx context.Context, task *store.WorkflowTask) (next *
 		defer func() { d.spanCtx = nil }()
 		if end != nil {
 			d.taskStatus, d.taskErr = "", nil
-			defer func() { w.observe(func() { end(d.taskStatus, d.taskErr) }) }()
+			defer func() { w.traced(func() { end(d.taskStatus, d.taskErr) }) }()
 		}
 	}
 	c := d.execute(task)
@@ -274,13 +274,16 @@ func (d *driver) startTask(task *store.WorkflowTask) (sctx context.Context, end 
 // (Tracer.StartFrom).
 func (d *driver) startChildren(task *store.WorkflowTask, c *store.Completion) {
 	w := d.w
+	if w.opts.Tracer == nil || len(c.Children) == 0 && c.ContinueAsNew == nil {
+		return
+	}
 	ctx := d.spanCtx
 	if ctx == nil {
 		ctx = d.ctx
 	}
 	start := func(ne *store.NewExecution, child int) {
 		var end func(bool, error)
-		w.observe(func() { end = w.opts.Tracer.StartFrom(ctx, &task.Execution, ne, child < 0) })
+		w.traced(func() { end = w.opts.Tracer.StartFrom(ctx, &task.Execution, ne, child < 0) })
 		if end != nil {
 			d.childEnds = append(d.childEnds, childEnd{end, child})
 		}
@@ -294,11 +297,14 @@ func (d *driver) startChildren(task *store.WorkflowTask, c *store.Completion) {
 }
 
 // endChildren ends the starts with the completion's outcome (a child whose
-// id was in use created nothing: Taken).
+// id was in use created nothing: Taken). A completion refused for
+// undelivered events (store.ErrPendingEvents) is no failure: the task runs
+// again and starts them again; the end gets that error, which the tracer
+// tells apart (flows.ErrRerun).
 func (d *driver) endChildren(c *store.Completion, err error) {
 	for i, ce := range d.childEnds {
 		created := err == nil && (ce.child < 0 || !c.Children[ce.child].Taken)
-		d.w.observe(func() { ce.end(created, err) })
+		d.w.traced(func() { ce.end(created, err) })
 		d.childEnds[i] = childEnd{}
 	}
 	d.childEnds = d.childEnds[:0]
@@ -338,18 +344,14 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		c.StickyFor = w.opts.StickyFor
 	}
 	nextTimer := d.stickyTimer(c)
-	if w.opts.Tracer != nil && (len(c.Children) > 0 || c.ContinueAsNew != nil) {
-		d.startChildren(task, c)
-	}
+	d.startChildren(task, c)
 	sent := time.Now()
 	// The worker's task context, not d.ctx: a lease lost meanwhile is
 	// caught by the store's fence anyway, and a long-lived context costs the
 	// store's cancellation watch nothing per task (Stop's deadline still
 	// cancels it).
 	leases, err := w.st.CompleteWorkflowTask(w.taskCtx(), d.lease, c)
-	if len(d.childEnds) > 0 {
-		d.endChildren(c, err)
-	}
+	d.endChildren(c, err)
 	if err != nil {
 		c.Resume = nil // a resume buffer: not c's to keep
 		for range eager {
@@ -730,6 +732,17 @@ func (w *Worker) observe(fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
 			w.log.LogAttrs(context.Background(), slog.LevelError, "flows: panic in observer", slog.Any("panic", r))
+		}
+	}()
+	fn()
+}
+
+// traced calls the tracer, recovering (and logging) its panics, as
+// observe.
+func (w *Worker) traced(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.log.LogAttrs(context.Background(), slog.LevelError, "flows: panic in tracer", slog.Any("panic", r))
 		}
 	}()
 	fn()

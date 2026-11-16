@@ -139,7 +139,7 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // kết thúc hơn 30 n
   - Trace đi theo execution. `Workflow.Start` phát một span ngắn
     `flows.start <workflow>`, là con của span trong context của bên gọi
     (không có thì là gốc mới). Span context của nó (26 byte) được lưu cùng
-    execution (cột `trace`, migration 00016) và trả về khi claim, nên mọi
+    execution (cột `trace`, migration 00015) và trả về khi claim, nên mọi
     workflow task và activity attempt, ở bất kỳ process nào, đều là con của
     nó. Span start của child workflow là con của task cha đã tạo nó.
   - Trace kéo dài bằng execution của nó. Execution chờ nhiều ngày (timer,
@@ -153,7 +153,9 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // kết thúc hơn 30 n
   - Lần start không tạo gì kết thúc với `flows.outcome=existing`:
     `Workflow.Start` lần hai cho một instance id (không phải lỗi; không lưu
     gì, execution giữ trace của nó), hoặc child có instance id đã bị dùng
-    (status lỗi; child thất bại với `ErrInstanceExists`).
+    (status lỗi; child thất bại với `ErrInstanceExists`). Lần start mà
+    completion bị từ chối vì có signal tới trong lúc đó kết thúc với
+    `flows.outcome=rerun` (không phải lỗi): task chạy lại và start lại.
   - Việc lấy mẫu được quyết định một lần, lúc start, bởi sampler của bạn;
     quyết định lưu cùng execution áp dụng cho mọi span của nó
     (`ParentBased`). Trace state không được lưu: các entry của vendor và

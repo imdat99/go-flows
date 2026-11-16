@@ -27,6 +27,12 @@ var (
 	// activity attempt or workflow task whose lease was lost: another
 	// engine took its task and runs it again (its outcome is not recorded).
 	ErrLeaseLost = store.ErrLeaseLost
+	// ErrRerun is matched by the error a Tracer's start end gets when the
+	// completion that would have stored the start (a child, a
+	// continue-as-new) was refused because signals or cancel requests
+	// arrived meanwhile: not a failure, the task runs again with them and
+	// makes the start again (created is false).
+	ErrRerun = store.ErrPendingEvents
 	// ErrInstanceConflict reports an instance id already used by another
 	// workflow: an instance id is an idempotency key.
 	ErrInstanceConflict = store.ErrInstanceConflict

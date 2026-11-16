@@ -112,7 +112,9 @@ type Tracer interface {
 	// once the start is stored: created is false when the instance id was
 	// in use and nothing was created (a second Start is not an error; a
 	// child then fails with ErrInstanceExists), err is set when the start
-	// failed. The existing execution keeps its own trace context.
+	// failed, or matches ErrRerun when it is made again by a re-run of the
+	// task (no failure). The existing execution keeps its own trace
+	// context.
 	StartWorkflow(ctx context.Context, w StartInfo) (trace []byte, end func(created bool, err error))
 	// StartActivity starts an attempt of an activity or compensator. The
 	// returned context is the attempt's: spans the activity makes are its
