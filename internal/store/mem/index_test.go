@@ -254,7 +254,7 @@ func TestIndexesFollowEveryChange(t *testing.T) {
 	checkIndexes(t, s, "r2 compensated")
 
 	// Terminating r1 asks the next run of k2 (still its child) to cancel.
-	if err := s.Terminate(ctx, "r1", "stop"); err != nil {
+	if _, err := s.Terminate(ctx, "r1", "stop"); err != nil {
 		t.Fatal(err)
 	}
 	checkIndexes(t, s, "r1 terminated")
@@ -304,4 +304,28 @@ func TestClaimRepeatedQueue(t *testing.T) {
 	if err != nil || len(ts) != 1 {
 		t.Fatalf("claimed %d tasks, %v; want 1", len(ts), err)
 	}
+}
+
+// A queue's index goes once the queue has no claimable execution: a map
+// keeps its peak capacity, and ranging over it after a burst would cost
+// as much as the scan the index replaced.
+func TestRunnableQueueIndexShrinks(t *testing.T) {
+	s := New(&ManualClock{})
+	ctx := context.Background()
+	for i := range 3 {
+		create(t, s, fmt.Sprintf("burst-%d", i), "burst")
+	}
+	for i := range 3 {
+		if _, err := s.Terminate(ctx, fmt.Sprintf("burst-%d", i), "done"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.mu.Lock()
+	m, ok := s.runnable["burst"]
+	s.mu.Unlock()
+	if ok {
+		t.Fatalf("index of an emptied queue kept (%d entries)", len(m))
+	}
+	create(t, s, "burst-again", "burst")
+	claim(t, s, "burst")
 }

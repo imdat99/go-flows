@@ -185,12 +185,11 @@ func (s *Store) setStatus(e *execution, st store.Status) {
 	case is && !was:
 		s.addRunnable(e)
 	case was && !is:
-		delete(s.runnable[e.Queue], e.ID)
+		s.removeRunnable(e)
 	}
 }
 
-// addRunnable indexes e as claimable. A queue's map is kept once made:
-// queues are few, and executions come and go.
+// addRunnable indexes e as claimable.
 func (s *Store) addRunnable(e *execution) {
 	m := s.runnable[e.Queue]
 	if m == nil {
@@ -198,6 +197,18 @@ func (s *Store) addRunnable(e *execution) {
 		s.runnable[e.Queue] = m
 	}
 	m[e.ID] = e
+}
+
+// removeRunnable drops e from the claimable index. A queue's map goes
+// once it is empty: a map keeps its peak capacity, and ranging over it
+// costs that capacity, so a burst would make every later lookup of the
+// queue as slow as a full scan.
+func (s *Store) removeRunnable(e *execution) {
+	m := s.runnable[e.Queue]
+	delete(m, e.ID)
+	if len(m) == 0 {
+		delete(s.runnable, e.Queue)
+	}
 }
 
 // index adds a new execution to the indexes.
@@ -213,7 +224,7 @@ func (s *Store) index(e *execution) {
 // unindex removes a purged execution from the indexes. Its own children
 // keep their entry until they are purged in turn.
 func (s *Store) unindex(e *execution) {
-	delete(s.runnable[e.Queue], e.ID)
+	s.removeRunnable(e)
 	if e.ParentID == 0 {
 		return
 	}
