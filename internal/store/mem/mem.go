@@ -66,6 +66,18 @@ type Store struct {
 
 	watchers map[int]func(store.WorkKind, string)
 	nextW    int
+
+	// Indexes of executions (T10.8), so that the lookups made per task
+	// (claims, Wake, ending a parent) are proportional to the matching set,
+	// not to every execution kept for retention. Kept by create, setStatus
+	// and PurgeEnded, the only places that add an execution, change its
+	// status or remove it; its queue and parent never change.
+	runnable map[string]map[int64]*execution // queue -> claimable executions (running, compensating)
+	children map[int64][]*execution          // parent execution id -> its child executions, any status
+
+	// visited counts the executions examined by Wake and cancelChildrenOf,
+	// for the tests that check those lookups visit only the matching set.
+	visited int
 }
 
 // SetHook installs the end hook (see pg.Hook), before the store is used.
@@ -160,8 +172,62 @@ func New(clock Clock) *Store {
 		tasks:      make(map[int64]*activityTask),
 		locks:      make(map[string]*lockRow),
 		waiters:    make(map[string][]waiter),
+		runnable:   make(map[string]map[int64]*execution),
+		children:   make(map[int64][]*execution),
 	}
 }
+
+// setStatus changes e's status, keeping the runnable index.
+func (s *Store) setStatus(e *execution, st store.Status) {
+	was, is := claimable(e.Status), claimable(st)
+	e.Status = st
+	switch {
+	case is && !was:
+		s.addRunnable(e)
+	case was && !is:
+		delete(s.runnable[e.Queue], e.ID)
+	}
+}
+
+// addRunnable indexes e as claimable. A queue's map is kept once made:
+// queues are few, and executions come and go.
+func (s *Store) addRunnable(e *execution) {
+	m := s.runnable[e.Queue]
+	if m == nil {
+		m = make(map[int64]*execution)
+		s.runnable[e.Queue] = m
+	}
+	m[e.ID] = e
+}
+
+// index adds a new execution to the indexes.
+func (s *Store) index(e *execution) {
+	if claimable(e.Status) {
+		s.addRunnable(e)
+	}
+	if e.ParentID != 0 {
+		s.children[e.ParentID] = append(s.children[e.ParentID], e)
+	}
+}
+
+// unindex removes a purged execution from the indexes. Its own children
+// keep their entry until they are purged in turn.
+func (s *Store) unindex(e *execution) {
+	delete(s.runnable[e.Queue], e.ID)
+	if e.ParentID == 0 {
+		return
+	}
+	sib := slices.DeleteFunc(s.children[e.ParentID], func(c *execution) bool { return c == e })
+	if len(sib) == 0 {
+		delete(s.children, e.ParentID)
+	} else {
+		s.children[e.ParentID] = sib
+	}
+}
+
+// firstOf reports whether queues[i] is not repeated earlier in queues: an
+// execution of a queue listed twice is visited once.
+func firstOf(queues []string, i int) bool { return !slices.Contains(queues[:i], queues[i]) }
 
 func (s *Store) id() int64 {
 	s.nextID++
@@ -194,6 +260,7 @@ func (s *Store) create(ne store.NewExecution, now time.Time) *execution {
 	}
 	s.executions[e.ID] = e
 	s.latest[ne.InstanceID] = e.ID
+	s.index(e)
 	s.hint(store.WorkflowWork, e.Queue)
 	s.addPending(e, history.Event{
 		Type: history.ExecutionStarted, Name: ne.Workflow, Version: ne.Version, Queue: ne.Queue,
@@ -283,26 +350,32 @@ func (s *Store) Wake(owner string, queues []string) (ready bool, next time.Time,
 			next, ok = at, true
 		}
 	}
-	for _, e := range s.executions {
-		if !claimable(e.Status) || len(e.pending) == 0 && !e.forceReady || !contains(queues, e.Queue) {
+	for i, q := range queues {
+		if !firstOf(queues, i) {
 			continue
 		}
-		var earliest time.Time
-		if e.forceReady {
-			earliest = now
-		} else {
-			earliest = e.pending[0].visibleAt
-			for _, p := range e.pending[1:] {
-				if p.visibleAt.Before(earliest) {
-					earliest = p.visibleAt
+		for _, e := range s.runnable[q] {
+			s.visited++
+			if len(e.pending) == 0 && !e.forceReady {
+				continue
+			}
+			var earliest time.Time
+			if e.forceReady {
+				earliest = now
+			} else {
+				earliest = e.pending[0].visibleAt
+				for _, p := range e.pending[1:] {
+					if p.visibleAt.Before(earliest) {
+						earliest = p.visibleAt
+					}
 				}
 			}
+			at := latest(earliest, e.lockedUntil, e.notBefore)
+			if e.stickyOwner != "" && e.stickyOwner != owner {
+				at = latest(at, e.stickyUntil)
+			}
+			consider(at)
 		}
-		at := latest(earliest, e.lockedUntil, e.notBefore)
-		if e.stickyOwner != "" && e.stickyOwner != owner {
-			at = latest(at, e.stickyUntil)
-		}
-		consider(at)
 	}
 	for _, t := range s.tasks {
 		if contains(queues, t.Queue) {
@@ -335,18 +408,20 @@ func (s *Store) ClaimWorkflowTasks(_ context.Context, owner string, queues []str
 		at time.Time
 	}
 	var cands []cand
-	for _, e := range s.executions {
-		if !claimable(e.Status) || !contains(queues, e.Queue) {
+	for i, q := range queues {
+		if !firstOf(queues, i) {
 			continue
 		}
-		if e.lockedUntil.After(now) || e.notBefore.After(now) {
-			continue
-		}
-		if e.stickyOwner != "" && e.stickyOwner != owner && e.stickyUntil.After(now) {
-			continue
-		}
-		if at, ok := e.readyAt(now); ok {
-			cands = append(cands, cand{e, at})
+		for _, e := range s.runnable[q] {
+			if e.lockedUntil.After(now) || e.notBefore.After(now) {
+				continue
+			}
+			if e.stickyOwner != "" && e.stickyOwner != owner && e.stickyUntil.After(now) {
+				continue
+			}
+			if at, ok := e.readyAt(now); ok {
+				cands = append(cands, cand{e, at})
+			}
 		}
 	}
 	slices.SortFunc(cands, func(a, b cand) int {
@@ -429,7 +504,7 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 	s.compensateChildren(e, c.CompensateChildren, now)
 
 	if c.Status != "" && c.Status != e.Status {
-		e.Status = c.Status
+		s.setStatus(e, c.Status)
 	}
 	if c.Status == store.StatusNeedsAttention || c.Status == store.StatusCompensating {
 		e.Err, e.ErrKinds = c.Err, c.ErrKinds // the reason, for an operator
@@ -988,8 +1063,8 @@ func (s *Store) Unstick(_ context.Context, owner string) error {
 func (s *Store) compensateChildren(e *execution, scheds []int32, now time.Time) {
 	for _, sched := range scheds {
 		var child *execution
-		for _, ch := range s.executions {
-			if ch.ParentID == e.ID && ch.ParentSched == sched && ch.Status == store.StatusCompleted {
+		for _, ch := range s.children[e.ID] {
+			if ch.ParentSched == sched && ch.Status == store.StatusCompleted {
 				child = ch
 			}
 		}
@@ -997,7 +1072,8 @@ func (s *Store) compensateChildren(e *execution, scheds []int32, now time.Time) 
 			s.addPending(e, history.Event{Type: history.CompensationCompleted, ScheduleID: sched}, now)
 			continue
 		}
-		child.Status, child.EndedAt, child.compRequested = store.StatusCompensating, time.Time{}, true
+		s.setStatus(child, store.StatusCompensating)
+		child.EndedAt, child.compRequested = time.Time{}, true
 		s.addPending(child, history.Event{Type: history.ExecutionCompensationRequested}, now)
 		s.hint(store.WorkflowWork, child.Queue)
 	}
@@ -1005,8 +1081,9 @@ func (s *Store) compensateChildren(e *execution, scheds []int32, now time.Time) 
 
 // cancelChildrenOf asks the active children of execution id to cancel.
 func (s *Store) cancelChildrenOf(id int64, now time.Time) {
-	for _, ch := range s.executions {
-		if ch.ParentID == id && ch.Status.Active() {
+	for _, ch := range s.children[id] {
+		s.visited++
+		if ch.Status.Active() {
 			s.addPending(ch, history.Event{Type: history.ExecutionCancelRequested}, now)
 			s.hint(store.WorkflowWork, ch.Queue)
 		}
@@ -1025,7 +1102,7 @@ func (s *Store) ReopenCompensation(_ context.Context, instanceID string) error {
 	if e.Status != store.StatusNeedsAttention || !slices.Contains(strings.Split(e.ErrKinds, ","), store.KindCompensationFailed) {
 		return store.ErrNotActive
 	}
-	e.Status = store.StatusCompensating
+	s.setStatus(e, store.StatusCompensating)
 	s.addPending(e, history.Event{Type: history.CompensationRetryRequested}, s.clock.Now())
 	s.hint(store.WorkflowWork, e.Queue)
 	return nil
@@ -1045,7 +1122,8 @@ func (s *Store) ReopenParked(_ context.Context, instanceID string) error {
 		!slices.Contains(kinds, store.KindNonDeterministic) && !slices.Contains(kinds, store.KindStuck) {
 		return store.ErrNotActive
 	}
-	e.Status, e.Err, e.ErrKinds = store.StatusRunning, "", ""
+	s.setStatus(e, store.StatusRunning)
+	e.Err, e.ErrKinds = "", ""
 	e.stuckNoted = false // the stall count starts over (T9.3)
 	e.forceReady = true
 	s.hint(store.WorkflowWork, e.Queue)
@@ -1144,6 +1222,7 @@ func (s *Store) PurgeEnded(_ context.Context, olderThan time.Duration, limit int
 	for _, id := range ids {
 		e := s.executions[id]
 		delete(s.executions, id)
+		s.unindex(e)
 		if s.latest[e.InstanceID] == id {
 			delete(s.latest, e.InstanceID)
 		}
@@ -1205,7 +1284,7 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 		seq = e.history[n-1].Seq + 1
 	}
 	e.history = append(e.history, history.Event{Seq: seq, Type: history.ExecutionTerminated, Err: reason})
-	e.Status = store.StatusTerminated
+	s.setStatus(e, store.StatusTerminated)
 	s.releaseLocks(e.ID)
 	// The holder's lease is gone: a new version fences its writes.
 	e.lease = store.Lease{ID: e.ID, Version: e.lease.Version + 1}
@@ -1229,17 +1308,19 @@ func (s *Store) ClaimWorkflowTasksDue(ctx context.Context, owner string, queues 
 			next = t
 		}
 	}
-	for _, e := range s.executions {
-		if !claimable(e.Status) || !contains(queues, e.Queue) {
+	for i, q := range queues {
+		if !firstOf(queues, i) {
 			continue
 		}
-		earlier(e.notBefore)
-		// As Postgres' ready_at: the earliest pending event, if none is
-		// visible now (then the execution is ready, not due later), of an
-		// execution without a lease (a kept lease is its owner's).
-		if at, ok := e.readyAt(now); e.lockedUntil.IsZero() && (!ok || at.After(now)) {
-			for _, p := range e.pending {
-				earlier(p.visibleAt)
+		for _, e := range s.runnable[q] {
+			earlier(e.notBefore)
+			// As Postgres' ready_at: the earliest pending event, if none is
+			// visible now (then the execution is ready, not due later), of an
+			// execution without a lease (a kept lease is its owner's).
+			if at, ok := e.readyAt(now); e.lockedUntil.IsZero() && (!ok || at.After(now)) {
+				for _, p := range e.pending {
+					earlier(p.visibleAt)
+				}
 			}
 		}
 	}
