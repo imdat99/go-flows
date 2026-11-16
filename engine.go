@@ -59,9 +59,9 @@ type Options struct {
 	// StuckTimeout bounds how long workflow code may run without yielding
 	// to the engine (default 10s). Code that exceeds it is handed back;
 	// exceeding it again at the same point of its history parks the
-	// execution (ErrStuck). Each engine counts for itself: with N engines,
-	// it may stall once on each before it is parked (each attempt leaves a
-	// goroutine running until its process exits).
+	// execution (ErrStuck), whichever engine ran the first attempt (the
+	// count is in the database). Each attempt leaves a goroutine running
+	// until its process exits.
 	StuckTimeout time.Duration
 }
 

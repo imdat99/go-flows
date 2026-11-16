@@ -73,21 +73,3 @@ func TestDueTimesSignalsOnlyANewEarliest(t *testing.T) {
 		t.Fatal("no hint for a new earliest time")
 	}
 }
-
-// T8.4 review: one stall is handed back (a paused process is not wrong
-// code); a second at the same history position parks.
-func TestStuckAgain(t *testing.T) {
-	var w Worker
-	if w.stuckAgain(1, 5) {
-		t.Fatal("first stall parks")
-	}
-	if w.stuckAgain(1, 6) {
-		t.Fatal("a stall at another position parks")
-	}
-	if !w.stuckAgain(1, 6) {
-		t.Fatal("a second stall at the same position does not park")
-	}
-	if w.stuckAgain(1, 6) {
-		t.Fatal("the record is not cleared by a park")
-	}
-}

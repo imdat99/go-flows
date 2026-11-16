@@ -208,31 +208,10 @@ type Worker struct {
 	pollers    sync.WaitGroup // pollers and watch
 	beat       sync.WaitGroup // heartbeat
 	tasks      sync.WaitGroup // in-flight tasks
-	// stuck remembers, per execution, the history position at which its
-	// workflow code last did not yield (driver.fail parks at the second).
-	stuckMu sync.Mutex
-	stuck   map[int64]int64
 	// detached counts the recorders of detached eager outcomes (driver
 	// detach): the only tasks that hold no slot (Busy).
 	detached atomic.Int64
 	started  bool
-}
-
-// stuckAgain records that the workflow code of execution id did not yield
-// at history position seq, and reports whether it did so there before (in
-// this worker). The record is bounded: past 1024 executions it restarts.
-func (w *Worker) stuckAgain(id, seq int64) bool {
-	w.stuckMu.Lock()
-	defer w.stuckMu.Unlock()
-	if prev, ok := w.stuck[id]; ok && prev == seq {
-		delete(w.stuck, id)
-		return true
-	}
-	if w.stuck == nil || len(w.stuck) >= 1024 {
-		w.stuck = make(map[int64]int64)
-	}
-	w.stuck[id] = seq
-	return false
 }
 
 // SetDroppedHook sets a function told, when a workflow ends, of the

@@ -561,7 +561,14 @@ func (d *driver) fail(task *store.WorkflowTask, err error) {
 	park := errors.Is(err, executor.ErrNonDeterministic)
 	if errors.Is(err, coro.ErrStuck) {
 		err = fmt.Errorf("workflow code did not yield (blocking call or busy loop?): %w", err)
-		park = w.stuckAgain(task.Execution.ID, task.LastSeq)
+		// Counted in the store: a second stall here, on any engine, parks
+		// (T9.3). Unrecorded (an error), it is handed back.
+		again, nerr := w.st.NoteStuck(d.ctx, d.lease, task.LastSeq)
+		if nerr != nil && !errors.Is(nerr, store.ErrLeaseLost) {
+			w.log.LogAttrs(d.ctx, slog.LevelWarn, "flows: could not count a stall, handing back",
+				slog.String("instance", task.Execution.InstanceID), slog.Any("error", nerr))
+		}
+		park = nerr == nil && again
 	}
 	d.taskErr = err
 	if park {

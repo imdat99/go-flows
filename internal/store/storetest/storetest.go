@@ -92,6 +92,7 @@ func Run(t *testing.T, h Harness) {
 		{"ClaimsWithRepeatedQueues", testClaimsWithRepeatedQueues},
 		{"DueClaims", testDueClaims},
 		{"ChildrenWithTheEnd", testChildrenWithTheEnd},
+		{"NoteStuck", testNoteStuck},
 		{"TimesComeFromTheStoreClock", testStoreClock},
 		{"GW3_SignalsRacingTerminalCompletion", testSignalsRacingTerminal},
 		{"ParkedExecutionCannotKeepItsLease", testParkedCannotKeep},

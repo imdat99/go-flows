@@ -495,10 +495,16 @@ type Store interface {
 	// CompensationRetryRequested pending event. ErrNotFound for an unknown
 	// id, ErrNotActive when the latest execution is not parked that way.
 	ReopenCompensation(ctx context.Context, instanceID string) error
+	// NoteStuck records, under the workflow lease l, that the execution's
+	// workflow code ran without yielding at history position seq (the
+	// task's LastSeq), and reports whether it had at that position before,
+	// on any engine: then it is parked, otherwise handed back (a stalled
+	// process is not wrong code). ErrLeaseLost when l is no longer held.
+	NoteStuck(ctx context.Context, l Lease, seq int64) (again bool, err error)
 	// ReopenParked resumes an execution parked because its code was wrong
 	// (its ErrKinds hold KindNonDeterministic or KindStuck): it becomes
-	// running again, its reason cleared, ready to be claimed (and replayed
-	// by the code deployed since). ErrNotFound for an unknown id,
+	// running again, its reason and stall count (NoteStuck) cleared, ready
+	// to be claimed (and replayed by the code deployed since). ErrNotFound for an unknown id,
 	// ErrNotActive when the latest execution is not parked that way.
 	ReopenParked(ctx context.Context, instanceID string) error
 

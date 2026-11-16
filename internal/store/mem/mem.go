@@ -112,6 +112,9 @@ type execution struct {
 	// forceReady: reopened (ReopenParked), claimable even with nothing
 	// pending, until claimed.
 	forceReady bool
+	// stuckSeq is the history position of the last stall (NoteStuck).
+	stuckSeq   int64
+	stuckNoted bool
 }
 
 type pending struct {
@@ -904,6 +907,7 @@ func (s *Store) ReopenParked(_ context.Context, instanceID string) error {
 		return store.ErrNotActive
 	}
 	e.Status, e.Err, e.ErrKinds = store.StatusRunning, "", ""
+	e.stuckNoted = false // the stall count starts over (T9.3)
 	e.forceReady = true
 	s.hint(store.WorkflowWork, e.Queue)
 	return nil
@@ -1129,4 +1133,17 @@ func until(next, now time.Time) time.Duration {
 		return 0
 	}
 	return next.Sub(now)
+}
+
+// NoteStuck implements store.Store.
+func (s *Store) NoteStuck(_ context.Context, l store.Lease, seq int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, err := s.fenced(l)
+	if err != nil {
+		return false, err
+	}
+	again := e.stuckNoted && e.stuckSeq == seq
+	e.stuckSeq, e.stuckNoted = seq, true
+	return again, nil
 }

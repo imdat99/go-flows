@@ -691,3 +691,42 @@ func testChildrenWithTheEnd(t *testing.T, h Harness) {
 		t.Fatalf("next execution %+v %v", next, err)
 	}
 }
+
+// T9.3: NoteStuck counts stalls per history position in the store, under
+// the lease: the first at a position is not "again", a second there is,
+// another position starts over; a lost lease is refused.
+func testNoteStuck(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "i1")
+	task := claimOne(t, s, owner, h.TTL)
+	for i, c := range []struct {
+		seq  int64
+		want bool
+	}{{1, false}, {1, true}, {2, false}, {2, true}} {
+		again, err := s.NoteStuck(ctx, task.Lease, c.seq)
+		if err != nil || again != c.want {
+			t.Fatalf("note %d (seq %d): %v %v, want %v", i, c.seq, again, err, c.want)
+		}
+	}
+	// Under another lease (the next owner's), the count stays.
+	if err := s.ReleaseWorkflowTask(ctx, task.Lease, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.NoteStuck(ctx, task.Lease, 2); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("a released lease: %v", err)
+	}
+	next := claimOne(t, s, other, h.TTL)
+	if again, err := s.NoteStuck(ctx, next.Lease, 2); err != nil || !again {
+		t.Fatalf("another owner, same position: %v %v", again, err)
+	}
+	// Parked, then resumed (fixed code deployed): the count starts over,
+	// so a stalled process right after Resume gets its grace again.
+	started(t, s, next, &store.Completion{Status: store.StatusNeedsAttention, Err: "stuck", ErrKinds: store.KindStuck})
+	if err := s.ReopenParked(ctx, "i1"); err != nil {
+		t.Fatal(err)
+	}
+	resumed := claimOne(t, s, owner, h.TTL)
+	if again, err := s.NoteStuck(ctx, resumed.Lease, 2); err != nil || again {
+		t.Fatalf("first stall after Resume: %v %v", again, err)
+	}
+}

@@ -233,9 +233,9 @@ const reopenCompensation = `
 	SELECT ` + notifyW + "queue)" + ` FROM e`
 
 // reopenParked makes the latest execution of $1, parked because its code
-// was wrong, running and ready again.
+// was wrong, running and ready again; its stall count starts over (T9.3).
 const reopenParked = `
-	UPDATE flows.execution SET status = 'running', err = '', err_kinds = '', ready_at = now()
+	UPDATE flows.execution SET status = 'running', err = '', err_kinds = '', stuck_seq = NULL, ready_at = now()
 	WHERE id = ` + latestOf + `
 	  AND status = 'needs_attention'
 	  AND string_to_array(err_kinds, ',') && ARRAY['` + store.KindNonDeterministic + `', '` + store.KindStuck + `']
@@ -380,4 +380,28 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 		}
 	}
 	return fmt.Errorf("terminate: %s kept continuing as new", instanceID)
+}
+
+// NoteStuck implements store.Store.
+func (s *Store) NoteStuck(ctx context.Context, l store.Lease, seq int64) (bool, error) {
+	var again bool
+	err := retry(ctx, func() error {
+		return s.pool.QueryRow(ctx, `
+			WITH old AS (
+				SELECT stuck_seq FROM flows.execution
+				WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''
+				FOR NO KEY UPDATE
+			)
+			UPDATE flows.execution SET stuck_seq = $4
+			WHERE id = $1 AND EXISTS (SELECT 1 FROM old)
+			RETURNING (SELECT stuck_seq FROM old) IS NOT DISTINCT FROM $4::bigint`,
+			l.ID, l.Owner, l.Version, seq).Scan(&again)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, store.ErrLeaseLost
+	}
+	if err != nil {
+		return false, fmt.Errorf("note stuck: %w", err)
+	}
+	return again, nil
 }

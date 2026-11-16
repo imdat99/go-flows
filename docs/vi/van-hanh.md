@@ -76,7 +76,7 @@ defer engine.Stop(shutdownCtx)
 | `PollMax` | 1s | Khoảng poll dài nhất khi rảnh. Notification và thời điểm đến hạn cục bộ đánh thức poller sớm hơn. |
 | `StickyFor`, `CacheSize` | 10s, 1000 | Giữ execution đã replay trong bộ nhớ, cùng với task kế tiếp của nó trên engine này. `CacheSize: -1` tắt cache (task nào cũng replay). |
 | `DisableEager` | false | Chạy mọi activity qua queue thay vì chạy ngay trong engine đã lên lịch nó. |
-| `StuckTimeout` | 10s | Code workflow được chạy bao lâu mà không nhường. Một lần: trả lại; hai lần ở cùng chỗ: park (`ErrStuck`). Tăng lên nếu code workflow thật sự cần tính toán lâu. |
+| `StuckTimeout` | 10s | Code workflow được chạy bao lâu mà không nhường. Một lần: trả lại; hai lần ở cùng chỗ, trên bất kỳ engine nào (đếm trong database): park (`ErrStuck`); `Resume` đặt lại số đếm. Tăng lên nếu code workflow thật sự cần tính toán lâu. |
 | `EagerWindow` | 200ms | Execution chờ các activity eager của nó bao lâu trước khi cho signal và timer vào. |
 
 Chi phí đo được và nguyên nhân nằm trong [benchmarks.md](../benchmarks.md).

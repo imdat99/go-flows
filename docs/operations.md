@@ -76,7 +76,7 @@ defer engine.Stop(shutdownCtx)
 | `PollMax` | 1s | The longest idle poll interval. Notifications and local due times wake pollers earlier. |
 | `StickyFor`, `CacheSize` | 10s, 1000 | Keep a replayed execution in memory, with its next task on this engine. `CacheSize: -1` disables the cache (every task replays). |
 | `DisableEager` | false | Run every activity through the queue instead of in the scheduling engine. |
-| `StuckTimeout` | 10s | How long workflow code may run without yielding. Once: handed back; twice at the same point: parked (`ErrStuck`). Raise it if workflow code legitimately computes for long. |
+| `StuckTimeout` | 10s | How long workflow code may run without yielding. Once: handed back; twice at the same point, on any engine (counted in the database): parked (`ErrStuck`); `Resume` resets the count. Raise it if workflow code legitimately computes for long. |
 | `EagerWindow` | 200ms | How long an execution waits for its eager activities before letting signals and timers in. |
 
 Measured costs and their causes are in [benchmarks.md](benchmarks.md).

@@ -436,7 +436,7 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
     - **Đĩa:** trong lúc làm, đĩa máy dev đầy 100%. Đã dọn go build cache (23 GB) và các bản sao review.
     - **Còn mở:**
       - Mục tiêu ≤ 80 alloc (thiết kế lại SQL của store).
-      - Đếm stuck theo từng worker: với N engine có thể tới N+1 lần thử, mỗi lần để lại goroutine.
+      - ~~Đếm stuck theo từng worker: với N engine có thể tới N+1 lần thử, mỗi lần để lại goroutine.~~ Đã sửa ở T9.3.
       - Chu trình deadlock hiếm (child kết thúc ↔ cha lấy lock), được Postgres phát hiện và retry.
       - Comment của migration `00005` sai (đã áp dụng nên không sửa).
       - Thỉnh thoảng có một run benchmark mất khoảng 1.5 s (có từ trước).
@@ -489,7 +489,12 @@ Các mục được rút ra từ phần "Còn mở" của T8.x, xếp theo thứ
       - Kèm theo, làm chắc lại 2 test conformance flaky khi máy tải nặng: `DueClaims`, `TimersBecomeVisibleAtTheirTime`.
     - **Review:** lần 1 không đạt (tài liệu khẳng định sai về flowtest, hai câu mâu thuẫn, chưa ghi quyết định); lần 2 đạt.
     - **Còn mở (thấp):** flowtest chỉ báo cho instance được truyền vào `Run`, không báo cho child của nó; hook không có recover (chỉ flowtest dùng).
-- [ ] **T9.3** Đếm stuck trong DB. Execution lưu `last_seq` của lần kẹt gần nhất (migration mới). Lần kẹt thứ hai ở cùng `last_seq`, trên bất kỳ engine nào, sẽ park. Test với 2 engine.
+- [x] **T9.3** Đếm stuck trong DB. Execution lưu `last_seq` của lần kẹt gần nhất (migration mới). Lần kẹt thứ hai ở cùng `last_seq`, trên bất kỳ engine nào, sẽ park. Test với 2 engine.
+    - Migration `00010_stuck_seq.sql` thêm cột `stuck_seq` (nullable, không rewrite bảng). `Store.NoteStuck(lease, seq)`: một câu lệnh được fence (CTE `FOR NO KEY UPDATE` theo owner/lease_version), 0 dòng → `ErrLeaseLost`; trả về `again` khi giá trị cũ bằng `seq`.
+    - `driver.fail` gọi `NoteStuck` thay cho map trong bộ nhớ của worker (đã xoá `stuckAgain`); lỗi → bàn giao (có log trừ `ErrLeaseLost`).
+    - `ReopenParked` (Engine.Resume) xoá `stuck_seq`: lần kẹt đầu sau Resume vẫn được bàn giao như trước. Continue-as-new bắt đầu với `NULL`.
+    - Test: `TestStuckIsCountedAcrossWorkers` (2 worker, đỏ: 3 lần thử), conformance `NoteStuck` (mem, pg fast/pgx, gồm cả sau Resume), `TestStuckWorkflowIsParkedAndResumed`.
+    - Review 1 lần: đạt (sửa thêm: xoá đếm khi Resume, log lỗi NoteStuck).
 - [ ] **T9.4** Giữ lock khi activity đang chờ queue hoặc chờ retry:
     - heartbeat gia hạn lock của execution còn activity task chưa xong;
     - có giới hạn tuyệt đối để workflow bị bỏ quên không giữ lock mãi.
