@@ -1346,10 +1346,17 @@ func (s *Store) ClaimWorkflowTasksDue(ctx context.Context, owner string, queues 
 			earlier(e.notBefore)
 			// As Postgres' ready_at: the earliest pending event, if none is
 			// visible now (then the execution is ready, not due later), of an
-			// execution without a lease (a kept lease is its owner's).
+			// execution without a lease (a kept lease is its owner's), unless
+			// it falls due while sticky to its owner (owner_due, T10.3).
 			if at, ok := e.readyAt(now); e.lockedUntil.IsZero() && (!ok || at.After(now)) {
+				var first time.Time
 				for _, p := range e.pending {
-					earlier(p.visibleAt)
+					if first.IsZero() || p.visibleAt.Before(first) {
+						first = p.visibleAt
+					}
+				}
+				if e.stickyOwner == "" || first.After(e.stickyUntil) {
+					earlier(first)
 				}
 			}
 		}

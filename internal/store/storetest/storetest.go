@@ -92,6 +92,7 @@ func Run(t *testing.T, h Harness) {
 		{"ClaimsWithRepeatedQueues", testClaimsWithRepeatedQueues},
 		{"DueClaims", testDueClaims},
 		{"DueSkipsManyKeptLeases", testDueSkipsManyKeptLeases},
+		{"DueSkipsTimersOfStickyExecutions", testDueSkipsStickyTimers},
 		{"ChildrenWithTheEnd", testChildrenWithTheEnd},
 		{"NoteStuck", testNoteStuck},
 		{"TimesComeFromTheStoreClock", testStoreClock},

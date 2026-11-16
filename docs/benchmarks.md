@@ -119,11 +119,14 @@ polls then, so a backed-off poller does not run it up to `PollMax` late
   it was renewed no claim could report it, so `PollMax` is capped at a third
   of `LeaseTTL` (the renewal interval). An idle engine thus polls at least
   that often, and a crashed engine's work resumes within about 4/3
-  `LeaseTTL` (`TestCrashedEngineWorkIsRecoveredWithinLeaseTTL`). A timer of
-  an execution sticky to another engine may wake idle engines once, for an
-  empty claim. Kept leases (eager execution) are not due times: their
-  `ready_at` is the lease expiry. They are marked (`owner_due`, written only
-  with `ready_at`, so renewals stay HOT updates) and left out of a partial
+  `LeaseTTL` (`TestCrashedEngineWorkIsRecoveredWithinLeaseTTL`). Kept leases
+  (eager execution) are not due times: their `ready_at` is the lease expiry.
+  Nor is a timer falling due while its execution is sticky to the engine
+  that committed it (T10.3): that engine claims it, and an idle engine
+  waking for it made an empty claim (`TestStickyTimersDoNotWakeOthers`); if
+  that engine dies, the timed poll above finds it. Both are marked
+  (`owner_due`, written only with `ready_at`, so renewals stay HOT updates;
+  `Unstick` clears it) and left out of a partial
   index (`execution_due_idx`, T10.2), so the `ready_at` lookup reads one
   entry per queue however many kept leases fall due before the first timer.
 

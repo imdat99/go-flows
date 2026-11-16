@@ -702,6 +702,41 @@ func testDueSkipsManyKeptLeases(t *testing.T, h Harness) {
 	}
 }
 
+// T10.3: a timer that falls due while its execution is sticky to its owner
+// is that owner's (it claims it, knowing the time): not reported, to anyone.
+// A timer falling due after the stickiness ends is anyone's: reported.
+func testDueSkipsStickyTimers(t *testing.T, h Harness) {
+	s := h.New(t)
+	dc, ok := s.(store.DueClaimer)
+	if !ok {
+		t.Skip("store does not implement store.DueClaimer")
+	}
+	d := 30 * h.TTL // nothing falls due while the test runs
+	mustCreate(t, s, "sticky")
+	task := claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{StickyFor: d, Timers: []history.Event{{ScheduleID: 1, At: task.Now.Add(d / 2)}}})
+	for _, who := range []string{other, owner} {
+		if tasks, next, err := dc.ClaimWorkflowTasksDue(ctx, who, []string{queue}, 10, h.TTL); err != nil || len(tasks) != 0 || next != 0 {
+			t.Fatalf("%s: a timer due while sticky reported in %v (claimed %d, %v)", who, next, len(tasks), err)
+		}
+	}
+	mustCreate(t, s, "later")
+	task = claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{StickyFor: d / 4, Timers: []history.Event{{ScheduleID: 1, At: task.Now.Add(d)}}})
+	_, next, err := dc.ClaimWorkflowTasksDue(ctx, other, []string{queue}, 10, h.TTL)
+	if err != nil || next <= d/2 || next > d+d/2 {
+		t.Fatalf("a timer due after the stickiness: next in %v, want about %v (%v)", next, d, err)
+	}
+	// Unstick hands the sticky one over: its timer is anyone's again.
+	if err := s.Unstick(ctx, owner); err != nil {
+		t.Fatal(err)
+	}
+	_, next, err = dc.ClaimWorkflowTasksDue(ctx, other, []string{queue}, 10, h.TTL)
+	if err != nil || next <= 0 || next > d/2+d/4 {
+		t.Fatalf("after Unstick: next in %v, want about %v (%v)", next, d/2, err)
+	}
+}
+
 // T9.2: a continue-as-new may start children (they run on, detached, as
 // the children started before); another ending may not (they would be
 // canceled at once).

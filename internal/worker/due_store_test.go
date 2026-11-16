@@ -46,7 +46,7 @@ func TestDelayedWorkOfAnotherWorkerIsOnTime(t *testing.T) {
 	register := func(isB bool) *registry { return delayedRegistry(isB, delay, gate, mark) }
 	newWorker := func(owner string, reg *registry, pollMin, pollMax time.Duration) *worker.Worker {
 		w, err := worker.New(st, reg, reg, worker.Options{
-			Owner: owner, Queues: []string{q}, Eager: true, LeaseTTL: 10 * time.Second, // PollMax <= LeaseTTL/3
+			Owner: owner, Queues: []string{q}, Eager: true, LeaseTTL: max(5*time.Second, 3*pollMax), // PollMax <= LeaseTTL/3
 			PollMin: pollMin, PollMax: pollMax,
 		})
 		if err != nil {
@@ -357,4 +357,59 @@ type tWriter struct {
 func (w tWriter) Write(p []byte) (int, error) {
 	w.t.Logf("%s: %s", w.name, strings.TrimSpace(string(p)))
 	return len(p), nil
+}
+
+// T10.3: a timer that falls due while its execution is sticky to the engine
+// that committed it is that engine's: an idle engine does not wake for it
+// (an empty claim, the sticky engine claiming it).
+func TestStickyTimersDoNotWakeOthers(t *testing.T) {
+	const delay = 1500 * time.Millisecond
+	pool := testdb.New(t)
+	ctx := context.Background()
+	if err := pg.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	reg := newRegistry()
+	reg.addWorkflow("sleepy", func(ctx coro.Context, _ []byte) ([]byte, error) {
+		_, err := executor.FromContext(ctx).NewTimer(ctx, delay, "t").Get(ctx)
+		return nil, err
+	})
+	b, err := worker.New(pg.New(pool), reg, reg, worker.Options{
+		Owner: "b", Queues: []string{q}, LeaseTTL: 10 * time.Second, StickyFor: time.Minute,
+		PollMin: 10 * time.Millisecond, PollMax: 50 * time.Millisecond, Logger: testLogger(t, "b"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Stop(ctx) }()
+	create(t, pg.New(pool), "s", "sleepy", "")
+	waitUntil(t, func() bool { // B committed the timer, sticky to itself
+		var sticky bool
+		err := pool.QueryRow(ctx, `SELECT ready_at > now() AND sticky_owner = 'b' FROM flows.execution`).Scan(&sticky)
+		return err == nil && sticky
+	})
+	st := &dueWfClaims{Store: pg.New(pool)}
+	a, err := worker.New(st, reg, reg, worker.Options{
+		Owner: "a", Queues: []string{q}, LeaseTTL: 30 * time.Second,
+		PollMin: 5 * time.Second, PollMax: 5 * time.Second, Logger: testLogger(t, "a"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.Stop(ctx) }()
+	time.Sleep(200 * time.Millisecond) // A's claims on start (the poll, the watch's first hint)
+	before := st.claims.Load()
+	if e := waitEnd(t, pg.New(pool), "s"); e.Status != store.StatusCompleted {
+		t.Fatalf("s: %s %s", e.Status, e.Err)
+	}
+	time.Sleep(300 * time.Millisecond) // a wake-up for the timer would have claimed by now
+	if n := st.claims.Load() - before; n != 0 {
+		t.Fatalf("A claimed %d times for a timer sticky to B", n)
+	}
 }

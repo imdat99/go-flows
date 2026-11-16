@@ -482,7 +482,9 @@ const nextWorkflowDue = `
 	FROM unnest($1::text[]) AS q(name)
 	LEFT JOIN LATERAL (
 		-- Kept leases are left out (owner_due, T10.2): their ready_at is
-		-- the lease expiry (recovery's, not a due time). The index leaves
+		-- the lease expiry (recovery's, not a due time). So are events
+		-- falling due while sticky to the owner that committed them
+		-- (T10.3): it claims them; if it died, recovery's timed poll does. The index leaves
 		-- them out, so the first entry after now() is the answer; locked_until
 		-- only filters leases kept by a binary older than owner_due.
 		SELECT ready_at FROM flows.execution
@@ -1096,7 +1098,7 @@ const cancelActivities = `
 // sticky-for, $6 owner, $7/$8 the reason of a park (needs_attention) or of
 // a compensation (the workflow's error).
 // The lease is kept only while the execution stays
-// claimable. Released with work visible, it notifies other owners.
+// claimable (stickiness only applies when it is not kept). Released with work visible, it notifies other owners.
 const updateRunning = `
 	WITH v AS (
 		SELECT coalesce(nullif($3::text, ''), status) AS status,
@@ -1116,7 +1118,10 @@ const updateRunning = `
 	                   now() + $4 * interval '1 microsecond')
 	        ELSE (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1) END,
 	    owner_id = CASE WHEN v.keep THEN e.owner_id ELSE '' END,
-	    owner_due = v.keep,
+	    -- The next due time is the owner's (T10.2, T10.3): a kept lease's, or
+	    -- the first event falling due while the execution is sticky to it.
+	    owner_due = v.keep OR coalesce($5::bigint > 0 AND
+	        (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1) <= now() + $5 * interval '1 microsecond', false),
 	    locked_until = CASE WHEN v.keep THEN now() + $4 * interval '1 microsecond' END,
 	    sticky_owner = CASE WHEN NOT v.keep AND $5::bigint > 0 THEN $6 ELSE '' END,
 	    sticky_until = CASE WHEN NOT v.keep AND $5::bigint > 0 THEN now() + $5 * interval '1 microsecond' END
