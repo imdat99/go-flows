@@ -90,8 +90,11 @@ func (o observer) Ended(e store.EndInfo) { o.o.RunEnded(runInfo(e)) }
 // Tracer wraps engine work in spans; package otelflows implements it with
 // OpenTelemetry. Unset, it costs nothing. Its panics are recovered and
 // logged. Workflow code itself is replayed and not traced: a span covers a
-// whole workflow task. Spans are not linked across tasks and attempts
-// (each is a root, tied to the others by the instance id).
+// whole workflow task. Every task and attempt carries its execution's id
+// (ExecutionID): otelflows derives one trace per execution from it, so
+// the spans of an execution share a trace without any trace context being
+// stored. An attempt or task whose lease was lost (another engine runs it
+// again) ends with an error matching ErrLeaseLost.
 type Tracer interface {
 	// StartActivity starts an attempt of an activity or compensator. The
 	// returned context is the attempt's: spans the activity makes are its
@@ -109,7 +112,10 @@ type Tracer interface {
 
 // ActivityInfo describes an activity attempt.
 type ActivityInfo struct {
-	InstanceID   string
+	InstanceID string
+	// ExecutionID identifies the execution (one run of the instance id;
+	// continue-as-new starts another), as WorkflowTaskInfo.ExecutionID.
+	ExecutionID  int64
 	Activity     string
 	Attempt      int
 	Compensation bool
@@ -121,8 +127,10 @@ type ActivityInfo struct {
 // WorkflowTaskInfo describes a workflow task.
 type WorkflowTaskInfo struct {
 	InstanceID string
-	Workflow   string
-	Version    int
+	// ExecutionID identifies the execution (unique in its store).
+	ExecutionID int64
+	Workflow    string
+	Version     int
 	// Status is the execution's status when the task starts (running or
 	// compensating).
 	Status Status
@@ -135,13 +143,13 @@ var _ worker.Tracer = tracer{}
 
 func (t tracer) StartAttempt(ctx context.Context, a *store.ActivityTask) (context.Context, func(error)) {
 	return t.t.StartActivity(ctx, ActivityInfo{
-		InstanceID: a.InstanceID, Activity: a.Name, Attempt: int(a.Attempt), Compensation: a.Compensate, Uncertain: a.Uncertain,
+		InstanceID: a.InstanceID, ExecutionID: a.ExecutionID, Activity: a.Name, Attempt: int(a.Attempt), Compensation: a.Compensate, Uncertain: a.Uncertain,
 	})
 }
 
 func (t tracer) StartTask(ctx context.Context, e *store.Execution) func(store.Status, error) {
 	end := t.t.StartWorkflowTask(ctx, WorkflowTaskInfo{
-		InstanceID: e.InstanceID, Workflow: e.Workflow, Version: int(e.Version), Status: e.Status,
+		InstanceID: e.InstanceID, ExecutionID: e.ID, Workflow: e.Workflow, Version: int(e.Version), Status: e.Status,
 	})
 	if end == nil {
 		return nil

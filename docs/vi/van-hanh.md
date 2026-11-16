@@ -136,7 +136,15 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // kết thúc hơn 30 n
   - `flows.activity.attempts` và `flows.activity.duration` gắn nhãn theo
     activity, outcome (`completed`, `failed`, `retrying`) và compensation.
   - `flows.runs.ended` gắn nhãn theo workflow và status.
-  - Span là span gốc, nối với nhau bằng `flows.instance_id`.
+  - Mỗi execution một trace: trace id suy ra từ execution (không lưu gì
+    thêm), nên mọi workflow task và activity attempt, ở bất kỳ process
+    nào, đều là con của cùng một span context của execution (span này
+    không được phát ra: gốc của trace hiện là thiếu). Continue-as-new bắt
+    đầu trace khác; `flows.instance_id` nối chúng lại.
+  - Attempt hoặc task mất lease kết thúc với status lỗi và
+    `flows.outcome=lease_lost`; attempt thay thế nằm trong cùng trace.
+  - Lấy mẫu theo cả execution bằng sampler `ParentBased` với
+    `WithRemoteParentSampled(TraceIDRatioBased(r))`; mặc định giữ mọi span.
 - **Cảnh báo:**
   - có execution ở `needs_attention`;
   - số execution `compensating` tăng dần;
