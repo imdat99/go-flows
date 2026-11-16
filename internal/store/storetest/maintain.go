@@ -3,6 +3,7 @@ package storetest
 import (
 	"errors"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -663,6 +664,41 @@ func testDueClaims(t *testing.T, h Harness) {
 	}
 	if _, next, err := dc.ClaimActivityTasksDue(ctx, owner, []string{"leased"}, 10, h.TTL); err != nil || next != 0 {
 		t.Fatalf("a running task reported due in %v (%v)", next, err)
+	}
+}
+
+// T10.2: kept leases (eager execution) are not due times, however many of
+// them fall due before the first timer of the queue: the timer is reported.
+func testDueSkipsManyKeptLeases(t *testing.T, h Harness) {
+	s := h.New(t)
+	dc, ok := s.(store.DueClaimer)
+	if !ok {
+		t.Skip("store does not implement store.DueClaimer")
+	}
+	const kept = 100 // more than any fixed number of rows read
+	d := 30 * h.TTL  // nothing falls due while the test runs
+	for i := range kept {
+		mustCreate(t, s, "k"+strconv.Itoa(i))
+	}
+	for n := 0; n < kept; {
+		tasks := claim(t, s, owner, d)
+		if len(tasks) == 0 {
+			t.Fatalf("claimed %d of %d", n, kept)
+		}
+		for _, task := range tasks {
+			started(t, s, task, &store.Completion{KeepFor: d / 2}) // ready_at: the lease expiry
+		}
+		n += len(tasks)
+	}
+	mustCreate(t, s, "timer")
+	task := claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{Timers: []history.Event{{ScheduleID: 1, At: task.Now.Add(d)}}})
+	tasks, next, err := dc.ClaimWorkflowTasksDue(ctx, other, []string{queue}, 10, h.TTL)
+	if err != nil || len(tasks) != 0 {
+		t.Fatalf("claimed %d %v", len(tasks), err)
+	}
+	if next <= d/2 || next > d+d/2 {
+		t.Fatalf("next in %v, want about %v (the timer, not a kept lease)", next, d)
 	}
 }
 

@@ -165,6 +165,13 @@ func TestDueStatementsReadFewRows(t *testing.T) {
 		 FROM generate_series(1, 20000) g`,
 		`INSERT INTO flows.activity_task (execution_id, instance_id, schedule_id, name, queue, visible_at)
 		 SELECT id, instance_id, 1, 'a', 'q', now() + interval '1 hour' FROM flows.execution`,
+		// Kept leases due before the first timer (T10.2: a fixed number of
+		// rows read used to miss the timer behind them).
+		`INSERT INTO flows.execution (instance_id, workflow, version, queue, status, ready_at,
+		                             owner_id, lease_version, locked_until, owner_due)
+		 SELECT 'k' || g, 'w', 1, 'q', 'running', now() + interval '30 minutes',
+		        'keeper', 1, now() + interval '30 minutes', true
+		 FROM generate_series(1, 5000) g`,
 		`ANALYZE`,
 	} {
 		if _, err := pool.Exec(ctx, sql); err != nil {

@@ -474,23 +474,21 @@ func readDue(br pgx.BatchResults) (time.Duration, error) {
 // at which an active execution of the queues $1 becomes ready (ready_at: a
 // timer, a retry, an event delivered for later) or is no longer held back
 // (not_before: a hand-back); NULL when none. Index lookups per queue
-// (execution_ready_idx, execution_not_before_idx). Leases that expire are
-// not covered: recovery waits for a timed poll.
+// (execution_due_idx, execution_not_before_idx). Leases that expire are
+// not covered: recovery waits for a timed poll (at most LeaseTTL/3 apart,
+// T10.1).
 const nextWorkflowDue = `
 	SELECT (extract(epoch FROM min(least(r.t, n.t)) - now()) * 1000000)::bigint
 	FROM unnest($1::text[]) AS q(name)
 	LEFT JOIN LATERAL (
-		-- Leased executions are left out: a kept lease's ready_at is its
-		-- expiry (recovery's, not a due time). Filtering them through the
-		-- index would need locked_until in it, making every lease renewal
-		-- a non-HOT update: the first 64 rows are read instead (a queue
-		-- with more kept executions due before its first timer falls back
-		-- to the timed poll).
-		SELECT min(x.ready_at) FROM (
-			SELECT ready_at, locked_until FROM flows.execution
-			WHERE queue = q.name AND status IN ('running', 'compensating') AND ready_at > now()
-			ORDER BY ready_at LIMIT 64
-		) AS x WHERE x.locked_until IS NULL
+		-- Kept leases are left out (owner_due, T10.2): their ready_at is
+		-- the lease expiry (recovery's, not a due time). The index leaves
+		-- them out, so the first entry after now() is the answer; locked_until
+		-- only filters leases kept by a binary older than owner_due.
+		SELECT ready_at FROM flows.execution
+		WHERE queue = q.name AND status IN ('running', 'compensating') AND ready_at IS NOT NULL
+		  AND NOT owner_due AND ready_at > now() AND locked_until IS NULL
+		ORDER BY ready_at LIMIT 1
 	) AS r(t) ON true
 	LEFT JOIN LATERAL (
 		SELECT not_before FROM flows.execution
@@ -671,7 +669,7 @@ func (s *Store) ReleaseWorkflowTask(ctx context.Context, l store.Lease, delay ti
 
 const releaseWorkflow = `
 	UPDATE flows.execution
-	SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL,
+	SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL, owner_due = false,
 	    ready_at = (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
 	    not_before = CASE WHEN $2::bigint > 0 THEN now() + $2::bigint * interval '1 microsecond' END
 	WHERE id = $1
@@ -1118,6 +1116,7 @@ const updateRunning = `
 	                   now() + $4 * interval '1 microsecond')
 	        ELSE (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1) END,
 	    owner_id = CASE WHEN v.keep THEN e.owner_id ELSE '' END,
+	    owner_due = v.keep,
 	    locked_until = CASE WHEN v.keep THEN now() + $4 * interval '1 microsecond' END,
 	    sticky_owner = CASE WHEN NOT v.keep AND $5::bigint > 0 THEN $6 ELSE '' END,
 	    sticky_until = CASE WHEN NOT v.keep AND $5::bigint > 0 THEN now() + $5 * interval '1 microsecond' END

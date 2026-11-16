@@ -119,11 +119,13 @@ polls then, so a backed-off poller does not run it up to `PollMax` late
   it was renewed no claim could report it, so `PollMax` is capped at a third
   of `LeaseTTL` (the renewal interval). An idle engine thus polls at least
   that often, and a crashed engine's work resumes within about 4/3
-  `LeaseTTL` (`TestCrashedEngineWorkIsRecoveredWithinLeaseTTL`). A timer of an execution sticky
-  to another engine may wake idle engines once, for an empty claim; kept
-  leases (eager execution) are not due times. The `ready_at` lookup reads
-  at most 64 index rows per queue: a queue with more kept executions due
-  before its first timer falls back to the timed poll.
+  `LeaseTTL` (`TestCrashedEngineWorkIsRecoveredWithinLeaseTTL`). A timer of
+  an execution sticky to another engine may wake idle engines once, for an
+  empty claim. Kept leases (eager execution) are not due times: their
+  `ready_at` is the lease expiry. They are marked (`owner_due`, written only
+  with `ready_at`, so renewals stay HOT updates) and left out of a partial
+  index (`execution_due_idx`, T10.2), so the `ready_at` lookup reads one
+  entry per queue however many kept leases fall due before the first timer.
 
 Runs that take 0.5 to 1.7 s instead of ~0.15 s appear now and then on the
 development machine. A trace of store calls showed every statement of
