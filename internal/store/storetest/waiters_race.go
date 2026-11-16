@@ -22,7 +22,7 @@ func testLockWaiterRace(t *testing.T, h Harness) {
 	seq := lockSeq{}
 	for _, id := range []string{"i0", "i1", "i2"} {
 		mustCreate(t, s, id)
-		seq.consume(t, s, claimOne(t, s, owner, h.TTL))
+		seq.consume(t, s, claimOne(t, s, owner, lease(h)))
 	}
 	if ev := seq.queueFor(t, s, h, "i0", 1, "k", 0, 0); ev.Type != history.LockAcquired {
 		t.Fatalf("free: %+v", ev)
@@ -38,14 +38,14 @@ func testLockWaiterRace(t *testing.T, h Harness) {
 		return nil
 	})
 	// i0's end, prepared.
-	t0 := wakeTask(t, s, h, "i0")
+	t0 := wakeTaskFor(t, s, lease(h), "i0")
 	c0 := &store.Completion{Consumed: pendingIDs(t0), Status: store.StatusCompleted}
 	for _, p := range t0.Pending {
 		seq.add(c0, "i0", p.Event)
 	}
 	seq.add(c0, "i0", history.Event{Type: history.ExecutionCompleted})
 	// i2's request (no wait), prepared.
-	t2 := wakeTask(t, s, h, "i2")
+	t2 := wakeTaskFor(t, s, lease(h), "i2")
 	c2 := &store.Completion{Consumed: pendingIDs(t2), Locks: []store.LockRequest{{ScheduleID: 5, Key: "k", TTL: waitTTL(h)}}}
 	for _, p := range t2.Pending {
 		seq.add(c2, "i2", p.Event)
@@ -69,7 +69,7 @@ func testLockWaiterRace(t *testing.T, h Harness) {
 	time.Sleep(300 * time.Millisecond) // i2's acquireLock waits for k's row (pg; the memory store runs one call at a time)
 	close(release)
 	wg.Wait()
-	for _, task := range claim(t, s, owner, h.TTL) {
+	for _, task := range claim(t, s, owner, lease(h)) {
 		for _, p := range task.Pending {
 			t.Logf("%s: %v %s err=%q", task.Execution.InstanceID, p.Event.Type, p.Event.Name, p.Event.Err)
 			if task.Execution.InstanceID == "i2" && p.Event.Type == history.LockAcquired {

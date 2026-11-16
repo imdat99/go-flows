@@ -24,10 +24,13 @@ import (
 // PollMax) is claimed when it falls due: the commit notifies, the claim
 // that follows tells when the work falls due.
 func TestDelayedWorkOfAnotherWorkerIsOnTime(t *testing.T) {
+	// A's timed polls are pollMax apart: work found by them comes about
+	// pollMax late (A has just polled), far above limit, which leaves
+	// seconds of slack to a loaded machine.
 	const (
 		delay   = 300 * time.Millisecond
-		pollMax = 3 * time.Second
-		limit   = 1500 * time.Millisecond // well under pollMax
+		pollMax = 20 * time.Second
+		limit   = 5 * time.Second // well under pollMax
 	)
 	pool := testdb.New(t)
 	ctx := context.Background()
@@ -44,7 +47,7 @@ func TestDelayedWorkOfAnotherWorkerIsOnTime(t *testing.T) {
 	}
 	gate := make(chan struct{}) // B's first activity waits for it
 	register := func(isB bool) *registry { return delayedRegistry(isB, delay, gate, mark) }
-	newWorker := func(owner string, reg *registry, pollMin, pollMax time.Duration) *worker.Worker {
+	newWorker := func(owner string, st store.Store, reg *registry, pollMin, pollMax time.Duration) *worker.Worker {
 		w, err := worker.New(st, reg, reg, worker.Options{
 			Owner: owner, Queues: []string{q}, Eager: true, LeaseTTL: max(5*time.Second, 3*pollMax), // PollMax <= LeaseTTL/3
 			PollMin: pollMin, PollMax: pollMax,
@@ -66,24 +69,18 @@ func TestDelayedWorkOfAnotherWorkerIsOnTime(t *testing.T) {
 		t.Fatalf("claim handed: %v %v", tasks, err)
 	}
 	handed := tasks[0]
-	b := newWorker("b", register(true), 10*time.Millisecond, 50*time.Millisecond)
+	b := newWorker("b", st, register(true), 10*time.Millisecond, 50*time.Millisecond)
 	for _, wf := range []string{"sleep", "retry"} {
 		create(t, st, wf, wf, "")
 	}
-	waitUntil(t, func() bool {
-		n := 0
-		for _, id := range []string{"sleep", "retry"} {
-			if e, err := st.GetExecution(ctx, id); err == nil && e.Status == store.StatusRunning {
-				n++
-			}
-		}
-		return n == 2
-	})
-	time.Sleep(100 * time.Millisecond) // B holds both (their gate activities run)
-	// A starts now (nothing claimable, nothing due) and backs off.
-	a := newWorker("a", register(false), pollMax, pollMax)
+	// B holds both: their gate activities run.
+	waitUntil(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(marks["gate"]) == 2 })
+	// A starts now (nothing claimable, nothing due) and backs off: once
+	// it has claimed both kinds of task, it sleeps until pollMax.
+	stA := &claimCounts{Store: st}
+	a := newWorker("a", stA, register(false), pollMax, pollMax)
 	t.Cleanup(func() { _ = a.Stop(ctx) })
-	time.Sleep(1200 * time.Millisecond)
+	waitUntil(t, func() bool { return stA.wf.Load() >= 1 && stA.act.Load() >= 1 })
 	// While A is idle: B commits the timer and the retry delay, then stops;
 	// the third owner hands "handed" back for delay.
 	close(gate)
@@ -115,52 +112,110 @@ func TestDelayedWorkOfAnotherWorkerIsOnTime(t *testing.T) {
 	}
 }
 
-// countActClaims counts activity claims on a Postgres store.
+// claimCounts counts the claims of each kind on a Postgres store.
+type claimCounts struct {
+	*pg.Store
+	wf, act atomic.Int32
+}
+
+func (c *claimCounts) ClaimWorkflowTasksDue(ctx context.Context, owner string, queues []string, n int, ttl time.Duration) ([]store.WorkflowTask, time.Duration, error) {
+	tasks, next, err := c.Store.ClaimWorkflowTasksDue(ctx, owner, queues, n, ttl)
+	c.wf.Add(1)
+	return tasks, next, err
+}
+
+func (c *claimCounts) ClaimActivityTasksDue(ctx context.Context, owner string, queues []string, n int, ttl time.Duration) ([]store.ActivityTask, time.Duration, error) {
+	tasks, next, err := c.Store.ClaimActivityTasksDue(ctx, owner, queues, n, ttl)
+	c.act.Add(1)
+	return tasks, next, err
+}
+
+// countActClaims counts activity claims on a Postgres store, and the
+// tasks they returned.
 type countActClaims struct {
 	*pg.Store
-	n atomic.Int32
+	n, got atomic.Int32
 }
 
 func (c *countActClaims) ClaimActivityTasksDue(ctx context.Context, owner string, queues []string, n int, ttl time.Duration) ([]store.ActivityTask, time.Duration, error) {
 	c.n.Add(1)
-	return c.Store.ClaimActivityTasksDue(ctx, owner, queues, n, ttl)
+	tasks, next, err := c.Store.ClaimActivityTasksDue(ctx, owner, queues, n, ttl)
+	c.got.Add(int32(len(tasks)))
+	return tasks, next, err
 }
 
 // T9.1 review: running activities' lease expiries (their visible_at,
 // pushed by heartbeats) are not due times: an idle worker does not wake for
 // them.
 func TestRunningActivitiesAreNotDue(t *testing.T) {
+	// B's heartbeat (every third of its lease TTL) must keep its leases;
+	// when it did not (a loaded machine: A claimed a task whose lease
+	// lapsed, a real due time), the run proves nothing and runs again
+	// with a longer TTL.
+	for ttl := time.Second; !runningActivitiesAreNotDue(t, ttl); ttl *= 2 {
+		if ttl >= 8*time.Second {
+			t.Fatalf("B's leases lapsed with a TTL of %v", ttl)
+		}
+		t.Logf("a lease of B lapsed with a TTL of %v; again with %v", ttl, 2*ttl)
+	}
+}
+
+// runningActivitiesAreNotDue runs TestRunningActivitiesAreNotDue with B's
+// lease TTL; false: a lease of B lapsed.
+func runningActivitiesAreNotDue(t *testing.T, ttl time.Duration) bool {
+	t.Helper()
 	pool := testdb.New(t)
 	ctx := context.Background()
 	if err := pg.Migrate(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
 	release := make(chan struct{})
-	reg := newRegistry()
-	reg.addActivity("long", &worker.Activity{Run: func(ctx context.Context, _ *store.ActivityTask) ([]byte, []byte, error) {
+	var running atomic.Int32
+	regB := newRegistry()
+	regB.addActivity("long", &worker.Activity{Run: func(ctx context.Context, _ *store.ActivityTask) ([]byte, []byte, error) {
+		running.Add(1)
 		select {
 		case <-release:
 		case <-ctx.Done():
 		}
 		return nil, nil, nil
 	}})
-	reg.addWorkflow("w", func(ctx coro.Context, _ []byte) ([]byte, error) { return activity(ctx, "long", nil) })
-	b, err := worker.New(pg.New(pool), reg, reg, worker.Options{Owner: "b", Queues: []string{q}, Eager: true, LeaseTTL: time.Second})
+	wf := func(ctx coro.Context, _ []byte) ([]byte, error) { return activity(ctx, "long", nil) }
+	regB.addWorkflow("w", wf)
+	// A runs a task it claims (a lapsed lease of B) at once: nothing of A
+	// waits for release.
+	regA := newRegistry()
+	regA.addActivity("long", &worker.Activity{Run: func(context.Context, *store.ActivityTask) ([]byte, []byte, error) {
+		return nil, nil, nil
+	}})
+	regA.addWorkflow("w", wf)
+	var a, b *worker.Worker
+	// release first: B's stop waits for its activities.
+	defer func() {
+		close(release)
+		for _, w := range []*worker.Worker{a, b} {
+			if w != nil {
+				_ = w.Stop(ctx)
+			}
+		}
+	}()
+	b, err := worker.New(pg.New(pool), regB, regB, worker.Options{Owner: "b", Queues: []string{q}, Eager: true, LeaseTTL: ttl})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := b.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { close(release); _ = b.Stop(ctx) }()
 	for i := range 5 {
 		create(t, pg.New(pool), "w"+string(rune('0'+i)), "w", "")
 	}
-	time.Sleep(500 * time.Millisecond) // B runs all five (heartbeats every ~330 ms)
+	waitUntil(t, func() bool { return running.Load() == 5 }) // B runs all five
+	// A's timed polls are far apart (20 TTLs); B's heartbeats move the
+	// lease expiries every third of a TTL.
 	st := &countActClaims{Store: pg.New(pool)}
-	a, err := worker.New(st, reg, reg, worker.Options{
-		Owner: "a", Queues: []string{q}, LeaseTTL: 10 * time.Second, // PollMax <= LeaseTTL/3
-		PollMin: 3 * time.Second, PollMax: 3 * time.Second,
+	a, err = worker.New(st, regA, regA, worker.Options{
+		Owner: "a", Queues: []string{q}, LeaseTTL: 60 * ttl, // PollMax <= LeaseTTL/3
+		PollMin: 20 * ttl, PollMax: 20 * ttl,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -168,13 +223,17 @@ func TestRunningActivitiesAreNotDue(t *testing.T) {
 	if err := a.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = a.Stop(ctx) }()
-	time.Sleep(4 * time.Second)
-	// The claims on start and at the first timed poll (3 s): a wake-up per
-	// lease expiry (~1 s) would make 4 or more.
-	if n := st.n.Load(); n > 3 {
-		t.Fatalf("%d activity claims in 4 s", n)
+	window := 6 * ttl
+	time.Sleep(window)
+	if st.got.Load() > 0 {
+		return false
 	}
+	// The claim on start (and slack for one more): a wake-up per lease
+	// expiry (at most a TTL apart) would make 7 or more.
+	if n := st.n.Load(); n > 3 {
+		t.Fatalf("%d activity claims in %v (B's lease TTL %v)", n, window, ttl)
+	}
+	return true
 }
 
 // delayedRegistry registers the workflows of
@@ -184,6 +243,7 @@ func delayedRegistry(isB bool, delay time.Duration, gate chan struct{}, mark fun
 	reg := newRegistry()
 	reg.addActivity("gate", &worker.Activity{Run: func(context.Context, *store.ActivityTask) ([]byte, []byte, error) {
 		if isB {
+			mark("gate")
 			<-gate
 		}
 		return nil, nil, nil

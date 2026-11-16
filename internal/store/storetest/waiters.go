@@ -29,11 +29,35 @@ func (seq lockSeq) queueForTTL(t *testing.T, s store.Store, h Harness, id string
 	return ev
 }
 
+// queueForAll is queueForTTL that does not fail when the claim after the
+// request finds other executions ready too: it returns them (claimed, not
+// consumed), for a realTime case to check against its TTL.
+func (seq lockSeq) queueForAll(t *testing.T, s store.Store, h Harness, id string, sched int32, key string, retry, wake, ttl time.Duration) (history.Event, []store.WorkflowTask) {
+	t.Helper()
+	ev, task, others := seq.askAll(t, s, h, id, sched, key, retry, wake, ttl)
+	seq.answer(t, s, task, sched, ev)
+	return ev, others
+}
+
 // ask is the first half of queueFor: the request (and its timer), and the
 // claimed task with the answer, not consumed yet.
 func (seq lockSeq) ask(t *testing.T, s store.Store, h Harness, id string, sched int32, key string, retry, wake, ttl time.Duration) (history.Event, store.WorkflowTask) {
 	t.Helper()
-	task := wakeTask(t, s, h, id)
+	ev, task, others := seq.askAll(t, s, h, id, sched, key, retry, wake, ttl)
+	if len(others) > 0 {
+		for _, x := range others {
+			t.Logf("claimed %s: %+v", x.Execution.InstanceID, x.Pending)
+		}
+		t.Fatalf("claimed %d tasks, want 1", len(others)+1)
+	}
+	return ev, task
+}
+
+// askAll is ask returning the tasks of other executions claimed with the
+// answer (not consumed).
+func (seq lockSeq) askAll(t *testing.T, s store.Store, h Harness, id string, sched int32, key string, retry, wake, ttl time.Duration) (history.Event, store.WorkflowTask, []store.WorkflowTask) {
+	t.Helper()
+	task := wakeTaskFor(t, s, lease(h), id)
 	c := &store.Completion{
 		Consumed: pendingIDs(task),
 		Locks:    []store.LockRequest{{ScheduleID: sched, Key: key, TTL: ttl, Wait: retry > 0, WaitRetry: retry}},
@@ -54,9 +78,17 @@ func (seq lockSeq) ask(t *testing.T, s store.Store, h Harness, id string, sched 
 	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, c); err != nil {
 		t.Fatal(err)
 	}
-	next := claimOne(t, s, owner, h.TTL)
+	var next store.WorkflowTask
+	var others []store.WorkflowTask
+	for _, x := range claim(t, s, owner, lease(h)) {
+		if x.Execution.InstanceID == id {
+			next = x
+		} else {
+			others = append(others, x)
+		}
+	}
 	if next.Execution.InstanceID != id {
-		t.Fatalf("claimed %s, want %s", next.Execution.InstanceID, id)
+		t.Fatalf("%s not claimed after its request (%d others)", id, len(others))
 	}
 	var answer history.Event
 	for _, p := range next.Pending {
@@ -64,7 +96,7 @@ func (seq lockSeq) ask(t *testing.T, s store.Store, h Harness, id string, sched 
 			answer = p.Event
 		}
 	}
-	return answer, next
+	return answer, next, others
 }
 
 // answer consumes task's events; a granted waiting request's timer
@@ -94,7 +126,7 @@ func (seq lockSeq) add(c *store.Completion, id string, ev history.Event) {
 // end completes the execution id.
 func (seq lockSeq) end(t *testing.T, s store.Store, h Harness, id string) {
 	t.Helper()
-	task := wakeTask(t, s, h, id)
+	task := wakeTaskFor(t, s, lease(h), id)
 	c := &store.Completion{Consumed: pendingIDs(task), Status: store.StatusCompleted}
 	for _, p := range task.Pending {
 		seq[id]++
@@ -118,7 +150,7 @@ func testLockWaitersFIFO(t *testing.T, h Harness) {
 	ids := []string{"i0", "i1", "i2", "i3", "i4"}
 	for _, id := range ids {
 		mustCreate(t, s, id)
-		seq.consume(t, s, claimOne(t, s, owner, h.TTL))
+		seq.consume(t, s, claimOne(t, s, owner, lease(h)))
 	}
 	if ev := seq.queueFor(t, s, h, "i0", 1, "k", 0, 0); ev.Type != history.LockAcquired {
 		t.Fatalf("free lock: %+v", ev)
@@ -135,7 +167,7 @@ func testLockWaitersFIFO(t *testing.T, h Harness) {
 	for _, next := range []string{"i1", "i2", "i3"} {
 		holder := map[string]string{"i1": "i0", "i2": "i1", "i3": "i2"}[next]
 		seq.end(t, s, h, holder) // releases k: next's lock-wait timer fires now
-		task := claimOne(t, s, owner, h.TTL)
+		task := claimOne(t, s, owner, lease(h))
 		if task.Execution.InstanceID != next || len(task.Pending) == 0 {
 			t.Fatalf("after %s ended: %+v", holder, task)
 		}
@@ -167,37 +199,59 @@ func testLockWaitersFIFO(t *testing.T, h Harness) {
 // loses its turn once its next attempt is overdue by the lock's TTL; one
 // asking without Wait leaves the queue.
 func testLockWaiterExpires(t *testing.T, h Harness) {
-	s := h.New(t)
-	seq := lockSeq{}
-	for _, id := range []string{"i0", "i1", "i2", "i3"} {
-		mustCreate(t, s, id)
-		seq.consume(t, s, claimOne(t, s, owner, h.TTL))
-	}
-	if ev := seq.queueForTTL(t, s, h, "i0", 1, "k", 0, 0, h.TTL); ev.Type != history.LockAcquired {
-		t.Fatalf("free lock: %+v", ev)
-	}
-	if ev := seq.queueForTTL(t, s, h, "i1", 1, "k", time.Millisecond, time.Hour, h.TTL); ev.Type != history.LockHeld {
-		t.Fatalf("i1: %+v", ev)
-	}
-	if ev := seq.queueFor(t, s, h, "i2", 1, "k", time.Hour, time.Hour); ev.Type != history.LockHeld {
-		t.Fatalf("i2: %+v", ev)
-	}
-	// i2 gives up (its last attempt does not wait): it leaves the queue.
-	if ev := seq.queueFor(t, s, h, "i2", 2, "k", 0, 0); ev.Type != history.LockHeld {
-		t.Fatalf("i2 last: %+v", ev)
-	}
-	seq.end(t, s, h, "i0")
-	// i1 is woken, but its worker dies with its task (a long lease).
-	if dead := claimOne(t, s, "dead", 100*h.TTL); dead.Execution.InstanceID != "i1" {
-		t.Fatalf("woken: %s", dead.Execution.InstanceID)
-	}
-	if ev := seq.queueFor(t, s, h, "i3", 1, "k", 0, 0); ev.Type != history.LockHeld || ev.Err != "i1" {
-		t.Fatalf("i1's turn: %+v", ev)
-	}
-	h.Advance(t, s, h.TTL+h.TTL/2) // i1 never came back
-	if ev := seq.queueFor(t, s, h, "i3", 2, "k", 0, 0); ev.Type != history.LockAcquired {
-		t.Fatalf("after i1's turn lapsed: %+v", ev)
-	}
+	// i0's lock and i1's wait must last (h.TTL) until i0 ends, then i1's
+	// turn (i0's lock's TTL) must last while i3 asks, and lapse after.
+	realTime(t, h, func(h Harness) bool {
+		s := h.New(t)
+		seq := lockSeq{}
+		for _, id := range []string{"i0", "i1", "i2", "i3"} {
+			mustCreate(t, s, id)
+			seq.consume(t, s, claimOne(t, s, owner, lease(h)))
+		}
+		inTime := within(t, s, h.TTL)
+		if ev := seq.queueForTTL(t, s, h, "i0", 1, "k", 0, 0, h.TTL); ev.Type != history.LockAcquired {
+			t.Fatalf("free lock: %+v", ev)
+		}
+		if ev, others := seq.queueForAll(t, s, h, "i1", 1, "k", time.Millisecond, time.Hour, h.TTL); ev.Type != history.LockHeld || len(others) > 0 {
+			if !inTime() {
+				return false
+			}
+			t.Fatalf("i1: %+v, %d others", ev, len(others))
+		}
+		if ev, others := seq.queueForAll(t, s, h, "i2", 1, "k", time.Hour, time.Hour, waitTTL(h)); ev.Type != history.LockHeld || len(others) > 0 {
+			if !inTime() {
+				return false
+			}
+			t.Fatalf("i2: %+v, %d others", ev, len(others))
+		}
+		// i2 gives up (its last attempt does not wait): it leaves the queue.
+		if ev, others := seq.queueForAll(t, s, h, "i2", 2, "k", 0, 0, waitTTL(h)); ev.Type != history.LockHeld || len(others) > 0 {
+			if !inTime() {
+				return false
+			}
+			t.Fatalf("i2 last: %+v, %d others", ev, len(others))
+		}
+		seq.end(t, s, h, "i0")
+		// i1 is woken, but its worker dies with its task (a long lease).
+		if dead := claim(t, s, "dead", 100*h.TTL); len(dead) != 1 || dead[0].Execution.InstanceID != "i1" {
+			if !inTime() {
+				return false
+			}
+			t.Fatalf("woken: %d tasks, want i1's", len(dead))
+		}
+		// i1's turn began after inTime's start: it lasts while inTime holds.
+		if ev := seq.queueFor(t, s, h, "i3", 1, "k", 0, 0); ev.Type != history.LockHeld || ev.Err != "i1" {
+			if !inTime() {
+				return false
+			}
+			t.Fatalf("i1's turn: %+v", ev)
+		}
+		h.Advance(t, s, h.TTL+h.TTL/2) // i1 never came back
+		if ev := seq.queueFor(t, s, h, "i3", 2, "k", 0, 0); ev.Type != history.LockAcquired {
+			t.Fatalf("after i1's turn lapsed: %+v", ev)
+		}
+		return true
+	})
 }
 
 // T9.8 review: a waiter whose wait ended without the lock (its context
@@ -208,7 +262,7 @@ func testLockWaiterEdges(t *testing.T, h Harness) {
 	seq := lockSeq{}
 	for _, id := range []string{"i0", "i1", "i2", "i3"} {
 		mustCreate(t, s, id)
-		seq.consume(t, s, claimOne(t, s, owner, h.TTL))
+		seq.consume(t, s, claimOne(t, s, owner, lease(h)))
 	}
 	if ev := seq.queueFor(t, s, h, "i0", 1, "k", 0, 0); ev.Type != history.LockAcquired {
 		t.Fatalf("free lock: %+v", ev)
@@ -217,7 +271,7 @@ func testLockWaiterEdges(t *testing.T, h Harness) {
 		t.Fatalf("i1: %+v", ev)
 	}
 	// i1's wait is canceled: its timer goes.
-	task := wakeTask(t, s, h, "i1")
+	task := wakeTaskFor(t, s, lease(h), "i1")
 	c := &store.Completion{Consumed: pendingIDs(task), CanceledTimers: []int32{1001}}
 	for _, p := range task.Pending {
 		seq.add(c, "i1", p.Event)
@@ -235,7 +289,7 @@ func testLockWaiterEdges(t *testing.T, h Harness) {
 	if err := s.ReleaseWorkflowTask(ctx, task.Lease, 0); err != nil {
 		t.Fatal(err)
 	}
-	got := claim(t, s, owner, h.TTL)
+	got := claim(t, s, owner, lease(h))
 	if len(got) != 1 || got[0].Execution.InstanceID != "i2" {
 		for _, g := range got {
 			t.Logf("%s: %+v", g.Execution.InstanceID, g.Pending)
@@ -264,26 +318,34 @@ func testLockWaiterEdges(t *testing.T, h Harness) {
 // A lapsed lock (not released) wakes nobody and is anyone's: only a
 // release gives a waiter its turn.
 func testLockWaiterLapsed(t *testing.T, h Harness) {
-	s := h.New(t)
-	seq := lockSeq{}
-	for _, id := range []string{"i0", "i1", "i2"} {
-		mustCreate(t, s, id)
-		seq.consume(t, s, claimOne(t, s, owner, h.TTL))
-	}
-	if ev := seq.queueForTTL(t, s, h, "i0", 1, "k", 0, 0, h.TTL); ev.Type != history.LockAcquired {
-		t.Fatalf("free lock: %+v", ev)
-	}
-	if ev := seq.queueFor(t, s, h, "i1", 1, "k", time.Hour, time.Hour); ev.Type != history.LockHeld || ev.Err != "i0" {
-		t.Fatalf("i1: %+v", ev)
-	}
-	h.Advance(t, s, h.TTL+h.TTL/2) // i0 idles: k lapses
-	ev, others := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 1, "k")
-	if ev.Type != history.LockAcquired {
-		t.Fatalf("lapsed: %+v", ev)
-	}
-	if len(others) != 1 || others[0].Execution.InstanceID != "i0" || others[0].Pending[0].Event.Type != history.LockLost {
-		t.Fatalf("i0 not told: %+v", others)
-	}
+	// i0's lock must last (h.TTL) until i1 is refused, then lapse.
+	realTime(t, h, func(h Harness) bool {
+		s := h.New(t)
+		seq := lockSeq{}
+		for _, id := range []string{"i0", "i1", "i2"} {
+			mustCreate(t, s, id)
+			seq.consume(t, s, claimOne(t, s, owner, lease(h)))
+		}
+		inTime := within(t, s, h.TTL)
+		if ev := seq.queueForTTL(t, s, h, "i0", 1, "k", 0, 0, h.TTL); ev.Type != history.LockAcquired {
+			t.Fatalf("free lock: %+v", ev)
+		}
+		if ev, others := seq.queueForAll(t, s, h, "i1", 1, "k", time.Hour, time.Hour, waitTTL(h)); ev.Type != history.LockHeld || ev.Err != "i0" || len(others) > 0 {
+			if !inTime() {
+				return false
+			}
+			t.Fatalf("i1: %+v, %d others", ev, len(others))
+		}
+		h.Advance(t, s, h.TTL+h.TTL/2) // i0 idles: k lapses
+		ev, others := seq.requestLock(t, s, h, wakeTaskFor(t, s, lease(h), "i2"), 1, "k")
+		if ev.Type != history.LockAcquired {
+			t.Fatalf("lapsed: %+v", ev)
+		}
+		if len(others) != 1 || others[0].Execution.InstanceID != "i0" || others[0].Pending[0].Event.Type != history.LockLost {
+			t.Fatalf("i0 not told: %+v", others)
+		}
+		return true
+	})
 }
 
 // T9.8 review: the woken waiter's last attempt (no Wait, no new timer, in
@@ -293,7 +355,7 @@ func testLockWaiterLastAttempt(t *testing.T, h Harness) {
 	seq := lockSeq{}
 	for _, id := range []string{"i0", "i1", "i2"} {
 		mustCreate(t, s, id)
-		seq.consume(t, s, claimOne(t, s, owner, h.TTL))
+		seq.consume(t, s, claimOne(t, s, owner, lease(h)))
 	}
 	if ev := seq.queueFor(t, s, h, "i0", 1, "k", 0, 0); ev.Type != history.LockAcquired {
 		t.Fatalf("free lock: %+v", ev)
@@ -316,7 +378,7 @@ func testLockWaiterHeadTerminated(t *testing.T, h Harness) {
 	seq := lockSeq{}
 	for _, id := range []string{"i0", "i1", "i2", "i3"} {
 		mustCreate(t, s, id)
-		seq.consume(t, s, claimOne(t, s, owner, h.TTL))
+		seq.consume(t, s, claimOne(t, s, owner, lease(h)))
 	}
 	if ev := seq.queueFor(t, s, h, "i0", 1, "k", 0, 0); ev.Type != history.LockAcquired {
 		t.Fatalf("free lock: %+v", ev)

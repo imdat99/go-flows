@@ -16,23 +16,26 @@ import (
 func TestNoLostWakeWhileReleasing(t *testing.T) {
 	for _, release := range []struct {
 		name string
-		do   func(s *storeT, task store.WorkflowTask) error
+		do   func(ctx context.Context, s *storeT, task store.WorkflowTask) error
 	}{
-		{"ReleaseWorkflowTask", func(s *storeT, task store.WorkflowTask) error {
-			return s.ReleaseWorkflowTask(context.Background(), task.Lease, 0)
+		{"ReleaseWorkflowTask", func(ctx context.Context, s *storeT, task store.WorkflowTask) error {
+			return s.ReleaseWorkflowTask(ctx, task.Lease, 0)
 		}},
-		{"CompleteWorkflowTask", func(s *storeT, task store.WorkflowTask) error {
-			_, err := s.CompleteWorkflowTask(context.Background(), task.Lease, &store.Completion{})
+		{"CompleteWorkflowTask", func(ctx context.Context, s *storeT, task store.WorkflowTask) error {
+			_, err := s.CompleteWorkflowTask(ctx, task.Lease, &store.Completion{})
 			return err
 		}},
 	} {
 		t.Run(release.name, func(t *testing.T) {
 			s := newStore(t)
-			ctx := context.Background()
+			// Every wait is bounded: a stuck statement fails the test, it
+			// does not hang it.
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
 			if _, _, err := s.CreateExecution(ctx, store.NewExecution{InstanceID: "x", Workflow: "w", Queue: "q"}); err != nil {
 				t.Fatal(err)
 			}
-			tasks, err := s.ClaimWorkflowTasks(ctx, "o", []string{"q"}, 1, time.Minute)
+			tasks, err := s.ClaimWorkflowTasks(ctx, "o", []string{"q"}, 1, time.Hour)
 			if err != nil || len(tasks) != 1 {
 				t.Fatal(err)
 			}
@@ -40,8 +43,8 @@ func TestNoLostWakeWhileReleasing(t *testing.T) {
 			leases, err := s.CompleteWorkflowTask(ctx, task.Lease, &store.Completion{
 				History:    []history.Event{{Seq: 1, Type: history.ExecutionStarted}, {Seq: 2, Type: history.ActivityScheduled, ScheduleID: 1, Name: "a"}},
 				Consumed:   []int64{task.Pending[0].ID},
-				Activities: []store.NewActivityTask{{ScheduleID: 1, Name: "a", Queue: "q", ClaimFor: time.Minute}},
-				KeepFor:    time.Minute,
+				Activities: []store.NewActivityTask{{ScheduleID: 1, Name: "a", Queue: "q", ClaimFor: time.Hour}},
+				KeepFor:    time.Hour,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -51,18 +54,22 @@ func TestNoLostWakeWhileReleasing(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// A failure before the commit: z ends, so the pool can close.
+			defer func() { _ = z.Rollback(context.Background()) }()
 			if _, err := z.Exec(ctx, `SELECT 1 FROM flows.execution WHERE id = $1 FOR SHARE`, task.Lease.ID); err != nil {
 				t.Fatal(err)
 			}
 			done := make(chan error, 1)
-			go func() { done <- release.do(s, task) }()
-			time.Sleep(200 * time.Millisecond) // the release waits for z
+			go func() { done <- release.do(ctx, s, task) }()
+			waitLockWaiters(ctx, t, s, 1, nil) // the release waits for z
 			actDone := make(chan error, 1)
 			go func() {
 				_, err := s.CompleteActivityTask(ctx, leases[0], store.ActivityResult{Event: history.Event{Type: history.ActivityCompleted}})
 				actDone <- err
 			}()
-			time.Sleep(200 * time.Millisecond)
+			// The delivery waits too (for z or the release), unless it is
+			// through already.
+			waitLockWaiters(ctx, t, s, 2, actDone)
 			if err := z.Commit(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -77,5 +84,36 @@ func TestNoLostWakeWhileReleasing(t *testing.T) {
 				t.Fatalf("lost wake-up: claim %+v %v", got, err)
 			}
 		})
+	}
+}
+
+// waitLockWaiters waits until n sessions of the test database wait for a
+// lock, or (with through) until through has a value (put back for its
+// reader).
+func waitLockWaiters(ctx context.Context, t *testing.T, s *storeT, n int, through chan error) {
+	t.Helper()
+	for {
+		var waiting int
+		err := s.Pool().QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("waiting for %d lock waiters: %v", n, err)
+		}
+		if waiting >= n {
+			return
+		}
+		if through != nil {
+			select {
+			case err := <-through:
+				through <- err
+				return
+			default:
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("waiting for %d lock waiters: %v", n, ctx.Err())
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }

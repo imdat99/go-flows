@@ -24,8 +24,8 @@ import (
 func TestDelayedWorkIsNotPollMaxLate(t *testing.T) {
 	const (
 		delay   = 100 * time.Millisecond
-		pollMax = 3 * time.Second
-		limit   = time.Second // well under pollMax
+		pollMax = 20 * time.Second
+		limit   = 5 * time.Second // well under pollMax, slack for a loaded machine
 	)
 	stores := map[string]func(t *testing.T) store.Store{
 		"mem": func(*testing.T) store.Store { return mem.New(nil) },
@@ -77,7 +77,7 @@ func TestDelayedWorkIsNotPollMaxLate(t *testing.T) {
 			})
 			// PollMin = PollMax: every timed poll is pollMax apart.
 			w, err := worker.New(st, reg, reg, worker.Options{
-				Owner: "w1", Queues: []string{q}, Eager: true, LeaseTTL: 10 * time.Second, // PollMax <= LeaseTTL/3
+				Owner: "w1", Queues: []string{q}, Eager: true, LeaseTTL: 3 * pollMax, // PollMax <= LeaseTTL/3
 				PollMin: pollMax, PollMax: pollMax,
 			})
 			if err != nil {

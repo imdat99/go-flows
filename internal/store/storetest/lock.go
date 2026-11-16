@@ -16,10 +16,16 @@ type lockSeq map[string]int64
 // wakeTask makes instance id ready (a signal) and claims it.
 func wakeTask(t *testing.T, s store.Store, h Harness, id string) store.WorkflowTask {
 	t.Helper()
+	return wakeTaskFor(t, s, h.TTL, id)
+}
+
+// wakeTaskFor is wakeTask with the task's lease.
+func wakeTaskFor(t *testing.T, s store.Store, ttl time.Duration, id string) store.WorkflowTask {
+	t.Helper()
 	if err := s.Signal(ctx, id, "wake", nil); err != nil {
 		t.Fatal(err)
 	}
-	task := claimOne(t, s, owner, h.TTL)
+	task := claimOne(t, s, owner, ttl)
 	if task.Execution.InstanceID != id {
 		t.Fatalf("claimed %s, want %s", task.Execution.InstanceID, id)
 	}
@@ -145,29 +151,60 @@ func testLocks(t *testing.T, h Harness) {
 // A running execution keeps its locks: claims and lease renewals extend
 // them.
 func testLockRenewal(t *testing.T, h Harness) {
-	// Real sleeps on Postgres: twice the TTL, in steps leaving 45% of it
-	// as slack for a loaded machine (the three steps still outlast one TTL,
-	// so only the extensions keep the lock).
+	// Three advances of 55% of the TTL outlast it: only the extensions
+	// keep the lock. Each extension must come within a TTL of the one
+	// before (on Postgres the sleeps are real and steps can be slow).
 	h.TTL *= 2
-	s := h.New(t)
-	seq := lockSeq{}
-	for _, id := range []string{"i1", "i2"} {
-		mustCreate(t, s, id)
-		seq.consume(t, s, claimOne(t, s, owner, h.TTL))
-	}
-	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i1"), 1, "k"); ev.Type != history.LockAcquired {
-		t.Fatalf("free lock: %+v", ev)
-	}
-	h.Advance(t, s, h.TTL*55/100)
-	held := wakeTask(t, s, h, "i1") // the claim extends the lock
-	h.Advance(t, s, h.TTL*55/100)
-	if _, err := s.RenewLeases(ctx, owner, []store.Lease{held.Lease}, nil, h.TTL); err != nil {
-		t.Fatal(err)
-	}
-	h.Advance(t, s, h.TTL*55/100)
-	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 1, "k"); ev.Type != history.LockHeld {
-		t.Fatalf("lock of a running execution taken: %+v", ev)
-	}
+	realTime(t, h, func(h Harness) bool {
+		s := h.New(t)
+		seq := lockSeq{}
+		for _, id := range []string{"i1", "i2"} {
+			mustCreate(t, s, id)
+			seq.consume(t, s, claimOne(t, s, owner, h.TTL))
+		}
+		inTime := within(t, s, h.TTL) // the lock lasts a TTL from now
+		if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i1"), 1, "k"); ev.Type != history.LockAcquired {
+			t.Fatalf("free lock: %+v", ev)
+		}
+		h.Advance(t, s, h.TTL*55/100)
+		next := within(t, s, h.TTL)
+		held := wakeTask(t, s, h, "i1") // the claim extends the lock
+		if !inTime() {
+			return false
+		}
+		inTime = next
+		h.Advance(t, s, h.TTL*55/100)
+		next = within(t, s, h.TTL)
+		if _, err := s.RenewLeases(ctx, owner, []store.Lease{held.Lease}, nil, h.TTL); err != nil {
+			if !inTime() {
+				return false
+			}
+			t.Fatal(err)
+		}
+		if !inTime() {
+			return false
+		}
+		inTime = next
+		h.Advance(t, s, h.TTL*55/100)
+		if err := s.Signal(ctx, "i2", "wake", nil); err != nil {
+			t.Fatal(err)
+		}
+		// Only i2 is ready while held's lease lasts.
+		tasks := claim(t, s, owner, h.TTL)
+		if len(tasks) != 1 || tasks[0].Execution.InstanceID != "i2" {
+			if !inTime() {
+				return false
+			}
+			t.Fatalf("claimed %d tasks, want i2's", len(tasks))
+		}
+		if ev, _ := seq.requestLock(t, s, h, tasks[0], 1, "k"); ev.Type != history.LockHeld {
+			if !inTime() {
+				return false
+			}
+			t.Fatalf("lock of a running execution taken: %+v", ev)
+		}
+		return true
+	})
 }
 
 // Locks in a completion that ends the execution, or without a TTL, are

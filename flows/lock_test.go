@@ -116,7 +116,10 @@ func TestLockWait(t *testing.T) {
 // A lock lapses while its holder sleeps; another execution takes it, and
 // the holder fails with ErrLockLost (and compensates) when it wakes.
 func TestLockLost(t *testing.T) {
-	e, err := newEngine(mem.New(nil), Options{InstanceID: "lost", PollMax: 20 * time.Millisecond, LeaseTTL: 200 * time.Millisecond})
+	// The store's clock moves only when the test says: the lock lapses
+	// while the holder sleeps, whatever the machine's speed.
+	clock := &mem.ManualClock{}
+	e, err := newEngine(mem.New(clock), Options{InstanceID: "lost", PollMax: 20 * time.Millisecond, LeaseTTL: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,13 +134,15 @@ func TestLockLost(t *testing.T) {
 	// Lock asks for 1s: the holder sleeps 3s, so its lock lapses.
 	a := startLock(t, e, "lost-a", lockIn{Key: "l", Sleep: 3 * time.Second})
 	waitFor(t, func() bool { return historyHas(e, "lost-a", "TimerScheduled") })
-	waitFor(t, func() bool {
-		ex, _ := e.st.GetExecution(bg, "lost-b")
-		if ex.ID == 0 {
-			_ = startLock(t, e, "lost-b", lockIn{Key: "l", Wait: true})
-		}
-		return historyHas(e, "lost-b", "LockAcquired")
-	})
+	clock.Advance(1500 * time.Millisecond) // the lock lapsed, the holder sleeps on
+	b := startLock(t, e, "lost-b", lockIn{Key: "l", Wait: true})
+	if out, err := b.Wait(waitCtx(t)); err != nil || out != "locked l" {
+		t.Fatalf("taker: %q %v", out, err)
+	}
+	if !historyHas(e, "lost-b", "LockAcquired") || historyHas(e, "lost-b", "LockHeld") {
+		t.Fatal("the lapsed lock was not taken at once")
+	}
+	clock.Advance(2 * time.Second) // the holder wakes
 	_, err = a.Wait(waitCtx(t))
 	if !errors.Is(err, ErrLockLost) || !errors.Is(err, ErrCompensated) {
 		t.Fatalf("holder: %v", err)

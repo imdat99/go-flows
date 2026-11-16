@@ -487,19 +487,27 @@ func testKeepHoldsLease(t *testing.T, h Harness) {
 }
 
 func testReleaseWithDelay(t *testing.T, h Harness) {
-	s := h.New(t)
-	mustCreate(t, s, "i1")
-	task := claimOne(t, s, owner, h.TTL)
-	if err := s.ReleaseWorkflowTask(ctx, task.Lease, h.TTL); err != nil {
-		t.Fatal(err)
-	}
-	if got := claim(t, s, other, h.TTL); len(got) != 0 {
-		t.Fatal("claimed during the release delay")
-	}
-	h.Advance(t, s, h.TTL+h.TTL/2)
-	if got := claimOne(t, s, other, h.TTL); len(got.Pending) != 1 {
-		t.Fatalf("pending after release: %v", pendingTypes(got))
-	}
+	// The delay (h.TTL) must last until the claim that follows the release.
+	realTime(t, h, func(h Harness) bool {
+		s := h.New(t)
+		mustCreate(t, s, "i1")
+		task := claimOne(t, s, owner, lease(h))
+		inTime := within(t, s, h.TTL)
+		if err := s.ReleaseWorkflowTask(ctx, task.Lease, h.TTL); err != nil {
+			t.Fatal(err)
+		}
+		if got := claim(t, s, other, h.TTL); len(got) != 0 {
+			if !inTime() {
+				return false
+			}
+			t.Fatal("claimed during the release delay")
+		}
+		h.Advance(t, s, h.TTL+h.TTL/2)
+		if got := claimOne(t, s, other, h.TTL); len(got.Pending) != 1 {
+			t.Fatalf("pending after release: %v", pendingTypes(got))
+		}
+		return true
+	})
 }
 
 func testSticky(t *testing.T, h Harness) {
