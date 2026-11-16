@@ -14,6 +14,7 @@ import (
 // Statement names of the fast path (prepared once per connection).
 var (
 	nFence           = stmtName(fence)
+	nLockParent      = stmtName(lockParent)
 	nNoUndelivered   = stmtName(noUndelivered)
 	nInsertHistory   = stmtName(insertHistory)
 	nDeletePending   = stmtName(deletePending)
@@ -30,6 +31,7 @@ var (
 	nCarryPending    = stmtName(carryPending)
 	nCarrySignals    = stmtName(carrySignals)
 	nDropEnded       = stmtName(dropEnded)
+	nDropLocks       = stmtName(dropLocks)
 	nCancelChildOf   = stmtName(cancelChildrenOf)
 	nNotifyParent    = stmtName(notifyParent)
 	nWakeForTask     = stmtName(wakeForTask)
@@ -94,6 +96,9 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 	fb := s.getFastBatch(ctx, pc.Conn())
 	defer fb.release()
 
+	if terminal {
+		fb.stmt(lockParent, nLockParent, func() { fb.Int(l.ID) }) // T9.5: parent row first
+	}
 	fb.stmt(fence, nFence, func() {
 		fb.Int(l.ID)
 		fb.Str(l.Owner)
@@ -290,10 +295,12 @@ func (s *Store) endFast(fb *fastBatch, l store.Lease, c *store.Completion, endin
 		}
 		fb.stmt(carryPending, nCarryPending, func() { fb.Int(l.ID) })
 	}
-	fb.stmt(dropEnded, nDropEnded, func() { fb.Int(l.ID) })
+	// Children's rows, then task rows, then lock rows (lockParent).
 	if c.Status != store.StatusContinued {
 		fb.stmt(cancelChildrenOf, nCancelChildOf, func() { fb.Int(l.ID) })
 	}
+	fb.stmt(dropEnded, nDropEnded, func() { fb.Int(l.ID) })
+	fb.stmt(dropLocks, nDropLocks, func() { fb.Int(l.ID) })
 	if c.Status != store.StatusContinued {
 		ev := store.ChildOutcome(store.Execution{Status: c.Status, Output: c.Output, Err: c.Err, ErrKinds: c.ErrKinds})
 		fb.stmt(notifyParent, nNotifyParent, func() {

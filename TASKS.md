@@ -437,7 +437,7 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
     - **Còn mở:**
       - Mục tiêu ≤ 80 alloc (thiết kế lại SQL của store).
       - ~~Đếm stuck theo từng worker: với N engine có thể tới N+1 lần thử, mỗi lần để lại goroutine.~~ Đã sửa ở T9.3.
-      - Chu trình deadlock hiếm (child kết thúc ↔ cha lấy lock), được Postgres phát hiện và retry.
+      - ~~Chu trình deadlock hiếm (child kết thúc ↔ cha lấy lock), được Postgres phát hiện và retry.~~ Đã sửa ở T9.5.
       - Comment của migration `00005` sai (đã áp dụng nên không sửa).
       - Thỉnh thoảng có một run benchmark mất khoảng 1.5 s (có từ trước).
       - Claim lock dư tới `$3` dòng mỗi queue trong lúc chạy câu lệnh.
@@ -507,7 +507,13 @@ Các mục được rút ra từ phần "Còn mở" của T8.x, xếp theo thứ
     - Bench gate đạt: ActivityRun 76.5 allocs/op, Public 140.5, Replay 30.
     - Review 1 lần: đạt (sửa thêm tài liệu concepts/operations vi+en, kiểm tra `Hold < 0`).
     - Còn mở: kết quả activity đã xong nhưng workflow task còn chờ trong queue lâu hơn `ttl` thì lock vẫn hết hạn (không tính `pending_event`); khi nâng cấp cuốn chiếu, binary cũ lấy lại lock không ghi `hold_us`.
-- [ ] **T9.5** Bỏ chu trình deadlock giữa child kết thúc (`dropEnded`, `notifyParent`) và cha lấy lock (`acquireLock`): sắp lại thứ tự khoá, hoặc dùng `SKIP LOCKED` rồi thử lại. Test tái hiện tranh chấp (pg).
+- [x] **T9.5** Bỏ chu trình deadlock giữa child kết thúc (`dropEnded`, `notifyParent`) và cha lấy lock (`acquireLock`): sắp lại thứ tự khoá, hoặc dùng `SKIP LOCKED` rồi thử lại. Test tái hiện tranh chấp (pg).
+    - Một thứ tự khoá cho mọi transaction (doc của `lockParent`): execution row (tổ tiên trước con cháu), rồi activity task row, rồi lock row.
+    - Kết thúc (complete terminal, Terminate) khoá row của cha trước (`lockParent`, trước fence), rồi `cancelChildrenOf`, `dropEnded` (pending + task), `dropLocks` (lệnh riêng), `notifyParent`. Thêm 2 lệnh trong cùng pipeline, chỉ khi kết thúc: không thêm round trip, không thêm alloc (closure không escape).
+    - Test `TestEndsLockRowsInOrder` (pg; fast, pgx, hooked; complete và terminate): giữ row mà phía bên kia khoá trước, chờ end đứng chờ, kiểm tra bằng `NOWAIT` rằng end không giữ row phía kia cần. Đỏ ở HEAD với "child ends" và "parent ends"; "task" không đỏ ở HEAD (Postgres tình cờ xoá task trước) nhưng giữ thứ tự tường minh.
+    - Bench gate đạt: ActivityRun 74 allocs/op, Public 142, Eager 6.
+    - Review 2 lần (1 không đạt: còn chu trình ngược parent kết thúc ↔ child lấy lock; đã sửa bằng cách đổi thứ tự `cancelChildrenOf` trước `dropEnded`).
+    - Còn mở: `Unstick` cập nhật nhiều execution row theo thứ tự lưu trữ (rất hiếm, Postgres phát hiện, retry).
 - [ ] **T9.6** `Options.ListenDSN`: kết nối `LISTEN` riêng, đi thẳng tới Postgres khi pool chạy qua PgBouncer ở transaction mode. Test: engine với pool không có `LISTEN` vẫn nhận hint qua `ListenDSN`.
 - [ ] **T9.7** ⚡ Lấy lock trong 1 round trip: kết quả lock được trả về ngay trong completion, không cần resume riêng. Bench `BenchmarkEagerActivity` và một bench có lock.
 - [ ] **T9.8** Phục vụ waiter của lock theo thứ tự FIFO: bảng hàng đợi waiter; khi nhả lock thì đánh thức waiter đầu hàng thay vì để các bên poll bằng `LockWait`. Test: N waiter nhận lock đúng thứ tự.

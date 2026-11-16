@@ -147,13 +147,9 @@ func nonNil[T any](s []T) []T {
 // after a short randomized backoff. fn must be
 // all-or-nothing (one batch or one statement): a retry starts from scratch.
 //
-// Known deadlock: a parent cancelling a child (parent row, then child row:
-// a ChildCancels request, or cancelChildrenOf when the parent ends) while
-// that child ends and notifies the parent (child row, then parent row).
-// Postgres detects it after deadlock_timeout (1s by default) and the retry
-// succeeds. It costs latency on a cancel by tree whose child ends at the
-// same moment; avoiding it would need SKIP LOCKED on the child rows, which
-// risks a lost wake-up of a child completing concurrently.
+// The engine's statements lock rows in one order (lockParent); a rare
+// cycle left (Unstick updates several execution rows in storage order)
+// and the application's own transactions are covered by retry.
 func retry(ctx context.Context, fn func() error) error {
 	var err error
 	for attempt := range maxRetries {
@@ -758,6 +754,24 @@ func (s *Store) ResumeWorkflowTask(ctx context.Context, l store.Lease, ttl time.
 	return t, nil
 }
 
+// lockParent locks the parent row of execution $1 (none for a root), first
+// in a transaction ending $1 (T9.5). Transactions that wait for rows lock
+// them in one order: execution rows, an ancestor's before a descendant's
+// (a parent's completion: its row, then its children's in cancelChildren,
+// compensateChild, cancelChildrenOf); then activity task rows; then lock
+// rows (acquireLock, claims, dropLocks). An ending child locks its parent
+// here, its own row in the fence, and notifies the parent (notifyParent)
+// last. Exceptions that cannot close a cycle: a completion cancels its
+// activities (task rows) and takes locks before compensateChild and
+// cancelChildrenOf (no transaction holds a child's row while waiting for
+// its parent's task or lock rows); claims, renewals and acquireLock's
+// previous holder use SKIP LOCKED. parent_id never changes: reading it
+// unlocked is safe.
+const lockParent = `
+	SELECT 1 FROM flows.execution
+	WHERE id = (SELECT parent_id FROM flows.execution WHERE id = $1 AND parent_id <> 0)
+	FOR NO KEY UPDATE`
+
 // fence locks the execution row under lease ($1 id, $2 owner, $3 version)
 // and raises (see Store) when the lease is lost or when $5 (history is
 // appended) and last_seq differs from $4. random() keeps the failing expressions out of
@@ -1034,20 +1048,14 @@ const (
 		ORDER BY p.visible_at, p.id`
 	// dropEnded removes what an ended execution can no longer use: its
 	// pending events and its activity tasks, so their workers learn of the
-	// end at their next heartbeat (ErrLeaseLost) instead of running on, and
-	// its business locks. Lock order: activity completions lock the
-	// execution row before the task row (wakeForTask); claims lock
-	// execution or task rows, then wait for lock rows, taken in key order;
-	// a lock takeover (acquireLock) locks a lock row, then the previous
-	// holder's execution row with SKIP LOCKED. One cycle remains, rare and
-	// broken by Postgres' deadlock detection (retry runs the statement
-	// again): an ending child holding its lock row here, then locking its
-	// parent's row (notifyParent), against its parent's completion holding
-	// that row and waiting in acquireLock for the same key.
+	// end at their next heartbeat (ErrLeaseLost) instead of running on.
+	// dropLocks, a statement of its own after it, releases its business
+	// locks: task rows before lock rows, as activity claims lock them (see
+	// lockParent for the whole order).
 	dropEnded = `
-		WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = $1),
-		     k AS (DELETE FROM flows.lock WHERE execution_id = $1)
+		WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = $1)
 		DELETE FROM flows.activity_task WHERE execution_id = $1`
+	dropLocks = `DELETE FROM flows.lock WHERE execution_id = $1`
 	// cancelChildrenOf asks the active children of an ended execution $1 to
 	// cancel (cancel by tree).
 	cancelChildrenOf = `
@@ -1116,8 +1124,11 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 			return err
 		}
 		b := &pgx.Batch{}
+		sh := completionShape{activityAt: -1, parentFirst: terminal}
+		if terminal {
+			b.Queue(lockParent, l.ID)
+		}
 		b.Queue(fence, l.ID, l.Owner, l.Version, prevSeq, len(c.History) > 0)
-		sh := completionShape{activityAt: -1}
 		if terminal {
 			b.Queue(noUndelivered, l.ID, nonNil(c.Consumed)) // NULL would disable the check
 			sh.statements++
@@ -1175,8 +1186,9 @@ func eagerLeases(c *store.Completion, owner string, claimed map[actKey]int64) []
 // completionShape tells readCompletion which statements were queued after
 // the fence.
 type completionShape struct {
-	statements int // queued statements after the fence
-	activityAt int // index of the activity insert among them, -1 if none
+	parentFirst bool // lockParent queued before the fence
+	statements  int  // queued statements after the fence
+	activityAt  int  // index of the activity insert among them, -1 if none
 }
 
 // queueCompletion queues the statements of c after the fence, counting
@@ -1251,10 +1263,12 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		}
 		queue(carryPending, l.ID)
 	}
-	queue(dropEnded, l.ID)
+	// Children's rows, then task rows, then lock rows (lockParent).
 	if c.Status != store.StatusContinued {
 		queue(cancelChildrenOf, l.ID)
 	}
+	queue(dropEnded, l.ID)
+	queue(dropLocks, l.ID)
 	if c.Status != store.StatusContinued {
 		ev := store.ChildOutcome(store.Execution{Status: c.Status, Output: c.Output, Err: c.Err, ErrKinds: c.ErrKinds})
 		queue(notifyParent, l.ID, int16(ev.Type), ev.Payload, ev.Err, ev.ErrKinds)
@@ -1270,6 +1284,11 @@ type actKey struct {
 // readCompletion reads the batch results: the fence, then each queued
 // statement. It returns the ids of the eagerly claimed activity tasks.
 func readCompletion(br pgx.BatchResults, sh completionShape) (map[actKey]int64, error) {
+	if sh.parentFirst {
+		if _, err := br.Exec(); err != nil {
+			return nil, err
+		}
+	}
 	var seq int64
 	if err := br.QueryRow().Scan(&seq); err != nil {
 		return nil, err

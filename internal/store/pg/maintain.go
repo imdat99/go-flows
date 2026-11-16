@@ -305,6 +305,10 @@ func (s *Store) ReopenCompensation(ctx context.Context, instanceID string) error
 // instance id $1 (Terminate).
 var cancelChildrenOfLatest = strings.Replace(cancelChildrenOf, "x.parent_id = $1", "x.parent_id = "+latestOf, 1)
 
+// lockParentLatest is lockParent for the latest execution of instance id
+// $1 (Terminate).
+var lockParentLatest = strings.Replace(lockParent, "WHERE id = $1", "WHERE id = "+latestOf, 1)
+
 // notifyTerminated delivers ChildFailed (terminated) to the active parent
 // of the latest execution of $1.
 const notifyTerminated = `
@@ -332,23 +336,28 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 	for range maxRetries {
 		err := retry(ctx, func() error {
 			b := &pgx.Batch{}
+			b.Queue(lockParentLatest, instanceID) // parent row first, as lockParent
 			b.Queue(terminate, instanceID, reason)
-			b.Queue(`WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = `+latestOf+`),
-				k AS (DELETE FROM flows.lock WHERE execution_id = `+latestOf+`)
-				DELETE FROM flows.activity_task WHERE execution_id = `+latestOf, instanceID)
-			b.Queue(notifyTerminated, instanceID, ev.Err, ev.ErrKinds)
+			// Children's rows, then task rows, then lock rows (lockParent).
 			b.Queue(cancelChildrenOfLatest, instanceID)
+			b.Queue(`WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = `+latestOf+`)
+				DELETE FROM flows.activity_task WHERE execution_id = `+latestOf, instanceID)
+			b.Queue(`DELETE FROM flows.lock WHERE execution_id = `+latestOf, instanceID)
+			b.Queue(notifyTerminated, instanceID, ev.Err, ev.ErrKinds)
 			send := func(sb interface {
 				SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
 			},
 			) (int64, error) {
 				br := sb.SendBatch(ctx, b)
 				defer br.Close()
+				if _, err := br.Exec(); err != nil { // lockParentLatest
+					return 0, err
+				}
 				var id int64
 				if err := br.QueryRow().Scan(&id); err != nil {
 					return 0, err
 				}
-				for range 3 {
+				for range 4 {
 					if _, err := br.Exec(); err != nil {
 						return 0, err
 					}
