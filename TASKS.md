@@ -514,7 +514,12 @@ Các mục được rút ra từ phần "Còn mở" của T8.x, xếp theo thứ
     - Bench gate đạt: ActivityRun 74 allocs/op, Public 142, Eager 6.
     - Review 2 lần (1 không đạt: còn chu trình ngược parent kết thúc ↔ child lấy lock; đã sửa bằng cách đổi thứ tự `cancelChildrenOf` trước `dropEnded`).
     - Còn mở: `Unstick` cập nhật nhiều execution row theo thứ tự lưu trữ (rất hiếm, Postgres phát hiện, retry).
-- [ ] **T9.6** `Options.ListenDSN`: kết nối `LISTEN` riêng, đi thẳng tới Postgres khi pool chạy qua PgBouncer ở transaction mode. Test: engine với pool không có `LISTEN` vẫn nhận hint qua `ListenDSN`.
+- [x] **T9.6** `Options.ListenDSN`: kết nối `LISTEN` riêng, đi thẳng tới Postgres khi pool chạy qua PgBouncer ở transaction mode. Test: engine với pool không có `LISTEN` vẫn nhận hint qua `ListenDSN`.
+    - `Options.ListenDSN` (parse bằng `pgx.ParseConfig` trong `New`, sai cú pháp → `ErrInvalidArgument`); `pg.Store.SetListenConfig`: `Watch` mở kết nối riêng (`pgx.ConnectConfig`) thay vì hijack kết nối của pool. Mật khẩu không lộ trong lỗi (pgx redact).
+    - Backoff của watch được đặt lại khi Watch đã chạy lâu hơn `PollMax` (lần rớt mới không phải chờ backoff cũ).
+    - Test: `TestWatchListensOnItsOwnConnection` (pool 1 kết nối bị giữ, hint vẫn tới; đỏ trước khi sửa), `TestListenDSN` (engine, DSN sai bị từ chối, session LISTEN theo application_name).
+    - Tài liệu vi+en: hook của pool không áp dụng, `sslmode=verify-full`, lỗi kết nối hiện trong log.
+    - Review 1 lần: đạt.
 - [ ] **T9.7** ⚡ Lấy lock trong 1 round trip: kết quả lock được trả về ngay trong completion, không cần resume riêng. Bench `BenchmarkEagerActivity` và một bench có lock.
 - [ ] **T9.8** Phục vụ waiter của lock theo thứ tự FIFO: bảng hàng đợi waiter; khi nhả lock thì đánh thức waiter đầu hàng thay vì để các bên poll bằng `LockWait`. Test: N waiter nhận lock đúng thứ tự.
 

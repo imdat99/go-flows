@@ -62,8 +62,11 @@ defer engine.Stop(shutdownCtx)
   lại an toàn.
 - **Pooler.** Đứng sau PgBouncer ở transaction mode thì `LISTEN` không nhận
   được gì. Engine vẫn chạy nhờ poll của chính nó (thêm tới `PollMax` độ trễ
-  mỗi lần chuyển giao). Nên cho engine kết nối trực tiếp hoặc qua session
-  mode. Cũng chạy `Migrate` qua kết nối trực tiếp (nó giữ advisory lock trên
+  mỗi lần chuyển giao). Đặt `Options.ListenDSN` là connection string trực
+  tiếp hoặc qua session mode: engine khi đó `LISTEN` trên một kết nối riêng ở
+  đó, và vẫn dùng pool cho mọi việc khác. Hook của pool không áp dụng cho kết
+  nối này; đặt `sslmode=verify-full` cho kết nối trực tiếp. Kết nối lỗi hiện
+  trong log là "flows: watch failed". Cũng chạy `Migrate` qua kết nối trực tiếp (nó giữ advisory lock trên
   một kết nối trong khi goose dùng các kết nối khác: pool cần
   `MaxConns >= 3`).
 
@@ -76,6 +79,7 @@ defer engine.Stop(shutdownCtx)
 | `PollMax` | 1s | Khoảng poll dài nhất khi rảnh. Notification và thời điểm đến hạn cục bộ đánh thức poller sớm hơn. |
 | `StickyFor`, `CacheSize` | 10s, 1000 | Giữ execution đã replay trong bộ nhớ, cùng với task kế tiếp của nó trên engine này. `CacheSize: -1` tắt cache (task nào cũng replay). |
 | `DisableEager` | false | Chạy mọi activity qua queue thay vì chạy ngay trong engine đã lên lịch nó. |
+| `ListenDSN` | (pool) | Connection string cho kết nối `LISTEN` của engine (một kết nối), cho pool đứng sau PgBouncer ở transaction mode. |
 | `LockHold` | 1h | Execution giữ lock thêm bao lâu sau `ttl` khi một activity của nó đang chờ (trong queue, chờ retry, hoặc chờ engine khác sau crash). Giới hạn thời gian một workflow bị bỏ quên chặn người khác; âm: lock hết hạn sau `ttl`. |
 | `StuckTimeout` | 10s | Code workflow được chạy bao lâu mà không nhường. Một lần: trả lại; hai lần ở cùng chỗ, trên bất kỳ engine nào (đếm trong database): park (`ErrStuck`); `Resume` đặt lại số đếm. Tăng lên nếu code workflow thật sự cần tính toán lâu. |
 | `EagerWindow` | 200ms | Execution chờ các activity eager của nó bao lâu trước khi cho signal và timer vào. |

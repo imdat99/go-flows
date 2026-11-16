@@ -356,6 +356,7 @@ func (w *Worker) watch(ctx context.Context, wt store.Watcher) {
 	}
 	backoff := w.opts.PollMin
 	for ctx.Err() == nil {
+		started := time.Now()
 		err := wt.Watch(ctx, func(k store.WorkKind, q string) {
 			if q != "" && !queues[q] { // "": every queue
 				return
@@ -370,6 +371,9 @@ func (w *Worker) watch(ctx context.Context, wt store.Watcher) {
 			return
 		}
 		w.log.LogAttrs(ctx, slog.LevelWarn, "flows: watch failed", slog.Any("error", err))
+		if time.Since(started) > w.opts.PollMax {
+			backoff = w.opts.PollMin // it ran: a fresh drop, not a failing restart
+		}
 		if !sleep(ctx, backoff) {
 			return
 		}

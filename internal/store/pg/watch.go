@@ -5,20 +5,26 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/imdat99/go-flows/internal/store"
 )
 
 var _ store.Watcher = (*Store)(nil)
 
+// SetListenConfig makes Watch listen on connections of its own, made with
+// cfg, instead of taking one out of the pool (T9.6: a pool behind PgBouncer
+// in transaction mode cannot LISTEN). Call it before Watch.
+func (s *Store) SetListenConfig(cfg *pgx.ConnConfig) { s.listen = cfg }
+
 // Watch implements store.Watcher with LISTEN on a connection taken out of
 // the pool for the duration (a LISTEN must not follow a connection back to
-// the pool).
+// the pool), or made with the listen config (SetListenConfig).
 func (s *Store) Watch(ctx context.Context, wake func(kind store.WorkKind, queue string)) error {
-	pc, err := s.pool.Acquire(ctx)
+	conn, err := s.listenConn(ctx)
 	if err != nil {
 		return fmt.Errorf("watch: %w", err)
 	}
-	conn := pc.Hijack()
 	defer func() {
 		// Bounded: a dead peer must not hang the caller.
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -55,4 +61,17 @@ func (s *Store) Watch(ctx context.Context, wake func(kind store.WorkKind, queue 
 			wake(store.ActivityWork, n.Payload[1:])
 		}
 	}
+}
+
+// listenConn returns a connection of Watch's own: made with the listen
+// config, or taken out of the pool.
+func (s *Store) listenConn(ctx context.Context) (*pgx.Conn, error) {
+	if s.listen != nil {
+		return pgx.ConnectConfig(ctx, s.listen)
+	}
+	pc, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return pc.Hijack(), nil
 }

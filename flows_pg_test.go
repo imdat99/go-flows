@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -426,5 +428,60 @@ func TestCanceledErrorTextIsStorable(t *testing.T) {
 	var re *flows.RunError
 	if !errors.As(err, &re) || re.Status != flows.StatusCanceled || !errors.Is(err, flows.ErrCanceled) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// T9.6: with Options.ListenDSN, the engine listens on a connection of its
+// own (here named by application_name), not one of the pool's; a bad DSN
+// is refused at New.
+func TestListenDSN(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	if err := flows.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := flows.New(pool, flows.Options{ListenDSN: "postgres://%zz"}); !errors.Is(err, flows.ErrInvalidArgument) {
+		t.Fatalf("bad DSN: %v", err)
+	}
+	cc := pool.Config().ConnConfig
+	dsn := (&url.URL{
+		Scheme: "postgres", User: url.UserPassword(cc.User, cc.Password),
+		Host: net.JoinHostPort(cc.Host, strconv.Itoa(int(cc.Port))), Path: "/" + cc.Database,
+		RawQuery: "application_name=flows-listen-test&sslmode=disable",
+	}).String()
+	e, err := flows.New(pool, flows.Options{InstanceID: "listen", ListenDSN: dsn, PollMax: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Stop(ctx) }()
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND application_name = 'flows-listen-test' AND query LIKE 'LISTEN%'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the engine does not listen on its ListenDSN connection")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Work started elsewhere (a client) is picked up at once, on the hint
+	// (the engine's poll backs off to PollMax).
+	time.Sleep(200 * time.Millisecond)
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	client, err := flows.New(pool, flows.Options{InstanceID: "client"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := pickAll.Run(cctx, client, "listen-1", []item{{SKU: "a", Qty: 1}})
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("run: %v %v", keys, err)
 	}
 }

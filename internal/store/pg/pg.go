@@ -36,9 +36,10 @@ import (
 //     pending.
 type Store struct {
 	pool    *pgxpool.Pool
-	fast    bool     // hot paths on pgconn (fast.go)
-	hook    Hook     // nil: no end hook
-	watches sync.Map // done channel -> *ctxWatch (fast.go)
+	fast    bool            // hot paths on pgconn (fast.go)
+	hook    Hook            // nil: no end hook
+	watches sync.Map        // done channel -> *ctxWatch (fast.go)
+	listen  *pgx.ConnConfig // nil: Watch listens on a connection of the pool
 }
 
 // Hook runs inside the transaction that ends or parks an execution

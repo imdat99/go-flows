@@ -69,6 +69,17 @@ type Options struct {
 	// after its process died (default 1h; negative: not at all, the lock
 	// lapses after its ttl). It is recorded with the lock when taken.
 	LockHold time.Duration
+	// ListenDSN, when set, is the connection string of the connection the
+	// engine LISTENs on for work notifications, instead of one taken out of
+	// the pool: for pools behind PgBouncer in transaction mode (which drops
+	// notifications), point it at Postgres directly or at a session-mode
+	// pool. It holds one connection while the engine runs. The pool's hooks
+	// (BeforeConnect credentials, AfterConnect, tracers) do not apply to it;
+	// without sslmode, pgx's default (prefer) may fall back to plaintext:
+	// set sslmode=verify-full for a direct connection. Only its syntax is
+	// checked by New: a connection that fails is logged ("flows: watch
+	// failed") and retried, the engine polling meanwhile.
+	ListenDSN string
 }
 
 // Engine runs the workflows and activities defined in this binary against
@@ -82,7 +93,15 @@ type Engine struct {
 
 // New returns a stopped engine on pool. Run Migrate first.
 func New(pool *pgxpool.Pool, opts Options) (*Engine, error) {
-	return newEngine(pg.New(pool), opts)
+	st := pg.New(pool)
+	if opts.ListenDSN != "" {
+		cfg, err := pgx.ParseConfig(opts.ListenDSN)
+		if err != nil {
+			return nil, fmt.Errorf("%w: ListenDSN: %w", ErrInvalidArgument, err)
+		}
+		st.SetListenConfig(cfg)
+	}
+	return newEngine(st, opts)
 }
 
 // Migrate creates or upgrades the engine's tables (schema "flows"). It is

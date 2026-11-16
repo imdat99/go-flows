@@ -62,8 +62,11 @@ defer engine.Stop(shutdownCtx)
   before the cancel remains possible; fencing makes the retry safe.
 - **Poolers.** Behind PgBouncer in transaction mode, `LISTEN` receives
   nothing. The engine still works on its own polls (up to `PollMax` of extra
-  latency per hand-off). Prefer a direct or session-mode connection for
-  engines. Run `Migrate` over a direct connection too (it holds an advisory
+  latency per hand-off). Set `Options.ListenDSN` to a direct or
+  session-mode connection string: the engine then listens on one connection
+  of its own there, and keeps the pool for everything else. The pool's hooks
+  do not apply to it; set `sslmode=verify-full` for a direct connection. A
+  connection that fails shows as "flows: watch failed" in the logs. Run `Migrate` over a direct connection too (it holds an advisory
   lock on one connection while goose uses others: the pool needs
   `MaxConns >= 3`).
 
@@ -76,6 +79,7 @@ defer engine.Stop(shutdownCtx)
 | `PollMax` | 1s | The longest idle poll interval. Notifications and local due times wake pollers earlier. |
 | `StickyFor`, `CacheSize` | 10s, 1000 | Keep a replayed execution in memory, with its next task on this engine. `CacheSize: -1` disables the cache (every task replays). |
 | `DisableEager` | false | Run every activity through the queue instead of in the scheduling engine. |
+| `ListenDSN` | (pool) | Connection string for the engine's `LISTEN` connection (one connection), for pools behind PgBouncer in transaction mode. |
 | `LockHold` | 1h | How long past its `ttl` an execution keeps a lock while one of its activities waits (in its queue, for a retry, or for another engine after a crash). Bounds how long a forgotten workflow keeps others out; negative: the lock lapses after its `ttl`. |
 | `StuckTimeout` | 10s | How long workflow code may run without yielding. Once: handed back; twice at the same point, on any engine (counted in the database): parked (`ErrStuck`); `Resume` resets the count. Raise it if workflow code legitimately computes for long. |
 | `EagerWindow` | 200ms | How long an execution waits for its eager activities before letting signals and timers in. |
