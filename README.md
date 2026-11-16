@@ -71,8 +71,9 @@ func main() {
 }
 ```
 
-Runnable versions are in [`examples/`](examples). Start Postgres with
-`make up`, then run `go run ./examples/quickstart`.
+Runnable versions are in [`examples/`](examples) (quickstart, a saga, a
+fan-out, a transactional outbox). Start Postgres with `make up`, then run
+`go run ./examples/quickstart`.
 
 ## Documentation
 

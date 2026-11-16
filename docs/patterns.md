@@ -4,7 +4,7 @@
 
 Each pattern is short code against the public API. Runnable programs are in
 [`examples/`](../examples): `quickstart` (activity, signal), `order`
-(compensation), `fanout` (concurrency).
+(compensation), `fanout` (concurrency), `outbox` (publishing events).
 
 ## Exactly-once effects with `idem`
 
@@ -220,6 +220,12 @@ Set the hook on every engine, client-only ones included. A relay process
 then publishes the ready rows to the broker of your choice.
 `RunEnded` also runs for parks (`needs_attention`), which are not ends:
 leave the messages there.
+
+[`examples/outbox`](../examples/outbox) puts it together: an activity stages
+an event deduplicated by its `Key`, the hook releases or drops it and stages
+a `workflow.ended` event, and a relay publishes ready rows to a stub bus with
+`FOR UPDATE SKIP LOCKED`, retries with backoff, and per-key ordering
+(at-least-once, with an event id to deduplicate on).
 
 ## Testing
 

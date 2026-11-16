@@ -69,7 +69,8 @@ func main() {
 }
 ```
 
-Bản chạy được nằm trong [`examples/`](../../examples). Chạy Postgres bằng
+Bản chạy được nằm trong [`examples/`](../../examples) (quickstart, saga,
+fan-out, transactional outbox). Chạy Postgres bằng
 `make up`, rồi `go run ./examples/quickstart`.
 
 ## Tài liệu

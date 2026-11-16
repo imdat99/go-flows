@@ -4,7 +4,7 @@
 
 Mỗi mẫu là một đoạn code ngắn dùng API công khai. Chương trình chạy được nằm
 trong [`examples/`](../../examples): `quickstart` (activity, signal),
-`order` (compensation), `fanout` (đồng thời).
+`order` (compensation), `fanout` (đồng thời), `outbox` (phát event).
 
 ## Hiệu ứng đúng một lần với `idem`
 
@@ -220,6 +220,12 @@ engine, err := flows.New(pool, flows.Options{Hook: outbox{}})
 sau đó phát các dòng đã sẵn sàng tới broker bạn chọn.
 `RunEnded` cũng chạy khi park (`needs_attention`), vốn không phải kết thúc:
 hãy để nguyên message.
+
+[`examples/outbox`](../../examples/outbox) ghép tất cả lại: một activity đặt
+sẵn event, chống trùng theo `Key` của nó; hook phát hành hoặc huỷ event đó và
+thêm một event `workflow.ended`; một relay phát các dòng đã sẵn sàng tới một
+event bus giả bằng `FOR UPDATE SKIP LOCKED`, retry có backoff, giữ thứ tự theo
+key (at-least-once, kèm event id để consumer chống trùng).
 
 ## Kiểm thử
 
