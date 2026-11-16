@@ -62,6 +62,12 @@ func (c *cache) take(executionID, lastSeq int64) *executor.Executor {
 	return ex
 }
 
+// fits reports whether put would keep ex: a cache exists and ex is not
+// larger than the byte bound.
+func (c *cache) fits(ex *executor.Executor) bool {
+	return c.max > 0 && (c.maxBytes <= 0 || ex.Size() <= c.maxBytes)
+}
+
 // put caches ex, evicting the least recently used executors beyond max or
 // maxBytes. An executor larger than maxBytes is not cached (and evicts
 // nothing). An executor already cached for the execution (a newer one)
@@ -72,7 +78,7 @@ func (c *cache) put(ex *executor.Executor) {
 		return
 	}
 	size := ex.Size()
-	if c.maxBytes > 0 && size > c.maxBytes {
+	if !c.fits(ex) {
 		// Larger than the whole cache: dropped at once, rather than first
 		// evicting every other executor (and again at each of its tasks).
 		c.dropOversize(ex)

@@ -194,3 +194,22 @@ func TestCacheWarmCycleAllocations(t *testing.T) {
 		t.Fatalf("%v allocations per take and put, want at most 1 (the list element)", n)
 	}
 }
+
+// An executor larger than the byte limit is never kept, so its execution
+// is not made sticky (stickiness only pays off with a cached executor).
+func TestCacheFits(t *testing.T) {
+	ex := waitingExecutor(t, 1, 100_000)
+	defer ex.Close()
+	if !newCache(10, -1).fits(ex.Executor) {
+		t.Fatal("no byte bound: does not fit")
+	}
+	if newCache(10, ex.Size()-1).fits(ex.Executor) {
+		t.Fatal("larger than the limit: fits")
+	}
+	if !newCache(10, ex.Size()).fits(ex.Executor) {
+		t.Fatal("at the limit: does not fit")
+	}
+	if newCache(0, -1).fits(ex.Executor) {
+		t.Fatal("no cache: fits")
+	}
+}

@@ -267,7 +267,7 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 			// comes back with the completion (T9.7, one round trip).
 			c.Resume = d.nextResumeBuffer()
 		}
-	case !stopping && w.opts.CacheSize > 0 && !d.compensating: // only an executor kept in the cache gains from it
+	case !stopping && !d.compensating && w.cache.fits(d.ex): // only an executor kept in the cache gains from it
 		c.StickyFor = w.opts.StickyFor
 	}
 	sent := time.Now()
