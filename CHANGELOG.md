@@ -11,6 +11,30 @@ must take care of.
 
 ## Unreleased
 
+### Added
+
+- `Options.CacheBytes`: the sticky executor cache is bounded by an
+  estimate of its size too (default 256 MiB, `-1` for a count bound only),
+  evicting the least recently used executors (T10.6).
+- Tracing: `ActivityInfo` and `WorkflowTaskInfo` carry `ExecutionID`;
+  `flows.ErrLeaseLost` is exported so tracers can tell a lost lease
+  (T10.10).
+
+### Changed
+
+- `otelflows`: all spans of an execution share one trace, whose parent
+  span context is derived from the instance and execution ids (the same in
+  every process; the parent span itself is never emitted, so backends show
+  a missing root). An attempt that lost its lease ends its span with an
+  error status and `flows.outcome=lease_lost`. Continue-as-new starts a new
+  trace; `flows.instance_id` ties them together (T10.10).
+- **Sampling:** the derived parent is marked sampled, so a
+  `ParentBased(TraceIDRatioBased(r))` sampler now keeps every flows span
+  instead of applying the ratio. To sample whole executions, use
+  `ParentBased(root, WithRemoteParentSampled(TraceIDRatioBased(r)))`.
+- `Engine.Terminate` no longer reads the execution again for the observer,
+  and a hooked end no longer costs an extra `SELECT` round trip (T10.9).
+
 ### Upgrade notes
 
 - No new migration yet.

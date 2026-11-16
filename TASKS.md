@@ -580,8 +580,18 @@ Gom mọi mục "Còn mở" ở trên, xếp theo mức độ ảnh hưởng. Qu
     - Lần `make test` đầu trượt 4 test lock waiter pg ("claimed 2 tasks, want 1") khi chạy song song với bench và review; chạy lại đạt. Thuộc T10.13.
 
 **D. Round trip và quan sát**
-- [ ] **T10.9** `Terminate` đọc `GetExecution` riêng để báo cho observer: trả thông tin cần thiết ngay từ câu lệnh terminate. Khi có hook, `inTx` tốn thêm một round trip `SELECT`: gộp vào batch.
-- [ ] **T10.10** Tracing: nối span qua các task của một execution (link tới span của task trước, hoặc span cha theo instance); test cho attempt mất lease.
+- [x] **T10.9** `Terminate` đọc `GetExecution` riêng để báo cho observer: trả thông tin cần thiết ngay từ câu lệnh terminate. Khi có hook, `inTx` tốn thêm một round trip `SELECT`: gộp vào batch.
+    - `store.Store.Terminate` trả `(EndInfo, error)`: câu lệnh terminate của pg trả execution id, instance id, workflow, version; mem trả giống. `Engine.Terminate` đưa cho observer, bỏ `GetExecution`. Khi có hook, `inTx` không gửi `SELECT` riêng: completion xếp câu đọc đó vào batch sẵn có (trước các lệnh resume), Terminate lấy từ câu lệnh terminate. Kết thúc có hook còn BEGIN, một batch, hook, COMMIT.
+    - Test: `TestHookedEndsReadNothingMore` (pg, đếm câu lệnh bằng tracer pgx; đỏ trước: completion gửi thêm `SELECT instance_id, workflow, version ...`), `TestTerminateInformsObserverWithoutARead` (đỏ trước: đọc 1 lần), `TestHookedParkWithResume`, conformance `testTerminate` kiểm `EndInfo` cho pg và mem.
+    - Không chạm đường nóng (đường fast completion và driver không đổi), không chạy bench.
+    - Review 1 lần: đạt.
+- [x] **T10.10** Tracing: nối span qua các task của một execution (link tới span của task trước, hoặc span cha theo instance); test cho attempt mất lease.
+    - Một trace cho mỗi execution, không lưu gì thêm: otelflows suy ra trace id và span id từ instance id và execution id (hash 0 alloc, giống nhau ở mọi process); mọi span workflow task và attempt activity là con của span context đó, nên attempt mất lease và attempt thay thế cùng một trace. Span cha không bao giờ được phát (backend hiện root bị thiếu). Continue-as-new sang trace mới, nối bằng `flows.instance_id`.
+    - Core: `ActivityInfo`, `WorkflowTaskInfo` thêm `ExecutionID`; export `flows.ErrLeaseLost`. Span có `flows.execution_id`; mất lease thì status lỗi và `flows.outcome=lease_lost`. Không tracer thì 0 chi phí; có tracer thì thêm 1 alloc mỗi span.
+    - Test: `TestTracerLostLease` (flows, mất lease thật bằng đồng hồ tay của store và một claim cạnh tranh; -race 10 lần đạt), `TestExecutionTrace` (otelflows; đỏ trước: span cha rỗng), `TestTracesAndMetrics` (mọi span cùng trace), `TestExecutionSpanContext` (tất định, 0 alloc).
+    - Review 1 lần: đạt.
+    - Đổi hành vi (ghi trong CHANGELOG): span cha suy ra được đánh dấu sampled, nên `ParentBased(TraceIDRatioBased(r))` giữ mọi span; muốn lấy mẫu theo execution thì dùng `WithRemoteParentSampled(TraceIDRatioBased(r))`.
+    - Còn mở: attempt mất lease đúng lúc ghi kết quả vẫn kết thúc span là thành công (span kết thúc trước khi ghi; có từ trước); chưa có test end-to-end engine + OpenTelemetry qua một lần mất lease.
 - [ ] **T10.11** flowtest: báo future bị bỏ cho cả child, không chỉ instance truyền vào `Run`; hook có recover. Xem lại giới hạn activity chờ cancel do timer của workflow (`ErrNeverIdle`): sửa nếu được, nếu không thì giữ tài liệu.
 - [ ] **T10.12** analyzer: channel không gán vào biến (`foo(make(chan int))`), field kiểu channel hoặc mutex; không báo nhầm `SideEffect` để trong biến.
 
