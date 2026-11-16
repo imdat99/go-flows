@@ -132,19 +132,6 @@ func dumpState(t *testing.T, pool *pgxpool.Pool) {
 	dump("effects (step count)", `SELECT step, count(*) FROM chaos_effect GROUP BY step ORDER BY step`)
 }
 
-// waitUntil is waitFor without failing: it reports whether cond held
-// within timeout.
-func waitUntil(timeout time.Duration, cond func() bool) bool {
-	deadline := time.Now().Add(timeout)
-	for !cond() {
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return true
-}
-
 // ---- F, G: the workflow lease ----
 
 // fenceGate, when set in the parent, holds the parent's chaos.fstep2
@@ -235,7 +222,19 @@ func childFenced(ctx context.Context, eng *flows.Engine) {
 // its task, with a different next step: the store's fence (owner and
 // lease version of the execution) rejects it with ErrLeaseLost, nothing of
 // it reaches the history, and the takeover's run is the one that ends.
+//
+// The takeover runs under another instance id (the owner differs), or
+// under the frozen one's own id, "child" (a process restarted with a fixed
+// id while the old one is frozen, not dead): then only the lease version
+// tells the two apart.
 func TestFrozenWorkflowTaskIsFencedOff(t *testing.T) {
+	for _, owner := range []string{"takeover", "child"} {
+		t.Run("owner="+owner, func(t *testing.T) { testFencedOff(t, owner) })
+	}
+}
+
+func testFencedOff(t *testing.T, owner string) {
+	t.Helper()
 	pool := setup(t)
 	release := make(chan struct{})
 	var once sync.Once
@@ -243,7 +242,9 @@ func TestFrozenWorkflowTaskIsFencedOff(t *testing.T) {
 	fenceGate.Store(&release)
 	t.Cleanup(func() { open(); fenceGate.Store(nil) })
 
-	cmd, out := spawn(t, pool, "wf-pause", 1)
+	// 3s: a late renewal under load must not give the lease up before the
+	// freeze.
+	cmd, out := spawn(t, pool, "wf-pause", 1, envTTL+"=3s")
 	waitFor(t, "child to hold its workflow code", 60*time.Second, func() bool {
 		return count(t, pool, `SELECT count(*) FROM chaos_marker WHERE key = 'fence-0'`) == 1
 	})
@@ -257,17 +258,13 @@ func TestFrozenWorkflowTaskIsFencedOff(t *testing.T) {
 	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
 		t.Fatal(err)
 	}
-	stats := &racerStats{name: "takeover"}
+	stats := &racerStats{name: owner + " (takeover)"}
 	eng := startEngineWith(t, pool, flows.Options{
-		InstanceID: "takeover", EagerWindow: 10 * time.Minute, Observer: stats, Tracer: stats,
-		// A long lease of its own: a renewal late under load must not
-		// hand the takeover's task back (only the child's lease is meant
-		// to lapse).
-		LeaseTTL: 10 * time.Second,
+		InstanceID: owner, EagerWindow: 10 * time.Minute, Observer: stats, Tracer: stats,
 	})
 	waitFor(t, "the takeover to hold the workflow lease, its fstep2 running", 60*time.Second, func() bool {
 		return count(t, pool, `SELECT count(*) FROM chaos_attempt WHERE step = 'chaos.fstep2' AND pid = $1`, os.Getpid()) == 1 &&
-			count(t, pool, `SELECT count(*) FROM flows.execution WHERE instance_id = 'fence-0' AND owner_id = 'takeover' AND locked_until > now() AND lease_version > $1`, version) == 1
+			count(t, pool, `SELECT count(*) FROM flows.execution WHERE instance_id = 'fence-0' AND owner_id = $1 AND locked_until > now() AND lease_version > $2`, owner, version) == 1
 	})
 	if err := cmd.Process.Signal(syscall.SIGCONT); err != nil {
 		t.Fatal(err)
@@ -286,7 +283,7 @@ func TestFrozenWorkflowTaskIsFencedOff(t *testing.T) {
 	}
 	_ = cmd.Wait()
 	// While the takeover still holds it, the refused task left nothing.
-	if n := count(t, pool, `SELECT count(*) FROM flows.execution WHERE instance_id = 'fence-0' AND owner_id = 'takeover'`); n != 1 {
+	if n := count(t, pool, `SELECT count(*) FROM flows.execution WHERE instance_id = 'fence-0' AND owner_id = $1 AND lease_version > $2`, owner, version); n != 1 {
 		t.Fatal("the takeover lost the workflow lease to the stale completion")
 	}
 	if n := count(t, pool, `SELECT count(*) FROM flows.history WHERE type = $1 AND name = 'chaos.fstep2'`, int(history.ActivityScheduled)); n != 1 {
@@ -326,39 +323,70 @@ func TestFrozenWorkflowTaskIsFencedOff(t *testing.T) {
 	t.Log(stats)
 }
 
-// G: a process freezes in workflow code for less than its lease (15s,
-// frozen 2s); another engine polls meanwhile. Nothing is lost: across the
-// freeze the frozen process keeps the workflow lease (same owner, same
-// lease version, never taken over), and on thaw its held task completes
-// without a lease loss, the execution ending with the right output and
-// each step run once.
+// G: a process freezes in workflow code for less than its lease; another
+// engine polls meanwhile. Nothing is lost: across the freeze the frozen
+// process keeps the workflow lease (same owner, same lease version, never
+// taken over), its heartbeat renews it after the thaw, and its held task
+// completes without a lease loss, the execution ending with the right
+// output and each step run once.
+//
+// The freeze is aligned on the heartbeat so that it always spans a renewal
+// tick: the test waits for a renewal to land (locked_until moves), then half
+// an interval, then freezes for 0.8 interval (interval = TTL/3 = 5s), so the
+// next tick comes due while frozen and runs late, on thaw.
+//
+// Design limit: a worker gives a lease up locally once it has not renewed
+// it for ttl - interval (heartbeat.expire, two thirds of the TTL), whatever
+// the store says. A freeze is therefore guaranteed not to lose the lease
+// only while it is shorter than about one interval (TTL/3) past the last
+// renewal; longer freezes within the TTL may lose it (safely: the work is
+// fenced and runs again).
 //
 // The other engine may still run the second step, or the last task: an
 // eager launch is best effort (it needs a free activity slot, and the
 // child's activity poll, due at once on thaw, holds the free slots while
 // it claims), and a step not launched eagerly is queued for any engine.
 func TestShortFreezeKeepsTheLease(t *testing.T) {
+	const ttl, interval = 15 * time.Second, 5 * time.Second
 	pool := setup(t)
-	cmd, out := spawn(t, pool, "wf-short", 1, envTTL+"=15s")
+	cmd, out := spawn(t, pool, "wf-short", 1, envTTL+"="+ttl.String())
 	waitFor(t, "child to hold its workflow code", 60*time.Second, func() bool {
 		return count(t, pool, `SELECT count(*) FROM chaos_marker WHERE key = 'fence-0'`) == 1
 	})
 	stats := &racerStats{name: "thief"}
-	// A long lease: a late renewal under load must not re-run its steps.
-	startEngineWith(t, pool, flows.Options{InstanceID: "thief", Observer: stats, Tracer: stats, LeaseTTL: 10 * time.Second})
-	var version int64
-	if err := pool.QueryRow(context.Background(), `
-		SELECT lease_version FROM flows.execution
-		WHERE instance_id = 'fence-0' AND owner_id = 'child' AND locked_until > now()`).Scan(&version); err != nil {
-		t.Fatalf("the child does not hold the workflow lease: %v", err)
+	startEngineWith(t, pool, flows.Options{InstanceID: "thief", Observer: stats, Tracer: stats})
+	lease := func() (version int64, until time.Time) {
+		t.Helper()
+		if err := pool.QueryRow(context.Background(), `
+			SELECT lease_version, locked_until FROM flows.execution
+			WHERE instance_id = 'fence-0' AND owner_id = 'child' AND locked_until > now()`).Scan(&version, &until); err != nil {
+			t.Fatalf("the child does not hold the workflow lease: %v", err)
+		}
+		return version, until
 	}
+	version, first := lease()
+	var renewed time.Time
+	waitFor(t, "a renewal of the child's workflow lease", 3*interval, func() bool {
+		_, renewed = lease()
+		return renewed.After(first)
+	})
+	time.Sleep(interval / 2)
 	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(2 * time.Second) // the freeze: well within the 15s lease, renewed every 5s
+	time.Sleep(interval * 4 / 5) // spans the next renewal tick, due interval after the last
 	if err := cmd.Process.Signal(syscall.SIGCONT); err != nil {
 		t.Fatal(err)
 	}
+	// The tick missed during the freeze runs on thaw, and renews: same
+	// owner, same lease version.
+	waitFor(t, "the thawed child to renew its lease", 2*interval, func() bool {
+		v, until := lease()
+		if v != version {
+			t.Fatalf("lease version %d, was %d: the lease was taken during the freeze", v, version)
+		}
+		return until.After(renewed)
+	})
 	// Still the child's lease, the one it had: nobody took it meanwhile.
 	if n := count(t, pool, `
 		SELECT count(*) FROM flows.execution
@@ -533,7 +561,7 @@ func childTrees(ctx context.Context, eng *flows.Engine) {
 // trees is compensated, children included.
 func TestTreesSurviveFreezeAndKill(t *testing.T) {
 	pool := setup(t)
-	cmd, _ := spawn(t, pool, "tree", trees)
+	cmd, out := spawn(t, pool, "tree", trees)
 	effects := func() int { return count(t, pool, `SELECT count(*) FROM chaos_effect`) }
 	ended := func() int {
 		return count(t, pool, `SELECT count(*) FROM flows.execution WHERE workflow = 'chaos.tree' AND status IN ('completed', 'compensated', 'failed')`)
@@ -562,10 +590,16 @@ func TestTreesSurviveFreezeAndKill(t *testing.T) {
 	byChild := func() int {
 		return count(t, pool, `SELECT count(*) FROM chaos_attempt WHERE pid = $1`, cmd.Process.Pid)
 	}
-	before := byChild()
-	if !waitUntil(30*time.Second, func() bool { return byChild() > before || ended() == trees }) {
-		t.Log("the thawed child made no attempt before its kill")
-	}
+	// The thawed child takes part in the race: it makes attempts (new
+	// work it claims), or writes what it held when frozen and is refused
+	// (lost=true), unless nothing is left by then.
+	before, mark := byChild(), len(out.String())
+	refused := func() int { return strings.Count(out.String()[mark:], "lost=true") }
+	waitFor(t, "the thawed child to race the engines", time.Minute, func() bool {
+		return byChild() > before || refused() > 0 || ended() == trees
+	})
+	t.Logf("after the thaw the child made %d attempts and had %d writes refused (trees ended: %d)",
+		byChild()-before, refused(), ended())
 	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
@@ -588,6 +622,14 @@ func TestTreesSurviveFreezeAndKill(t *testing.T) {
 	}
 	for _, s := range stats {
 		t.Log(s)
+	}
+	// The child's stale writes were all refused by the lease fence: none
+	// got past it to a later check (a sequence or schedule conflict), none
+	// parked an execution.
+	for _, bad := range []string{"invalid completion", "out of sequence", "needs_attention", "non-determin", "parking"} {
+		if strings.Contains(out.String(), bad) {
+			t.Fatalf("the child reported %q: a stale write got past the lease fence", bad)
+		}
 	}
 	assertTrees(t, pool, cmd.Process.Pid)
 }

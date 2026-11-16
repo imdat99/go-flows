@@ -39,7 +39,19 @@ const (
 	envRuns  = "FLOWS_CHAOS_RUNS"
 	envTTL   = "FLOWS_CHAOS_TTL" // the child's LeaseTTL (default leaseTTL)
 	leaseTTL = time.Second
+	// killTTL is the lease of a child that gets killed in a test counting
+	// exact invocations: long enough that a renewal late under load (-race,
+	// other tests running) does not give a lease up before the kill (a
+	// worker gives a lease up after ttl - ttl/3 without renewal) and run a
+	// step twice.
+	killTTL = "5s"
+	// parentTTL is the lease of the parent's engines: they are never meant
+	// to lose one, and the tests count their attempts.
+	parentTTL = 10 * time.Second
 )
+
+// childTTL is the child's lease (envTTL).
+var childTTL = leaseTTL
 
 // db is the database of the current test (parent) or of the child process.
 // Parent tests do not run in parallel.
@@ -90,10 +102,11 @@ func defineStep(name string, stall bool) *flows.Activity[int, int, struct{}] {
 				select {} // killed with SIGKILL while here
 			case "pause":
 				// Frozen with SIGSTOP meanwhile, for longer than this sleep
-				// (at least a TTL: until the takeover claims the task): on
-				// thaw the attempt returns at once and writes its outcome,
-				// before the heartbeat's renewal learns the lease is lost.
-				time.Sleep(leaseTTL / 2)
+				// (until the takeover claims the task: at least the lease
+				// left, over two thirds of a TTL): on thaw the attempt
+				// returns at once and writes its outcome, before the
+				// heartbeat's renewal learns the lease is lost.
+				time.Sleep(childTTL / 2)
 				return v + 1000, struct{}{}, nil // told apart from the takeover's
 			}
 		}
@@ -180,6 +193,7 @@ func child(mode string) int {
 			return 2
 		}
 	}
+	childTTL = ttl
 	opts := flows.Options{
 		InstanceID: "child", LeaseTTL: ttl, PollMax: 50 * time.Millisecond, Logger: quietLogger(os.Stderr),
 		Observer: printAttempts{},
@@ -349,12 +363,12 @@ func startEngine(t *testing.T, pool *pgxpool.Pool, id string) *flows.Engine {
 	return startEngineWith(t, pool, flows.Options{InstanceID: id})
 }
 
-// startEngineWith starts an engine with the suite's lease and polling,
-// and opts' other fields.
+// startEngineWith starts an engine with the suite's polling, a long
+// lease (parentTTL) unless opts has one, and opts' other fields.
 func startEngineWith(t *testing.T, pool *pgxpool.Pool, opts flows.Options) *flows.Engine {
 	t.Helper()
 	if opts.LeaseTTL == 0 {
-		opts.LeaseTTL = leaseTTL
+		opts.LeaseTTL = parentTTL
 	}
 	opts.PollMax, opts.Logger = 50*time.Millisecond, quietLogger(t.Output())
 	eng, err := flows.New(pool, opts)
@@ -420,7 +434,7 @@ func assertOnce(t *testing.T, pool *pgxpool.Pool, runs int) {
 // runs the activity again with the same key, so its effect happens once.
 func TestKilledInstanceIsRecovered(t *testing.T) {
 	pool := setup(t)
-	cmd, _ := spawn(t, pool, "hang", 1)
+	cmd, _ := spawn(t, pool, "hang", 1, envTTL+"="+killTTL)
 	waitFor(t, "child to enter reserve", 30*time.Second, func() bool {
 		return count(t, pool, `SELECT count(*) FROM chaos_marker`) == 1
 	})
@@ -453,7 +467,7 @@ func TestFrozenInstanceIsFencedOff(t *testing.T) {
 	open := func() { once.Do(func() { close(release) }) }
 	gate.Store(&release)
 	t.Cleanup(func() { open(); gate.Store(nil) })
-	cmd, out := spawn(t, pool, "pause", 1)
+	cmd, out := spawn(t, pool, "pause", 1, envTTL+"=3s")
 	waitFor(t, "child to enter reserve", 30*time.Second, func() bool {
 		return count(t, pool, `SELECT count(*) FROM chaos_marker`) == 1
 	})
@@ -493,7 +507,7 @@ func TestFrozenInstanceIsFencedOff(t *testing.T) {
 func TestThreeInstancesRaceRecovery(t *testing.T) {
 	const runs = 30
 	pool := setup(t)
-	cmd, _ := spawn(t, pool, "many", runs)
+	cmd, _ := spawn(t, pool, "many", runs, envTTL+"="+killTTL)
 	waitFor(t, "child to enter reserve in every execution", 60*time.Second, func() bool {
 		return count(t, pool, `SELECT count(*) FROM chaos_marker`) == runs
 	})
@@ -549,7 +563,7 @@ func TestThreeInstancesRaceRecovery(t *testing.T) {
 // takes effect once, and the execution ends compensated.
 func TestKilledDuringCompensation(t *testing.T) {
 	pool := setup(t)
-	cmd, _ := spawn(t, pool, "comp-hang", 1)
+	cmd, _ := spawn(t, pool, "comp-hang", 1, envTTL+"="+killTTL)
 	waitFor(t, "child to enter the compensator", 30*time.Second, func() bool {
 		return count(t, pool, `SELECT count(*) FROM chaos_marker`) == 1
 	})
@@ -614,7 +628,7 @@ func TestKilledHoldingALock(t *testing.T) {
 	if _, err := pool.Exec(context.Background(), `CREATE TABLE chaos_section (key text PRIMARY KEY, at timestamptz NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	cmd, _ := spawn(t, pool, "lock-hang", 1)
+	cmd, _ := spawn(t, pool, "lock-hang", 1, envTTL+"="+killTTL)
 	waitFor(t, "child to enter the locked section", 30*time.Second, func() bool {
 		return count(t, pool, `SELECT count(*) FROM chaos_marker`) == 1
 	})
