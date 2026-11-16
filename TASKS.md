@@ -571,7 +571,13 @@ Gom mọi mục "Còn mở" ở trên, xếp theo mức độ ảnh hưởng. Qu
     - Review 2 lần (1 không đạt: executor quá lớn evict hết các entry khác trước khi tự bị bỏ; input activity được tính sau replay nhưng không khi chạy live). Lần 2 đạt.
     - Còn mở: ước lượng chỉ tăng, execution history rất dài (nhiều signal) có thể vượt `CacheBytes` rồi replay mỗi task (khó xảy ra với 256 MiB).
 - [ ] **T10.7** Comp data của attempt uncertain trước đó bị mất: compensator nhận data của attempt cuối (thường là zero). Giữ comp data khác rỗng gần nhất qua các attempt (cột trên `activity_task`), compensator nhận nó. Test: attempt 1 trả comp data rồi timeout, attempt 2 lỗi; compensator thấy data của attempt 1.
-- [ ] **T10.8** Store bộ nhớ: `cancelChildrenOf` và `Wake` quét toàn bộ execution; thêm chỉ mục theo cha và theo trạng thái.
+- [x] **T10.8** Store bộ nhớ: `cancelChildrenOf` và `Wake` quét toàn bộ execution; thêm chỉ mục theo cha và theo trạng thái.
+    - Hai chỉ mục trên `Store`: `runnable` (queue → execution running/compensating) và `children` (execution cha → con, mọi trạng thái). Cập nhật ở `create` (cả con và continue-as-new), mọi đổi trạng thái qua `setStatus` (hoàn tất task, mở lại child để compensate, `ReopenCompensation`, `ReopenParked`, `Terminate`) và `PurgeEnded`. Dùng cho `Wake`, `ClaimWorkflowTasks(Due)`, `cancelChildrenOf`, `compensateChildren`.
+    - Test: `TestIndexedLookupsVisitMatchingSet` (đỏ trước: "ending a parent of 3 children visited 504 executions"), `TestIndexesFollowEveryChange` (so chỉ mục với quét toàn bộ sau mỗi bước), `TestClaimRepeatedQueue`.
+    - Bench (0 alloc cả hai bên): Wake 10000 execution 587 µs → 408 ns; cancelChildrenOf 10000 execution 463 µs → 198 ns.
+    - Review 1 lần: đạt (thêm test queue lặp).
+    - Còn mở (store bộ nhớ, không phải đường nóng của pg): các hàm quét toàn bộ activity task mỗi lần hoàn tất hoặc claim (`duplicateActivity`, `cancelRequests`, `end`, `running`, `hasActivity`, claim activity theo queue); `extendLocks`/`releaseLocks` quét mọi key; purge N con của một cha tốn O(N²).
+    - Lần `make test` đầu trượt 4 test lock waiter pg ("claimed 2 tasks, want 1") khi chạy song song với bench và review; chạy lại đạt. Thuộc T10.13.
 
 **D. Round trip và quan sát**
 - [ ] **T10.9** `Terminate` đọc `GetExecution` riêng để báo cho observer: trả thông tin cần thiết ngay từ câu lệnh terminate. Khi có hook, `inTx` tốn thêm một round trip `SELECT`: gộp vào batch.
