@@ -137,17 +137,7 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // ended over 30 days ag
   - `flows.activity.attempts` and `flows.activity.duration` are labeled by
     activity, outcome (`completed`, `failed`, `retrying`) and compensation.
   - `flows.runs.ended` is labeled by workflow and status.
-  - One trace per execution: its trace id is derived from the execution
-    (nothing is stored), so every workflow task and activity attempt, in
-    any process, is a child of the same execution span context (never
-    emitted itself: the trace's root shows as missing). Continue-as-new
-    starts another trace; `flows.instance_id` ties them.
-  - An attempt or task whose lease was lost ends with an error status and
-    `flows.outcome=lease_lost`; the attempt that replaces it is in the same
-    trace.
-  - Executions are sampled whole by a `ParentBased` sampler with
-    `WithRemoteParentSampled(TraceIDRatioBased(r))`; by default every span
-    is kept.
+  - Spans are roots, tied together by `flows.instance_id`.
 - **Alerts:**
   - any execution in `needs_attention`;
   - a growing count of `compensating` executions;

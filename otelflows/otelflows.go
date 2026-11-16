@@ -10,31 +10,13 @@
 // It is a separate module, so go-flows itself does not depend on
 // OpenTelemetry; an engine without a Tracer or Observer pays nothing.
 //
-// One trace per execution: a workflow's tasks and attempts run at
-// different times, possibly in different processes, and no trace context
-// is stored with an execution. Instead the trace id, and the span id of a
-// span context standing for the execution, are derived from the execution
-// (its instance id and execution id): every task and attempt span, in any
-// process, is a child of that span context, so they share one trace (an
-// attempt whose lease was lost, and the attempt that replaced it, side by
-// side). The execution's span is never emitted itself (backends show the
-// trace's root as missing). Continue-as-new starts another execution, so
-// another trace; the flows.instance_id attribute ties them.
-//
-// That span context is a remote parent marked sampled, so a ParentBased
-// sampler keeps every span of an execution by default. To sample whole
-// executions, use its remote-parent option with a ratio of trace ids,
-// which is consistent across processes:
-//
-//	sdktrace.ParentBased(root, sdktrace.WithRemoteParentSampled(sdktrace.TraceIDRatioBased(0.1)))
-//
-// Spans of an attempt or task whose lease was lost (another engine runs it
-// again) end with an error status and flows.outcome "lease_lost".
+// Spans are roots, tied together by the flows.instance_id attribute: a
+// workflow's tasks and attempts run at different times, possibly in
+// different processes, and no trace context is stored with an execution.
 package otelflows
 
 import (
 	"context"
-	"errors"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -50,7 +32,6 @@ const scope = "github.com/imdat99/go-flows/otelflows"
 // Attribute keys.
 const (
 	AttrInstanceID   = attribute.Key("flows.instance_id")
-	AttrExecutionID  = attribute.Key("flows.execution_id")
 	AttrWorkflow     = attribute.Key("flows.workflow")
 	AttrVersion      = attribute.Key("flows.workflow_version")
 	AttrActivity     = attribute.Key("flows.activity")
@@ -76,82 +57,22 @@ func (t tracer) StartActivity(ctx context.Context, a flows.ActivityInfo) (contex
 	if a.Compensation {
 		name = "flows.compensate " + a.Activity
 	}
-	ctx, span := t.t.Start(inExecution(ctx, a.InstanceID, a.ExecutionID), name, trace.WithAttributes(
-		AttrInstanceID.String(a.InstanceID), AttrExecutionID.Int64(a.ExecutionID), AttrActivity.String(a.Activity),
-		AttrAttempt.Int(a.Attempt), AttrCompensation.Bool(a.Compensation), AttrUncertain.Bool(a.Uncertain),
+	ctx, span := t.t.Start(ctx, name, trace.WithAttributes(
+		AttrInstanceID.String(a.InstanceID), AttrActivity.String(a.Activity), AttrAttempt.Int(a.Attempt),
+		AttrCompensation.Bool(a.Compensation), AttrUncertain.Bool(a.Uncertain),
 	))
 	return ctx, func(err error) {
 		if err != nil {
-			fail(span, err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 		}
 		span.End()
 	}
 }
 
-// fail records err on span, marking a lost lease.
-func fail(span trace.Span, err error) {
-	if errors.Is(err, flows.ErrLeaseLost) {
-		span.SetAttributes(AttrOutcome.String("lease_lost"))
-	}
-	span.RecordError(err)
-	span.SetStatus(codes.Error, err.Error())
-}
-
-// inExecution returns ctx under the span context standing for execution
-// id of instance, replacing any span ctx holds (the engine's own context
-// is not the execution's); ctx unchanged for id 0, an unknown execution.
-func inExecution(ctx context.Context, instance string, id int64) context.Context {
-	if id == 0 {
-		return ctx
-	}
-	return trace.ContextWithRemoteSpanContext(ctx, executionSpanContext(instance, id))
-}
-
-// executionSpanContext derives the span context of an execution from its
-// identity (FNV-1a with distinct seeds: no allocation, the same in every
-// process). The execution id is unique in its store; the instance id
-// separates executions of different stores.
-func executionSpanContext(instance string, id int64) trace.SpanContext {
-	var tid trace.TraceID
-	var sid trace.SpanID
-	put := func(b []byte, v uint64) {
-		for i := range 8 {
-			b[i] = byte(v >> (56 - 8*i))
-		}
-	}
-	put(tid[:8], identityHash(1, instance, id))
-	put(tid[8:], identityHash(2, instance, id))
-	put(sid[:], identityHash(3, instance, id))
-	if !tid.IsValid() { // all zero: practically never
-		tid[15] = 1
-	}
-	if !sid.IsValid() {
-		sid[7] = 1
-	}
-	return trace.NewSpanContext(trace.SpanContextConfig{
-		TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled, Remote: true,
-	})
-}
-
-// identityHash is FNV-1a 64 over seed, instance and id.
-func identityHash(seed byte, instance string, id int64) uint64 {
-	const prime = 1099511628211
-	h := uint64(14695981039346656037)
-	h = (h ^ uint64(seed)) * prime
-	for i := range len(instance) {
-		h = (h ^ uint64(instance[i])) * prime
-	}
-	h = (h ^ 0xff) * prime // end of the instance id (the seed and id are fixed-width)
-	for i := range 8 {
-		h = (h ^ uint64(byte(uint64(id)>>(8*i)))) * prime
-	}
-	return h
-}
-
 func (t tracer) StartWorkflowTask(ctx context.Context, w flows.WorkflowTaskInfo) func(flows.Status, error) {
-	_, span := t.t.Start(inExecution(ctx, w.InstanceID, w.ExecutionID), "flows.workflow_task "+w.Workflow, trace.WithAttributes(
-		AttrInstanceID.String(w.InstanceID), AttrExecutionID.Int64(w.ExecutionID),
-		AttrWorkflow.String(w.Workflow), AttrVersion.Int(w.Version),
+	_, span := t.t.Start(ctx, "flows.workflow_task "+w.Workflow, trace.WithAttributes(
+		AttrInstanceID.String(w.InstanceID), AttrWorkflow.String(w.Workflow), AttrVersion.Int(w.Version),
 		// A task of a compensating execution plans compensation steps.
 		AttrCompensation.Bool(w.Status == flows.StatusCompensating),
 	))
@@ -161,7 +82,8 @@ func (t tracer) StartWorkflowTask(ctx context.Context, w flows.WorkflowTaskInfo)
 		}
 		switch {
 		case err != nil:
-			fail(span, err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 		case s == flows.StatusNeedsAttention || s == flows.StatusFailed:
 			span.SetStatus(codes.Error, "execution "+string(s))
 		}

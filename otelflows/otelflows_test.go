@@ -69,7 +69,6 @@ func TestTracesAndMetrics(t *testing.T) {
 	if db, act := byName["db.insert"], byName["flows.activity otel.reserve"]; db.Parent().SpanID() != act.SpanContext().SpanID() {
 		t.Fatal("the activity's span is not a child of the attempt's")
 	}
-	oneTrace(t, spans.Ended())
 	if s := byName["flows.activity otel.pay"]; s.Status().Code != codes.Error {
 		t.Fatalf("failed attempt status %v", s.Status())
 	}
@@ -107,17 +106,6 @@ func TestTracesAndMetrics(t *testing.T) {
 	} {
 		if sums[key] != want {
 			t.Fatalf("%s = %d, want %d (all: %v)", key, sums[key], want, sums)
-		}
-	}
-}
-
-// oneTrace expects every span of the execution, the activity's own
-// included, in one trace (T10.10).
-func oneTrace(t *testing.T, spans []sdktrace.ReadOnlySpan) {
-	t.Helper()
-	for _, s := range spans {
-		if s.SpanContext().TraceID() != spans[0].SpanContext().TraceID() {
-			t.Fatalf("span %q in another trace", s.Name())
 		}
 	}
 }

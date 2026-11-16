@@ -23,10 +23,6 @@ var (
 	ErrNotFound = store.ErrNotFound
 	// ErrNotActive reports an instance whose latest execution ended.
 	ErrNotActive = store.ErrNotActive
-	// ErrLeaseLost is matched by the error a Tracer's end gets for an
-	// activity attempt or workflow task whose lease was lost: another
-	// engine took its task and runs it again (its outcome is not recorded).
-	ErrLeaseLost = store.ErrLeaseLost
 	// ErrInstanceConflict reports an instance id already used by another
 	// workflow: an instance id is an idempotency key.
 	ErrInstanceConflict = store.ErrInstanceConflict
