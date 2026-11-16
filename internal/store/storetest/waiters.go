@@ -327,7 +327,7 @@ func testLockWaiterHeadTerminated(t *testing.T, h Harness) {
 		}
 	}
 	seq.end(t, s, h, "i0")
-	if err := s.Terminate(ctx, "i1", "gone"); err != nil {
+	if _, err := s.Terminate(ctx, "i1", "gone"); err != nil {
 		t.Fatal(err)
 	}
 	if ev := seq.queueFor(t, s, h, "i3", 1, "k", 0, 0); ev.Type != history.LockAcquired {

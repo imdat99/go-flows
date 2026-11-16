@@ -133,7 +133,7 @@ func testLocks(t *testing.T, h Harness) {
 		t.Fatalf("after the holder ended: %+v", ev)
 	}
 	// So does a termination.
-	if err := s.Terminate(ctx, "i3", "x"); err != nil {
+	if _, err := s.Terminate(ctx, "i3", "x"); err != nil {
 		t.Fatal(err)
 	}
 	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i1"), 3, "k"); ev.Type != history.LockAcquired {

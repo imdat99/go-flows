@@ -51,28 +51,27 @@ type Hook func(ctx context.Context, tx pgx.Tx, e store.EndInfo) error
 // SetHook installs the end hook (before the store is used).
 func (s *Store) SetHook(h Hook) { s.hook = h }
 
-// inTx runs fn in a transaction, then the end hook for the execution fn
-// returns, with info's status and error, then commits.
-func (s *Store) inTx(ctx context.Context, info store.EndInfo, fn func(tx pgx.Tx) (int64, error)) error {
+// inTx runs fn in a transaction, then the end hook with info, which fn
+// completes with the identity of the execution it ended (read in its own
+// batch, T10.9: no extra round trip), then commits.
+func (s *Store) inTx(ctx context.Context, info store.EndInfo, fn func(tx pgx.Tx, info *store.EndInfo) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	id, err := fn(tx)
-	if err != nil {
+	if err := fn(tx, &info); err != nil {
 		return err
 	}
-	if err := tx.QueryRow(ctx, `SELECT instance_id, workflow, version FROM flows.execution WHERE id = $1`, id).
-		Scan(&info.InstanceID, &info.Workflow, &info.Version); err != nil {
-		return err
-	}
-	info.ExecutionID = id
 	if err := callHook(ctx, s.hook, tx, info); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
+
+// endIdentity reads the identity of execution $1 for an end hook, queued
+// last in the batch that ends it.
+const endIdentity = `SELECT instance_id, workflow, version FROM flows.execution WHERE id = $1`
 
 // hookError wraps an end hook's error (it is not retried as a transient one).
 type hookError struct{ err error }
@@ -1286,6 +1285,9 @@ func (s *Store) completeWithPgx(ctx context.Context, l store.Lease, c *store.Com
 		sh.statements++
 	}
 	s.queueCompletion(b, l, c, ending, lastSeq, &sh)
+	if hooked {
+		b.Queue(endIdentity, l.ID) // for the hook, in the same round trip (before the resume's statements)
+	}
 	resume := resumes(c, ending)
 	if resume {
 		queueResume(b, l, c.KeepFor) // T9.7: in the same round trip
@@ -1293,13 +1295,19 @@ func (s *Store) completeWithPgx(ctx context.Context, l store.Lease, c *store.Com
 	var claimed map[actKey]int64
 	send := func(sb interface {
 		SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
-	},
+	}, info *store.EndInfo,
 	) error {
 		br := sb.SendBatch(ctx, b)
 		defer br.Close()
 		var err error
 		if claimed, err = readCompletion(br, sh); err != nil {
 			return err
+		}
+		if info != nil {
+			info.ExecutionID = l.ID
+			if err := br.QueryRow().Scan(&info.InstanceID, &info.Workflow, &info.Version); err != nil {
+				return err
+			}
 		}
 		if resume {
 			t, ok, err := readResume(br, l.Owner)
@@ -1314,10 +1322,10 @@ func (s *Store) completeWithPgx(ctx context.Context, l store.Lease, c *store.Com
 	}
 	if hooked {
 		err := s.inTx(ctx, store.EndInfo{Status: c.Status, Err: c.Err, ErrKinds: c.ErrKinds},
-			func(tx pgx.Tx) (int64, error) { return l.ID, send(tx) })
+			func(tx pgx.Tx, info *store.EndInfo) error { return send(tx, info) })
 		return claimed, err
 	}
-	return claimed, send(s.pool)
+	return claimed, send(s.pool, nil)
 }
 
 // eagerLeases lists the leases of the eagerly claimed activity tasks, in the

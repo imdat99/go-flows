@@ -1264,19 +1264,19 @@ func (s *Store) hint(kind store.WorkKind, queue string) {
 }
 
 // Terminate implements store.Store.
-func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error {
+func (s *Store) Terminate(ctx context.Context, instanceID, reason string) (store.EndInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id, ok := s.latest[instanceID]
 	if !ok {
-		return store.ErrNotFound
+		return store.EndInfo{}, store.ErrNotFound
 	}
 	e := s.executions[id]
 	if !e.Status.Active() {
-		return store.ErrNotActive
+		return store.EndInfo{}, store.ErrNotActive
 	}
 	if err := s.callHook(ctx, e, store.StatusTerminated, reason, ""); err != nil {
-		return err
+		return store.EndInfo{}, err
 	}
 	now := s.clock.Now()
 	seq := int64(1)
@@ -1290,7 +1290,10 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 	e.lease = store.Lease{ID: e.ID, Version: e.lease.Version + 1}
 	e.lockedUntil, e.stickyOwner, e.stickyUntil = time.Time{}, "", time.Time{}
 	s.end(e, &store.Completion{Status: store.StatusTerminated, Err: reason}, now)
-	return nil
+	return store.EndInfo{
+		ExecutionID: e.ID, InstanceID: e.InstanceID, Workflow: e.Workflow, Version: e.Version,
+		Status: store.StatusTerminated, Err: reason,
+	}, nil
 }
 
 // ClaimWorkflowTasksDue implements store.DueClaimer.

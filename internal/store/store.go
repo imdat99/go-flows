@@ -543,8 +543,10 @@ type Store interface {
 	// ExecutionTerminated is appended to its history, no workflow code or
 	// compensation runs, its pending events and tasks are dropped, its
 	// parent is notified, and any lease on it is lost (the holder's writes
-	// fail). ErrNotFound / ErrNotActive as Signal.
-	Terminate(ctx context.Context, instanceID, reason string) error
+	// fail). It returns what an end hook sees of the terminated execution
+	// (its identity, StatusTerminated, reason), from the same statement
+	// (no extra read). ErrNotFound / ErrNotActive as Signal.
+	Terminate(ctx context.Context, instanceID, reason string) (EndInfo, error)
 
 	// Signal delivers a SignalReceived event to the active execution of an
 	// instance id: ErrNotFound if the id is unknown, ErrNotActive if its

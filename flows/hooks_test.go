@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/imdat99/go-flows/internal/store"
 	"github.com/imdat99/go-flows/internal/store/mem"
 )
 
@@ -399,4 +400,47 @@ func TestTracerSpansBalance(t *testing.T) {
 		defer b.mu.Unlock()
 		return b.starts == b.ends && slices.Contains(b.taskEnds, "needs_attention/true")
 	})
+}
+
+// readCounter counts the GetExecution reads made through it.
+type readCounter struct {
+	store.Store
+	reads atomic.Int32
+}
+
+func (r *readCounter) GetExecution(ctx context.Context, id string) (store.Execution, error) {
+	r.reads.Add(1)
+	return r.Store.GetExecution(ctx, id)
+}
+
+// T10.9: Terminate tells the observer what it ended from the terminate
+// statement itself, without reading the execution again.
+func TestTerminateInformsObserverWithoutARead(t *testing.T) {
+	r := &recorder{}
+	st := &readCounter{Store: mem.New(nil)}
+	e, err := newEngine(st, Options{InstanceID: "term-obs", PollMax: 20 * time.Millisecond, Observer: obs{r}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+		defer cancel()
+		_ = e.Stop(ctx)
+	})
+	h, _ := waitForeverWF.Start(bg, e, "term-obs", 0)
+	waitFor(t, func() bool { st, _ := h.Status(bg); return st == StatusRunning })
+	before := st.reads.Load()
+	if err := e.Terminate(bg, "term-obs", "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if n := st.reads.Load() - before; n != 0 {
+		t.Fatalf("Terminate read the execution %d times", n)
+	}
+	run, ok := r.find(func(r *recorder) []RunInfo { return r.ended }, "term-obs")
+	if !ok || run.Status != StatusTerminated || run.Error != "operator" || run.Workflow != "test.forever" || run.Version != 1 {
+		t.Fatalf("observed %+v %v", run, ok)
+	}
 }

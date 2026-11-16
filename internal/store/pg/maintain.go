@@ -208,9 +208,10 @@ const (
 			    ready_at = NULL, owner_id = '', locked_until = NULL, lease_version = x.lease_version + 1,
 			    sticky_owner = '', sticky_until = NULL
 			FROM e WHERE x.id = e.id
-			RETURNING x.id
+			RETURNING x.id, x.instance_id, x.workflow, x.version
 		)
-		SELECT CASE WHEN count(*) = 0 THEN (1 / (0 * random()))::bigint ELSE max(id) END FROM u`
+		SELECT CASE WHEN count(*) = 0 THEN (1 / (0 * random()))::bigint ELSE max(id) END,
+		       max(instance_id), max(workflow), max(version) FROM u`
 	latestOf = `(SELECT id FROM flows.execution WHERE instance_id = $1 ORDER BY id DESC LIMIT 1)`
 )
 
@@ -339,9 +340,10 @@ const notifyTerminated = `
 	SELECT ` + notifyW + "queue) FROM p"
 
 // Terminate implements store.Store.
-func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error {
+func (s *Store) Terminate(ctx context.Context, instanceID, reason string) (store.EndInfo, error) {
 	ev := store.ChildOutcome(store.Execution{Status: store.StatusTerminated, Err: reason})
 	for range maxRetries {
+		var ended store.EndInfo
 		err := retry(ctx, func() error {
 			b := &pgx.Batch{}
 			b.Queue(lockParentLatest, instanceID) // parent row first, as lockParent
@@ -354,51 +356,57 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 			b.Queue(wakeWaitersLatest, instanceID)
 			b.Queue(dropLocksLatest, instanceID)
 			b.Queue(notifyTerminated, instanceID, ev.Err, ev.ErrKinds)
+			// send fills info with the terminated execution's identity
+			// (returned by the terminate statement, T10.9).
 			send := func(sb interface {
 				SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
-			},
-			) (int64, error) {
+			}, info *store.EndInfo,
+			) error {
 				br := sb.SendBatch(ctx, b)
 				defer br.Close()
 				if _, err := br.Exec(); err != nil { // lockParentLatest
-					return 0, err
+					return err
 				}
-				var id int64
-				if err := br.QueryRow().Scan(&id); err != nil {
-					return 0, err
+				if err := br.QueryRow().Scan(&info.ExecutionID, &info.InstanceID, &info.Workflow, &info.Version); err != nil {
+					return err
 				}
 				for range 6 {
 					if _, err := br.Exec(); err != nil {
-						return 0, err
+						return err
 					}
 				}
-				return id, br.Close()
+				return br.Close()
 			}
+			ended = store.EndInfo{Status: store.StatusTerminated, Err: reason}
 			if s.hook != nil {
-				return s.inTx(ctx, store.EndInfo{Status: store.StatusTerminated, Err: reason},
-					func(tx pgx.Tx) (int64, error) { return send(tx) })
+				return s.inTx(ctx, ended, func(tx pgx.Tx, info *store.EndInfo) error {
+					if err := send(tx, info); err != nil {
+						return err
+					}
+					ended = *info
+					return nil
+				})
 			}
-			_, err := send(s.pool)
-			return err
+			return send(s.pool, &ended)
 		})
 		if he := (*hookError)(nil); err != nil && (errors.As(err, &he) || sqlState(err) != codeLeaseLost) {
-			return fmt.Errorf("terminate: %w", err)
+			return store.EndInfo{}, fmt.Errorf("terminate: %w", err)
 		}
 		if err == nil {
-			return nil
+			return ended, nil
 		}
 		// Nothing active was terminated: the latest execution ended, or
 		// continued as new while we waited for its row (then try its
 		// successor).
 		e, gerr := s.GetExecution(ctx, instanceID)
 		if gerr != nil {
-			return gerr
+			return store.EndInfo{}, gerr
 		}
 		if !e.Status.Active() {
-			return store.ErrNotActive
+			return store.EndInfo{}, store.ErrNotActive
 		}
 	}
-	return fmt.Errorf("terminate: %s kept continuing as new", instanceID)
+	return store.EndInfo{}, fmt.Errorf("terminate: %s kept continuing as new", instanceID)
 }
 
 // NoteStuck implements store.Store.

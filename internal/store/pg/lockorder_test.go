@@ -77,7 +77,8 @@ func TestEndsLockRowsInOrder(t *testing.T) {
 			return err
 		},
 		"terminate": func(s *pg.Store, task store.WorkflowTask, _ int64) error {
-			return s.Terminate(context.Background(), task.Execution.InstanceID, "stop")
+			_, err := s.Terminate(context.Background(), task.Execution.InstanceID, "stop")
+			return err
 		},
 	}
 	stores := map[string]func(t *testing.T) *pg.Store{

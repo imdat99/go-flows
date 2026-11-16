@@ -62,7 +62,7 @@ func testLockWaiterTerminatedHolder(t *testing.T, h Harness) {
 	if ev := seq.queueFor(t, s, h, "i1", 1, "k", time.Hour, time.Hour); ev.Type != history.LockHeld {
 		t.Fatalf("i1: %+v", ev)
 	}
-	if err := s.Terminate(ctx, "i0", "x"); err != nil {
+	if _, err := s.Terminate(ctx, "i0", "x"); err != nil {
 		t.Fatal(err)
 	}
 	t1 := claimOne(t, s, owner, h.TTL)

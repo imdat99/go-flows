@@ -105,7 +105,7 @@ func testEndHookCalls(t *testing.T, h Harness) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Terminate(ctx, "i3", "stop"); err != nil {
+	if _, err := s.Terminate(ctx, "i3", "stop"); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()

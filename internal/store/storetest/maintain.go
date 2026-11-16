@@ -190,7 +190,7 @@ func testTerminalWithNilConsumed(t *testing.T, h Harness) {
 // parent learns of it.
 func testTerminate(t *testing.T, h Harness) {
 	s := h.New(t)
-	if err := s.Terminate(ctx, "missing", "x"); !errors.Is(err, store.ErrNotFound) {
+	if _, err := s.Terminate(ctx, "missing", "x"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("unknown: %v", err)
 	}
 	mustCreate(t, s, "parent")
@@ -206,12 +206,21 @@ func testTerminate(t *testing.T, h Harness) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Terminate(ctx, "child", "operator said so"); err != nil {
+	ended, err := s.Terminate(ctx, "child", "operator said so")
+	if err != nil {
 		t.Fatal(err)
 	}
 	e, _ := s.GetExecution(ctx, "child")
 	if e.Status != store.StatusTerminated || e.Err != "operator said so" || e.EndedAt.IsZero() {
 		t.Fatalf("terminated execution %+v", e)
+	}
+	// T10.9: what was terminated, without another read.
+	want := store.EndInfo{
+		ExecutionID: e.ID, InstanceID: "child", Workflow: "cw", Version: 1,
+		Status: store.StatusTerminated, Err: "operator said so",
+	}
+	if ended != want {
+		t.Fatalf("Terminate returned %+v, want %+v", ended, want)
 	}
 	hist, _ := s.LoadHistory(ctx, e.ID, 0)
 	if n := len(hist); n != 2 || hist[1].Type != history.ExecutionTerminated || hist[1].Seq != 2 {
@@ -223,7 +232,7 @@ func testTerminate(t *testing.T, h Harness) {
 	if _, err := s.CompleteActivityTask(ctx, leases[0], store.ActivityResult{Event: history.Event{Type: history.ActivityCompleted}}); !errors.Is(err, store.ErrLeaseLost) {
 		t.Fatalf("activity of a terminated execution: %v", err)
 	}
-	if err := s.Terminate(ctx, "child", "again"); !errors.Is(err, store.ErrNotActive) {
+	if _, err := s.Terminate(ctx, "child", "again"); !errors.Is(err, store.ErrNotActive) {
 		t.Fatalf("terminate twice: %v", err)
 	}
 	ptask := claimOne(t, s, owner, h.TTL)
@@ -414,7 +423,7 @@ func testEndCancelsChildren(t *testing.T, h Harness) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if err := s.Terminate(ctx, parent, "x"); err != nil {
+			if _, err := s.Terminate(ctx, parent, "x"); err != nil {
 				t.Fatal(err)
 			}
 		}

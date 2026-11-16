@@ -239,19 +239,18 @@ func (e *Engine) Terminate(ctx context.Context, instanceID, reason string) error
 		return err
 	}
 	reason = text.Safe(reason, maxErrorText)
-	if err := e.st.Terminate(ctx, instanceID, reason); err != nil {
+	ended, err := e.st.Terminate(ctx, instanceID, reason)
+	if err != nil {
 		return err
 	}
 	if e.obs != nil {
-		if ex, err := e.st.GetExecution(ctx, instanceID); err == nil {
-			func() {
-				defer func() { _ = recover() }() // a broken observer must not fail Terminate
-				e.obs.RunEnded(RunInfo{
-					InstanceID: instanceID, Workflow: ex.Workflow, Version: int(ex.Version),
-					Status: StatusTerminated, Error: reason,
-				})
-			}()
-		}
+		func() {
+			defer func() { _ = recover() }() // a broken observer must not fail Terminate
+			e.obs.RunEnded(RunInfo{
+				InstanceID: instanceID, Workflow: ended.Workflow, Version: int(ended.Version),
+				Status: StatusTerminated, Error: reason,
+			})
+		}()
 	}
 	return nil
 }
