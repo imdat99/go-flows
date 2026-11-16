@@ -122,7 +122,7 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
 
   - T3.2–T3.6: worker (`internal/worker`). Gồm poller có backoff và hint, driver theo từng execution (vòng eager, cửa sổ eager, chuyển phần còn lại cho recorder khi nhả lease), heartbeat gộp có kiểm tra version lease, cache theo kiểu checkout, retry phía engine, huỷ activity, Terminate (store và migration `00002`), Stop êm.
     - Mục "giới hạn theo byte" của T3.3 chưa làm: cache mới giới hạn theo số lượng.
-    - `BenchmarkActivityRun` (Postgres, eager, 10 activity): khoảng 1090 alloc mỗi lần chạy; khoảng 5.5 ms mỗi activity khi `synchronous_commit=off`. **Chưa đạt mục tiêu ≤ 80 alloc**, chuyển sang T8.2.
+    - `BenchmarkActivityRun` (Postgres, eager, 10 activity): khoảng 1090 alloc mỗi lần chạy (đo khi async commit; số mới ở T8.2); khoảng 5.5 ms mỗi activity khi `synchronous_commit=off`. **Chưa đạt mục tiêu ≤ 80 alloc**, chuyển sang T8.2.
     - Review: lần 1 không đạt (hạn chờ của Stop làm hỏng workflow; báo cáo lease cũ huỷ nhầm lease mới; nhả lease mà không giải phóng slot; resume lỗi làm rò lease; Compensate bị bỏ; renewedAt sai; huỷ khi đang chờ retry; Terminate dễ gãy; panic). Lần 2 không đạt (attempt thành công sau hạn chờ bị bỏ). Lần 3 đạt.
 
 ### P4 — API công khai
@@ -323,7 +323,29 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
     - tự ghi Bind/Execute thay cho `pgconn.Batch`, vì pgconn không cho tái dùng batch;
     - theo dõi context kiểu `Interrupt` của saga;
     - tuỳ chọn một commit mỗi activity (tương tự `AsyncStepStart`).
-- [ ] **T8.2** Benchmark đầy đủ so với saga và go-workflows, viết `docs/benchmarks.md`, bật perf gate trong CI.
+    - **Chưa làm, để mở:** cần thiết kế lại SQL của store (gộp câu lệnh thành CTE, tự mã hoá wire, claim qua fast path). Phân tích và hướng đi nằm trong `docs/benchmarks.md`. Trong T8.2 chỉ giảm được 13.6% nhờ sửa vòng poll (bên dưới).
+- [x] **T8.2** Benchmark đầy đủ so với saga và go-workflows, viết `docs/benchmarks.md`, bật perf gate trong CI.
+    - **So sánh** (10 activity no-op, Postgres cùng máy, durable commit):
+      - saga: 96 ms, 63 alloc;
+      - go-flows: 172 ms, khoảng 1200 alloc (80 ms khi async commit);
+      - go-workflows 48e8119: thời gian chạy 2.5 s với poll mặc định, 0.77 s với poll 1 ms, đo bằng `run-ms` lấy từ history, không tính phần poll của client; 26k–150k alloc.
+      - go-flows nhanh hơn go-workflows 4.5–15 lần, chậm hơn saga khoảng 1.8 lần (khoảng 9 câu lệnh mỗi activity so với 3).
+    - **Vòng poll:** hint không còn reset backoff, nên `BenchmarkActivityRun` giảm từ 1397 xuống 1213 alloc (−13.6%).
+      - Việc có delay mà worker tự commit (timer, retry delay) không có hint. Worker ghi thời điểm đến hạn (`internal/worker/due.go`): làm tròn lên 10 ms, bỏ trùng, chỉ giữ trong 64·PollMax.
+      - Thời điểm đến hạn mới chỉ rút ngắn giấc ngủ, không claim sớm.
+      - Poll theo giờ mà tìm thấy việc thì reset backoff.
+      - Claim lỗi thì backoff, không quay vòng.
+      - Test: `TestDelayedWorkIsNotPollMaxLate` (mem + pg), `TestTimedPollsFindingWorkDoNotBackOff`, `TestDueTimesDoNotCauseEmptyClaims`, `TestDueTimes*`. Mỗi test đỏ khi bỏ phần sửa tương ứng.
+    - **Perf gate** (`perf-budget.txt`, `make benchgate`): `BenchmarkActivityRun` ≤ 1300 (trung vị 1192–1226), `BenchmarkPublicActivityRun` ≤ 1450 (1284–1357), codec 1/1/0, Replay ≤ 140, EagerActivity ≤ 56.
+    - **CI** (`.github/workflows/ci.yml`): test + chaos, lint (4 module), bench + benchgate; Postgres chạy bằng `make up`; `bench.txt` luôn được upload.
+    - **Module `bench/goworkflows`:** pin 48e8119; database tạo cho mỗi lần chạy được xoá sau khi chạy.
+    - **Review:**
+      - Lần 1 không đạt: timer trễ tới PollMax khi engine rảnh; so sánh dùng `GetWorkflowResult`; budget lỏng; CI.
+      - Lần 2 không đạt: nhiều timer làm poll liên tục và bộ nhớ tăng không giới hạn; poll theo giờ tìm thấy việc vẫn backoff.
+      - Lần 3 đạt. Sau đó đã sửa thêm các mục còn lại: kênh `changed` riêng để không claim rỗng, sàn của grain, lời văn.
+    - **Còn mở:**
+      - delay do worker khác commit, hand-back, và việc ngoài horizon vẫn có thể trễ tối đa PollMax;
+      - gate trên runner CI dùng chung có thể dao động (headroom khoảng 7%).
 - [ ] **T8.3** Tài liệu song ngữ: concepts, guarantees, operations, patterns.
 - [ ] **T8.4** Review tổng thể toàn repo bằng subagent (đọc lạnh), sửa các phát hiện.
 

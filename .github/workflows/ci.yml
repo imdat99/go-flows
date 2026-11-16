@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The repository's compose file (max_connections=500: packages run
+      # in parallel against this one server), waiting until healthy.
+      - name: postgres
+        run: make up
+      - name: test (race; root, analyzer and otelflows modules)
+        run: make test
+      - name: chaos
+        run: make chaos
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15.0
+          install-only: true # make lint runs it, on every module
+      - name: lint (all modules)
+        run: make lint
+
+  # Perf gate: allocation budgets (perf-budget.txt) are near deterministic
+  # and machine independent; the time rules are loose ceilings.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The repository's compose file (max_connections=500: packages run
+      # in parallel against this one server), waiting until healthy.
+      - name: postgres
+        run: make up
+      - run: make bench
+      - run: make benchgate
+      - uses: actions/upload-artifact@v4
+        if: always() # most needed when the gate fails
+        with:
+          name: bench
+          path: bench.txt

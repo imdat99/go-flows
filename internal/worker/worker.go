@@ -175,6 +175,7 @@ type Worker struct {
 
 	wfSlots, actSlots chan struct{} // semaphores
 	wfHint, actHint   chan struct{} // store hints, capacity 1
+	wfDue, actDue     *dueTimes     // local wake-ups for committed delays
 
 	mu sync.Mutex
 	// pollCancel stops claiming (Stop's first step); taskCancel ends the
@@ -214,7 +215,17 @@ func New(st store.Store, wfs Workflows, acts Activities, opts Options) (*Worker,
 		actSlots: make(chan struct{}, opts.MaxActivities),
 		wfHint:   make(chan struct{}, 1),
 		actHint:  make(chan struct{}, 1),
+		wfDue:    newDueTimes(dueGrain(opts), 64*opts.PollMax),
+		actDue:   newDueTimes(dueGrain(opts), 64*opts.PollMax),
 	}, nil
+}
+
+// dueGrain is the rounding of due times: 10 ms (at most 100 wake-ups a
+// second), not below 1 ms however short PollMin is. With the horizon of 64
+// timed polls, a set holds at most 64*PollMax/grain times (6400 by
+// default).
+func dueGrain(o Options) time.Duration {
+	return max(min(o.PollMin, 10*time.Millisecond), time.Millisecond)
 }
 
 // Start starts polling. Tasks run under contexts derived from
@@ -369,38 +380,76 @@ func tryAcquire(slots chan struct{}) bool {
 }
 
 // poll is the claim loop shared by both task kinds.
-func (w *Worker) poll(ctx context.Context, slots, hint chan struct{}, claim func(n int) (int, error)) {
+func (w *Worker) poll(ctx context.Context, slots, hint chan struct{}, due *dueTimes, claim func(n int) (int, error)) {
 	idle := w.opts.PollMin
 	t := time.NewTimer(idle)
 	defer t.Stop()
+	timedPoll := false // this claim follows a backoff timeout
 	for {
 		n := acquire(ctx, slots)
 		if n == 0 {
 			return
 		}
+		polled := time.Now()
 		started, err := claim(n)
 		release(slots, n-started)
 		if err != nil && ctx.Err() == nil {
 			w.log.LogAttrs(ctx, slog.LevelWarn, "flows: claim failed", slog.Any("error", err))
 		}
-		if started > 0 {
+		if started == n {
+			// Every free slot was filled: more work is probably waiting.
 			idle = w.opts.PollMin
+			timedPoll = false
 			continue
 		}
-		t.Reset(idle) // Go 1.23+ timers: Reset discards a pending value
-		select {
-		case <-ctx.Done():
-			return
-		case <-hint:
+		if started > 0 && timedPoll {
+			// Work without hints (a watcher down, delays of other
+			// workers): keep polling at a short interval while it comes.
 			idle = w.opts.PollMin
-		case <-t.C:
-			idle = min(2*idle, w.opts.PollMax)
+		}
+		// Ready work comes with a hint (store notifications), and work
+		// this worker committed with a delay (timers, retry delays) with a
+		// due time. The timed polls only find the rest: work other
+		// workers delayed, expired leases. A hint therefore polls once
+		// without resetting the backoff: resetting it made every hint cost
+		// a series of empty polls.
+		if err != nil {
+			// A failed claim covered nothing: its due times stay, and it
+			// backs off (no immediate retry while the store is down).
+			polled = time.Time{}
+		}
+		timedPoll = false
+		backoff := time.Now().Add(idle)
+	sleep:
+		for {
+			wait, timed := time.Until(backoff), true
+			if at, ok := due.next(polled); ok && err == nil {
+				if d := time.Until(at); d < wait {
+					wait, timed = max(d, 0), false
+				}
+			}
+			t.Reset(wait) // Go 1.23+ timers: Reset discards a pending value
+			select {
+			case <-ctx.Done():
+				return
+			case <-hint:
+				break sleep
+			case <-due.changed:
+				// A new earliest due time: sleep again until it (no claim
+				// before it is due).
+			case <-t.C:
+				if timed {
+					idle = min(2*idle, w.opts.PollMax)
+					timedPoll = true
+				}
+				break sleep
+			}
 		}
 	}
 }
 
 func (w *Worker) pollWorkflows(ctx context.Context) {
-	w.poll(ctx, w.wfSlots, w.wfHint, func(n int) (int, error) {
+	w.poll(ctx, w.wfSlots, w.wfHint, w.wfDue, func(n int) (int, error) {
 		at := time.Now()
 		tasks, err := w.st.ClaimWorkflowTasks(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
 		for i := range tasks {
@@ -415,7 +464,7 @@ func (w *Worker) pollWorkflows(ctx context.Context) {
 }
 
 func (w *Worker) pollActivities(ctx context.Context) {
-	w.poll(ctx, w.actSlots, w.actHint, func(n int) (int, error) {
+	w.poll(ctx, w.actSlots, w.actHint, w.actDue, func(n int) (int, error) {
 		at := time.Now()
 		tasks, err := w.st.ClaimActivityTasks(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
 		for i := range tasks {

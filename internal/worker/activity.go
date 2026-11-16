@@ -249,6 +249,10 @@ func (w *Worker) recordOnce(ctx context.Context, t *store.ActivityTask, o attemp
 		return nil, false, nil
 	case o.retry:
 		err := w.st.RetryActivityTask(ctx, t.Lease, o.delay, o.maybe)
+		if err == nil && o.delay > 0 {
+			// Measured after the commit: never before the store's time.
+			w.actDue.add(time.Now().Add(o.delay))
+		}
 		if errors.Is(err, store.ErrLeaseLost) {
 			err = nil
 		}

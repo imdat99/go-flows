@@ -32,8 +32,22 @@ BenchmarkReplay allocs/op <= 140
 
 # internal/worker (T3.5): end to end on Postgres, eager execution, one op =
 # a 10-activity workflow (start, run, end; includes polling, heartbeat,
-# goroutines). Measured ~1090 allocs/op, ~150 KiB/op; ~5.5 ms/activity with
-# synchronous_commit=off (fsync-bound ~14 ms otherwise). The plan's target
-# (<= 80 allocs/run) is NOT met yet: ~10 pipelined statements per activity
-# cost ~5 allocs each inside pgconn (see TASKS.md T8.2).
-BenchmarkActivityRun allocs/op <= 1200
+# goroutines). Measured (T8.2) median ~1215 allocs/op, ~217 KiB/op,
+# ~17 ms/activity (durable commit; ~8 ms with synchronous_commit=off). The
+# plan's target (<= 80 allocs/run) is NOT met: ~9 pipelined statements per
+# activity cost ~6 allocs each inside pgconn (see docs/benchmarks.md). T8.2:
+# idle pollers no longer reset their backoff on every hint (-13.6%); single
+# runs still vary +-6% with polling, hence ~7% headroom.
+BenchmarkActivityRun allocs/op <= 1300
+
+# Root package (T4.1): the typed codec on the data path; a whole workflow
+# through the public API (same shape as BenchmarkActivityRun, plus the
+# typed layer: measured median ~1280).
+BenchmarkCodec/encode allocs/op <= 1
+BenchmarkCodec/decode allocs/op <= 1
+BenchmarkCodec/lookup allocs/op <= 0
+BenchmarkPublicActivityRun allocs/op <= 1450
+
+# flowtest BenchmarkFanOut (T7.1) has no rule: it counts the allocations of
+# the whole tester process across runs (idle detection, pollers), too noisy
+# to gate; its time per n (~linear) is checked in docs/benchmarks.md.

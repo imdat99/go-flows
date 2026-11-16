@@ -1,4 +1,4 @@
-.PHONY: up down test race race10 chaos test-chaos lint lint-fix fmt bench benchcmp benchgate
+.PHONY: up down test race race10 chaos test-chaos lint lint-fix fmt bench bench-goworkflows benchcmp benchgate
 
 BENCH ?= .
 BENCHPKG ?= ./...
@@ -33,6 +33,7 @@ lint:
 	golangci-lint run ./...
 	cd analyzer && golangci-lint run --config ../.golangci.yml ./...
 	cd otelflows && golangci-lint run --config ../.golangci.yml ./...
+	cd bench/goworkflows && golangci-lint run --config ../../.golangci.yml ./...
 
 lint-fix:
 	golangci-lint run --fix ./...
@@ -47,6 +48,10 @@ fmt:
 # Benchmarks: no -race, 6 samples for benchstat.
 bench:
 	go test -run "^$$" -bench "$(BENCH)" -benchmem -count 6 $(BENCHPKG) | tee $(BENCHOUT)
+
+# go-workflows on the same scenario (docs/benchmarks.md); a separate module.
+bench-goworkflows:
+	cd bench/goworkflows && go test -run "^$$" -bench . -benchmem -benchtime 10x -count 3 .
 
 # Compare two bench outputs (make benchcmp OLD=old.txt NEW=bench.txt).
 benchcmp:

@@ -248,6 +248,11 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		return d.completeFailed(task, err)
 	}
 	d.taskStatus = c.Status
+	for i := range c.Timers {
+		// The timer's delay counts from the claim (task.Now), before sent:
+		// the local due time is never before the store's.
+		w.wfDue.add(sent.Add(c.Timers[i].At.Sub(task.Now)))
+	}
 	d.completed(task, c, eager, leases, sent)
 	if len(c.Locks) > 0 && d.held {
 		// The answers are pending already: run the next task at once.
