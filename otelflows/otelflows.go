@@ -24,7 +24,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
-	flows "github.com/imdat99/go-flows"
+	flows "github.com/imdat99/go-flows/flows"
 )
 
 const scope = "github.com/imdat99/go-flows/otelflows"

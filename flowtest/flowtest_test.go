@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	flows "github.com/imdat99/go-flows"
+	flows "github.com/imdat99/go-flows/flows"
 	"github.com/imdat99/go-flows/flowtest"
 )
 

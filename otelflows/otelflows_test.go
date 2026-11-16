@@ -14,7 +14,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 
-	flows "github.com/imdat99/go-flows"
+	flows "github.com/imdat99/go-flows/flows"
 	"github.com/imdat99/go-flows/flowtest"
 	"github.com/imdat99/go-flows/otelflows"
 )

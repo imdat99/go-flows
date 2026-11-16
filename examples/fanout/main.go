@@ -14,7 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	flows "github.com/imdat99/go-flows"
+	flows "github.com/imdat99/go-flows/flows"
 )
 
 var (

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	fl "github.com/imdat99/go-flows"
+	fl "github.com/imdat99/go-flows/flows"
 )
 
 var src = mrand.New(mrand.NewSource(1)) // outside workflow code: fine

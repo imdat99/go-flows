@@ -63,7 +63,7 @@ FLOWS_TEST_DSN=postgres://... make test   # another server
 
 - **Toolchain:** Go 1.27 and `pgx/v5`. `database/sql` appears only inside `Migrate`, for goose.
 - **Migrations:** goose, embedded in `migrations/`. A change gets a new file; never edit an applied migration.
-- **Layout:** the public API lives in the root package `flows`, internals under `internal/`.
+- **Layout:** the public API lives in package `flows` (directory `flows/`, import `github.com/imdat99/go-flows/flows`), internals under `internal/`.
 - **Direct dependencies are an allowlist:** pgx, goose, uuid. Adding one is a design decision; record it in `TASKS.md` under decisions.
 - **Errors:** wrap with `%w` and context. Exported sentinels go in `errors.go`.
 - **Tests:** integration tests run against real Postgres via `internal/testdb`, which gives each test a fresh database.

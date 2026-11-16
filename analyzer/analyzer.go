@@ -26,7 +26,7 @@ import (
 )
 
 // FlowsPath is the import path of the flows package.
-const FlowsPath = "github.com/imdat99/go-flows"
+const FlowsPath = "github.com/imdat99/go-flows/flows"
 
 // Analyzer reports non-deterministic code in workflows.
 var Analyzer = &analysis.Analyzer{

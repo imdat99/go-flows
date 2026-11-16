@@ -16,7 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	flows "github.com/imdat99/go-flows"
+	flows "github.com/imdat99/go-flows/flows"
 	"github.com/imdat99/go-flows/internal/history"
 	"github.com/imdat99/go-flows/internal/testdb"
 )

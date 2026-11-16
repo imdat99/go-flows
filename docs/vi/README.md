@@ -29,6 +29,8 @@ nhiều instance và lớp saga của saga engine. Code được port ghi nguồ
 ## Ví dụ
 
 ```go
+import "github.com/imdat99/go-flows/flows"
+
 var (
 	charge = flows.DefineActivity("charge",
 		func(ctx context.Context, k flows.Key, o Order) (string, string, error) {
@@ -83,13 +85,13 @@ Bản chạy được nằm trong [`examples/`](../../examples). Chạy Postgres
   GW-1 tới GW-18 mà engine này sửa).
 
 Tài liệu tham chiếu API là tài liệu của package (`go doc
-github.com/imdat99/go-flows`).
+github.com/imdat99/go-flows/flows`).
 
 ## Package và module
 
 | Đường dẫn | Công dụng |
 | --- | --- |
-| `flows` (gốc) | Engine và API workflow. |
+| `flows` (`github.com/imdat99/go-flows/flows`) | Engine và API workflow. |
 | `flowtest` | Test trên engine thật, với store bộ nhớ, thời gian ảo và activity giả lập. |
 | `idem` | Hiệu ứng đúng một lần cho activity, theo `flows.Key`. |
 | `otelflows` (module riêng) | Tracer và observer metric OpenTelemetry. |

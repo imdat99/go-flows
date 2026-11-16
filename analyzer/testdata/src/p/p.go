@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	fl "github.com/imdat99/go-flows"
+	fl "github.com/imdat99/go-flows/flows"
 )
 
 var order = fl.DefineWorkflow("order", 1, func(c fl.Ctx, items map[string]int) (int, error) {

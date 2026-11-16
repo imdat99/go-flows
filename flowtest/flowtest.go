@@ -38,7 +38,7 @@ import (
 	"testing"
 	"time"
 
-	flows "github.com/imdat99/go-flows"
+	flows "github.com/imdat99/go-flows/flows"
 	"github.com/imdat99/go-flows/internal/bridge"
 	"github.com/imdat99/go-flows/internal/history"
 	"github.com/imdat99/go-flows/internal/store/mem"

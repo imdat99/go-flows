@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
-	fl "github.com/imdat99/go-flows"
+	fl "github.com/imdat99/go-flows/flows"
 )
 
 type state struct {

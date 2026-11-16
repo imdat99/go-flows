@@ -9,5 +9,5 @@ import (
 )
 
 func TestAnalyzer(t *testing.T) {
-	analysistest.Run(t, analysistest.TestData(), analyzer.Analyzer, "p", "q", "r", "github.com/imdat99/go-flows")
+	analysistest.Run(t, analysistest.TestData(), analyzer.Analyzer, "p", "q", "r", "github.com/imdat99/go-flows/flows")
 }

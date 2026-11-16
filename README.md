@@ -31,6 +31,8 @@ credited in [NOTICE](NOTICE). The comparison that motivated it is in
 ## Example
 
 ```go
+import "github.com/imdat99/go-flows/flows"
+
 var (
 	charge = flows.DefineActivity("charge",
 		func(ctx context.Context, k flows.Key, o Order) (string, string, error) {
@@ -84,13 +86,13 @@ Runnable versions are in [`examples/`](examples). Start Postgres with
 | go-workflows bugs this engine fixes (GW-1 to GW-18) | [regressions](docs/regressions.md) | |
 
 The API reference is the package documentation (`go doc
-github.com/imdat99/go-flows`).
+github.com/imdat99/go-flows/flows`).
 
 ## Packages and modules
 
 | Path | Purpose |
 | --- | --- |
-| `flows` (root) | The engine and the workflow API. |
+| `flows` (`github.com/imdat99/go-flows/flows`) | The engine and the workflow API. |
 | `flowtest` | Tests on the real engine, with an in-memory store, virtual time and mocked activities. |
 | `idem` | Exactly-once effects for activities, keyed by `flows.Key`. |
 | `otelflows` (separate module) | OpenTelemetry tracer and metrics observer. |
