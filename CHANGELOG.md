@@ -55,7 +55,9 @@ must take care of.
   does: no deadlock (detected by Postgres and retried) against a claim or
   a lock request. A claim over several queues locks only the executions it
   claims, not up to its limit in each queue, so a lock whose holder sits
-  in another queue is no longer refused for the time of that claim (T10.4).
+  in another queue is no longer refused for the time of that claim. Key
+  order is byte order in every statement, whatever the database collation
+  (T10.4).
 - A lock no longer lapses while its holder's next task waits in the queue
   (an activity's result, a signal or a fired timer delivered, no engine
   free to claim it for longer than the lock's `ttl`): such a holder keeps

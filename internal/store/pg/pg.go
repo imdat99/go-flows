@@ -147,10 +147,11 @@ func nonNil[T any](s []T) []T {
 // after a short randomized backoff. fn must be
 // all-or-nothing (one batch or one statement): a retry starts from scratch.
 //
-// The engine's statements lock rows in one order (lockParent); a rare
-// cycle left (two executions ending at once, each the other's lock's
-// waiter: lockWaitersOf) and the application's own transactions are
-// covered by retry.
+// The engine's statements mean to lock rows in one order (lockParent;
+// lock rows in byte order of their keys). Cycles that order leaves (the
+// one known: two executions ending at once, each the other's lock's
+// waiter, lockWaitersOf), any it misses, and the application's own
+// transactions are covered by retry.
 func retry(ctx context.Context, fn func() error) error {
 	var err error
 	for attempt := range maxRetries {
@@ -387,6 +388,9 @@ var claimWorkflow = `
 // The first $3 ready rows across the queues, read without locking, give
 // each queue its share; each queue then locks its share (SKIP LOCKED: rows
 // a concurrent claim holds are passed over for the queue's next ones).
+// When that falls short (a queue had fewer unlocked rows than its share),
+// the rest is topped up from every queue as claimWorkflow does: only then,
+// and only up to the rest in each queue, does it lock rows it drops.
 var claimWorkflowQueues = `
 	WITH n AS (
 		SELECT x.queue, count(*) AS n FROM (
@@ -400,7 +404,7 @@ var claimWorkflowQueues = `
 			ORDER BY x.ready_at, x.id
 			LIMIT $3::bigint
 		) x GROUP BY x.queue
-	), c AS (
+	), s AS (
 		SELECT x.id FROM n
 		CROSS JOIN LATERAL (
 			SELECT id FROM flows.execution
@@ -409,6 +413,25 @@ var claimWorkflowQueues = `
 			LIMIT n.n
 			FOR NO KEY UPDATE SKIP LOCKED
 		) x
+	), c AS (
+		SELECT id FROM s
+		UNION ALL (
+			-- Short (rows of a share locked elsewhere, by an in-flight
+			-- claim or completion): topped up from every queue, as
+			-- claimWorkflow does, skipping the rows s locked (this
+			-- transaction's: SKIP LOCKED would not).
+			SELECT x.id FROM (SELECT DISTINCT unnest($1::text[])) AS q(name)
+			CROSS JOIN LATERAL (
+				SELECT id, ready_at FROM flows.execution
+				WHERE ` + claimableIn("q.name") + ` AND id <> ALL(ARRAY(SELECT id FROM s))
+				ORDER BY ready_at, id
+				LIMIT $3::bigint - (SELECT count(*) FROM s)
+				FOR NO KEY UPDATE SKIP LOCKED
+			) x
+			WHERE (SELECT count(*) FROM s) < $3::bigint
+			ORDER BY x.ready_at, x.id
+			LIMIT $3::bigint - (SELECT count(*) FROM s)
+		)
 	)` + claimTail
 
 // claimableIn is the condition that an execution of queue q (an SQL
@@ -428,11 +451,12 @@ var claimTail = `
 		-- The locks of a running execution do not lapse (store.Completion.Locks).
 		-- It waits for a lock row a contender holds (acquireLock never waits
 		-- on an execution row: no cycle) and re-checks its holder.
-		-- Lock rows are taken in key order: claims for the same execution
-		-- (an execution and its activities) do not deadlock.
+		-- Lock rows are taken in key order (bytes, as sortedLocks): claims
+		-- for the same execution (an execution and its activities) and
+		-- ends do not deadlock.
 		UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
 		WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id = ANY(ARRAY(SELECT id FROM c)) AND NOT reserved
-		                ORDER BY key FOR UPDATE)
+		                ORDER BY key COLLATE "C" FOR UPDATE)
 	)
 	, u AS (
 		UPDATE flows.execution e
@@ -1068,13 +1092,13 @@ func wakeWaitersOf(id string) string {
 // drops its waits: a lock whose waiter wakeWaitersOf just woke becomes that
 // waiter's reservation, until its turn ends; the others are deleted (a
 // reservation of id's own too: a woken waiter that leaves wakes nobody).
-// The lock rows are locked in key order first (T10.4), as claims and
-// acquireLock take them, not in the order the update and delete scans
+// The lock rows are locked in key order (bytes, sortedLocks) first
+// (T10.4), as claims and acquireLock take them, not in the order the update and delete scans
 // meet them.
 func dropLocksOf(id string) string {
 	return `
 	WITH l AS MATERIALIZED (
-		SELECT key FROM flows.lock WHERE execution_id = ` + id + ` ORDER BY key FOR UPDATE
+		SELECT key FROM flows.lock WHERE execution_id = ` + id + ` ORDER BY key COLLATE "C" FOR UPDATE
 	), w AS (DELETE FROM flows.lock_waiter WHERE execution_id = ` + id + `
 	), r AS (
 		-- The waiter wakeWaitersOf woke in this transaction (now() is the
@@ -1126,6 +1150,8 @@ const (
 
 // sortedLocks orders lock requests by key: two executions taking the same
 // locks in one checkpoint lock their rows in the same order (no deadlock).
+// It is byte order, the order of every statement locking several lock rows
+// (ORDER BY key COLLATE "C": the column's collation may differ, T10.4).
 // Answers go by schedule id, so the order is invisible.
 func sortedLocks(locks []store.LockRequest) []store.LockRequest {
 	if len(locks) < 2 {
@@ -1626,7 +1652,7 @@ const claimActivities = `
 		-- waits for a contender's lock row, as the workflow claim.
 		UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
 		WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id = ANY(ARRAY(SELECT execution_id FROM c)) AND NOT reserved
-		                ORDER BY key FOR UPDATE)
+		                ORDER BY key COLLATE "C" FOR UPDATE)
 	)
 	UPDATE flows.activity_task t
 	SET owner_id = $2, lease_version = t.lease_version + 1, attempt = t.attempt + 1,
