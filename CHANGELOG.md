@@ -58,19 +58,20 @@ must take care of.
 
 ### Upgrade notes
 
-- `00014` adds a nullable column with no default: a metadata-only change
-  (no table rewrite). Old binaries ignore it; activities they retry keep no
-  data, as before.
 - `00013` adds a column with a constant default (no table rewrite) and an
   index built without `CONCURRENTLY`: writes to `flows.execution` wait while
   it builds. On large tables, run the migration in a quiet window.
 - While old and new binaries run side by side, a timer behind more than 64
   leases kept by old binaries is found by the timed poll (at most
   `PollMax` late) instead of the reported due time.
+- `00014` adds a nullable column with no default: a metadata-only change
+  (no table rewrite). Old binaries ignore it; activities they retry keep no
+  data, as before.
 - `00015` adds nullable `trace` columns with no default (metadata only).
   Executions started before it, or by an old binary during a rolling
   deploy, carry no trace context: their spans are roots, as before
-  (T10.10).
+  (T10.10). Activity tasks an old binary inserts for a traced execution
+  carry none either, so those attempts' spans are roots too.
 
 ## v0.1.0 (2026-11-16)
 
