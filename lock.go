@@ -49,10 +49,11 @@ func LockWait(p RetryPolicy) LockOption { return func(c *lockConfig) { c.wait = 
 // lock, is parked, or its processes died), the lock lapses after ttl (at
 // least the engine's LeaseTTL), and another execution may take it: the
 // workflow then fails with ErrLockLost at its next task. So ttl bounds how
-// long a waiting execution keeps others out; an activity waiting in a queue
-// or between retries does not run, so choose ttl above the expected queue
-// wait and retry delays. A compensating execution that
-// loses a lock still completes its compensation.
+// long a waiting execution keeps others out. While one of its activities
+// waits (in its queue, for a retry, or for another engine after its
+// process died), the lock is kept up to Options.LockHold longer. A
+// compensating execution that loses a lock still completes its
+// compensation.
 //
 // Locks are polled, not queued: waiters are not served in order. Two
 // executions taking two locks in opposite orders with LockWait each lose

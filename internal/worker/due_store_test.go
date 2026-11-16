@@ -84,7 +84,9 @@ func TestDelayedWorkOfAnotherWorkerIsOnTime(t *testing.T) {
 	// While A is idle: B commits the timer and the retry delay, then stops;
 	// the third owner hands "handed" back for delay.
 	close(gate)
-	waitUntil(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(marks["timer"]) == 1 && len(marks["retry"]) == 1 })
+	// Both first marks (not "exactly one each": under load, one workflow's
+	// second mark may come before the other's first).
+	waitUntil(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(marks["timer"]) >= 1 && len(marks["retry"]) >= 1 })
 	mark("handed")
 	if err := st.ReleaseWorkflowTask(ctx, handed.Lease, delay); err != nil {
 		t.Fatal(err)

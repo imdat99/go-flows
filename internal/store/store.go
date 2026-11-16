@@ -271,6 +271,11 @@ type LockRequest struct {
 	ScheduleID int32
 	Key        string
 	TTL        time.Duration
+	// Hold keeps the lock, up to Hold past its TTL, while an activity task
+	// of the holder waits (in its queue, for a retry, or for a new lease
+	// after its worker died): it does not run, but the workflow is not
+	// idle. 0 lets the lock lapse after its TTL like an idle holder's.
+	Hold time.Duration
 }
 
 // NewActivityTask is an activity task to create.
@@ -353,7 +358,7 @@ func ValidShape(c *Completion) bool {
 		return false
 	}
 	for _, k := range c.Locks {
-		if k.TTL <= 0 {
+		if k.TTL <= 0 || k.Hold < 0 {
 			return false
 		}
 	}

@@ -3,6 +3,7 @@ package storetest
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/imdat99/go-flows/internal/history"
 	"github.com/imdat99/go-flows/internal/store"
@@ -29,8 +30,14 @@ func wakeTask(t *testing.T, s store.Store, h Harness, id string) store.WorkflowT
 // it (still claimed). The execution is left released.
 func (seq lockSeq) requestLock(t *testing.T, s store.Store, h Harness, task store.WorkflowTask, sched int32, key string) (history.Event, []store.WorkflowTask) {
 	t.Helper()
+	return seq.requestLockHold(t, s, h, task, sched, key, 0)
+}
+
+// requestLockHold is requestLock with LockRequest.Hold.
+func (seq lockSeq) requestLockHold(t *testing.T, s store.Store, h Harness, task store.WorkflowTask, sched int32, key string, hold time.Duration) (history.Event, []store.WorkflowTask) {
+	t.Helper()
 	id := task.Execution.InstanceID
-	c := &store.Completion{Consumed: pendingIDs(task), Locks: []store.LockRequest{{ScheduleID: sched, Key: key, TTL: h.TTL}}}
+	c := &store.Completion{Consumed: pendingIDs(task), Locks: []store.LockRequest{{ScheduleID: sched, Key: key, TTL: h.TTL, Hold: hold}}}
 	add := func(ev history.Event) {
 		seq[id]++
 		ev.Seq = seq[id]
@@ -222,6 +229,73 @@ func testLockHeldDuringActivity(t *testing.T, h Harness) {
 	h.Advance(t, s, h.TTL*55/100)
 	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 1, "k"); ev.Type != history.LockHeld || ev.Err != "i1" {
 		t.Fatalf("lock taken while its holder's activity runs: %+v", ev)
+	}
+}
+
+// T9.4: an execution keeps its locks past their TTL, up to Hold, while one
+// of its activities waits in a queue or for a retry (it does not run, but
+// the workflow is not idle); past Hold, the lock lapses as usual.
+func testLockKeptWhileActivityWaits(t *testing.T, h Harness) {
+	s := h.New(t)
+	seq := lockSeq{}
+	for _, id := range []string{"i1", "i2"} {
+		mustCreate(t, s, id)
+		seq.consume(t, s, claimOne(t, s, owner, h.TTL))
+	}
+	hold := 3 * h.TTL
+	if ev, _ := seq.requestLockHold(t, s, h, wakeTask(t, s, h, "i1"), 1, "k", hold); ev.Type != history.LockAcquired {
+		t.Fatalf("free lock: %+v", ev)
+	}
+	task := wakeTask(t, s, h, "i1")
+	c := &store.Completion{
+		Consumed:   pendingIDs(task),
+		Activities: []store.NewActivityTask{{ScheduleID: 2, Name: "a", Queue: queue}},
+	}
+	for _, p := range task.Pending {
+		seq["i1"]++
+		ev := p.Event
+		ev.Seq = seq["i1"]
+		c.History = append(c.History, ev)
+	}
+	seq["i1"]++
+	c.History = append(c.History, history.Event{Seq: seq["i1"], Type: history.ActivityScheduled, ScheduleID: 2, Name: "a"})
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, c); err != nil {
+		t.Fatal(err)
+	}
+	// Waiting in its queue (no engine runs it yet).
+	h.Advance(t, s, h.TTL+h.TTL/2)
+	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 1, "k"); ev.Type != history.LockHeld || ev.Err != "i1" {
+		t.Fatalf("lock taken while its holder's activity waits in its queue: %+v", ev)
+	}
+	// Waiting for a retry (the claim extended the lock by its TTL).
+	act := claimActivity(t, s, other, h.TTL)
+	if len(act) != 1 {
+		t.Fatalf("activities %+v", act)
+	}
+	if err := s.RetryActivityTask(ctx, act[0].Lease, h.TTL, false); err != nil {
+		t.Fatal(err)
+	}
+	h.Advance(t, s, h.TTL+h.TTL/2)
+	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 2, "k"); ev.Type != history.LockHeld || ev.Err != "i1" {
+		t.Fatalf("lock taken while its holder's activity waits for a retry: %+v", ev)
+	}
+	// Leased by a worker that died (the claim extended the lock again).
+	act = claimActivity(t, s, other, h.TTL/2)
+	if len(act) != 1 {
+		t.Fatalf("activities after the retry delay %+v", act)
+	}
+	h.Advance(t, s, h.TTL+h.TTL/2)
+	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 3, "k"); ev.Type != history.LockHeld || ev.Err != "i1" {
+		t.Fatalf("lock taken while its holder's activity waits for a new lease: %+v", ev)
+	}
+	// Past Hold, it lapses: i2 takes it, i1 is told.
+	h.Advance(t, s, hold)
+	ev, others := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 4, "k")
+	if ev.Type != history.LockAcquired {
+		t.Fatalf("past Hold: %+v", ev)
+	}
+	if len(others) != 1 || others[0].Execution.InstanceID != "i1" || others[0].Pending[0].Event.Type != history.LockLost {
+		t.Fatalf("the previous holder was not told: %+v", others)
 	}
 }
 

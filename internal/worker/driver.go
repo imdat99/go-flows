@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/imdat99/go-flows/internal/compensation"
@@ -250,6 +251,7 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 	for i := range c.Locks {
 		// A lock outlives a lease of this worker (saga: raised to LeaseTTL).
 		c.Locks[i].TTL = max(c.Locks[i].TTL, w.opts.LeaseTTL)
+		c.Locks[i].Hold = w.opts.LockHold
 	}
 	switch {
 	case (d.inflight+len(eager) > 0 || len(c.Locks) > 0) && !stopping:
@@ -431,7 +433,9 @@ func (d *driver) eager(c *store.Completion, stopping bool) []int {
 	idx := d.eagerBuf[:0] // used within the task's completion only
 	for i := range c.Activities {
 		a := &c.Activities[i]
-		if _, ok := w.acts.Activity(a.Name, a.Compensate); !ok || !tryAcquire(w.actSlots) {
+		// Only activities of a queue this worker runs (WithQueue routes
+		// them to other engines), with a free slot.
+		if _, ok := w.acts.Activity(a.Name, a.Compensate); !ok || !w.runsQueue(a.Queue) || !tryAcquire(w.actSlots) {
 			continue
 		}
 		a.ClaimFor = w.opts.LeaseTTL
@@ -440,6 +444,9 @@ func (d *driver) eager(c *store.Completion, stopping bool) []int {
 	d.eagerBuf = idx
 	return idx
 }
+
+// runsQueue reports whether the worker runs tasks of queue q.
+func (w *Worker) runsQueue(q string) bool { return slices.Contains(w.opts.Queues, q) }
 
 // launch runs an eagerly claimed activity (its slot is held); its outcome
 // goes to the driver.

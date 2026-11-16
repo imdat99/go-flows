@@ -76,6 +76,7 @@ defer engine.Stop(shutdownCtx)
 | `PollMax` | 1s | Khoảng poll dài nhất khi rảnh. Notification và thời điểm đến hạn cục bộ đánh thức poller sớm hơn. |
 | `StickyFor`, `CacheSize` | 10s, 1000 | Giữ execution đã replay trong bộ nhớ, cùng với task kế tiếp của nó trên engine này. `CacheSize: -1` tắt cache (task nào cũng replay). |
 | `DisableEager` | false | Chạy mọi activity qua queue thay vì chạy ngay trong engine đã lên lịch nó. |
+| `LockHold` | 1h | Execution giữ lock thêm bao lâu sau `ttl` khi một activity của nó đang chờ (trong queue, chờ retry, hoặc chờ engine khác sau crash). Giới hạn thời gian một workflow bị bỏ quên chặn người khác; âm: lock hết hạn sau `ttl`. |
 | `StuckTimeout` | 10s | Code workflow được chạy bao lâu mà không nhường. Một lần: trả lại; hai lần ở cùng chỗ, trên bất kỳ engine nào (đếm trong database): park (`ErrStuck`); `Resume` đặt lại số đếm. Tăng lên nếu code workflow thật sự cần tính toán lâu. |
 | `EagerWindow` | 200ms | Execution chờ các activity eager của nó bao lâu trước khi cho signal và timer vào. |
 
@@ -168,4 +169,4 @@ ghi qua API của engine.
 | Execution ở mãi `compensating` | Nó chờ một activity phớt lờ context, chạy trên queue không engine nào phục vụ, hoặc retry rất lâu. | Xem `flows.activity_task` của execution đó. `Terminate` kết thúc nó mà không hoàn tác. |
 | Execution ở mãi `running` mà không có gì đang chạy | Nó chờ signal, timer hoặc child, đúng như thiết kế. | Gửi signal, hoặc `Cancel` nó: workflow được dọn dẹp và hoàn tác. |
 | Việc chạy tiếp chậm sau crash | Lease của engine đã chết còn hiệu lực tới hết `LeaseTTL`. | Giảm `LeaseTTL` nếu thời gian khôi phục quan trọng hơn lưu lượng gia hạn. |
-| Workflow lỗi `ErrLockLost` | Lock của nó hết hạn khi nó ngủ hoặc chờ lâu hơn `ttl` của lock, và execution khác đã lấy. | Chọn `ttl` lớn hơn các khoảng chờ dự kiến (chờ trong queue, retry delay, sleep). |
+| Workflow lỗi `ErrLockLost` | Lock của nó hết hạn khi nó ngủ hoặc chờ lâu hơn `ttl` của lock, và execution khác đã lấy. | Chọn `ttl` lớn hơn các khoảng sleep và await dự kiến; activity chờ trong queue hoặc chờ retry được `LockHold` bao (tăng nó nếu chờ lâu hơn). |

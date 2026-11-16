@@ -114,6 +114,7 @@ func Run(t *testing.T, h Harness) {
 		{"LockRenewal", testLockRenewal},
 		{"LockValidation", testLockValidation},
 		{"LockHeldDuringActivity", testLockHeldDuringActivity},
+		{"LockKeptWhileActivityWaits", testLockKeptWhileActivityWaits},
 		{"LockLostBlocksEnd", testLockLostBlocksEnd},
 		{"LockRace", testLockRace},
 		{"LockNotTakenFromRunningHolder", testLockNotTakenFromRunningHolder},

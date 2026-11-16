@@ -92,8 +92,11 @@ type Options struct {
 	EagerWindow time.Duration
 	// StuckTimeout bounds workflow code running without yielding.
 	StuckTimeout time.Duration
-	Errors       ErrorCodec
-	Logger       *slog.Logger
+	// LockHold is store.LockRequest.Hold for the locks this worker takes
+	// (0: default 1h; negative: none).
+	LockHold time.Duration
+	Errors   ErrorCodec
+	Logger   *slog.Logger
 	// Observer, when set, is told of activity attempts and of executions
 	// ending, after the fact (it must not block).
 	Observer Observer
@@ -133,6 +136,12 @@ func (o *Options) defaults() {
 	}
 	if o.StickyFor <= 0 {
 		o.StickyFor = 10 * time.Second
+	}
+	switch {
+	case o.LockHold == 0:
+		o.LockHold = time.Hour
+	case o.LockHold < 0:
+		o.LockHold = 0
 	}
 	if o.MaxWorkflowTasks <= 0 {
 		o.MaxWorkflowTasks = 64

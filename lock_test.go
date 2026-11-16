@@ -208,3 +208,74 @@ func TestLockHeldDuringPolledActivity(t *testing.T) {
 		t.Fatalf("%d critical sections at once", m)
 	}
 }
+
+// lockElsewhere runs on a queue no test engine runs: it waits there.
+var lockElsewhere = DefineActivity("test.lock.elsewhere",
+	func(context.Context, Key, int) (int, int, error) { return 0, 0, nil }, nil, WithQueue("elsewhere"))
+
+var lockThenQueueWF = DefineWorkflow("test.lock.queue", 1, func(c Ctx, key string) (int, error) {
+	if err := Lock(c, key, time.Millisecond); err != nil { // ttl raised to LeaseTTL
+		return 0, err
+	}
+	return lockElsewhere.Run(c, 1)
+})
+
+// T9.4: a lock is kept past its ttl while its holder's activity waits in a
+// queue, up to Options.LockHold; with LockHold negative, it lapses.
+func TestLockKeptWhileActivityWaits(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		hold time.Duration
+		want error // the contender's
+	}{{"default hold", 0, ErrLockHeld}, {"no hold", -1, nil}} {
+		t.Run(c.name, func(t *testing.T) {
+			e, err := newEngine(mem.New(nil), Options{
+				InstanceID: "test", PollMax: 20 * time.Millisecond, LeaseTTL: 300 * time.Millisecond, LockHold: c.hold,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := e.Start(bg); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+				defer cancel()
+				_ = e.Stop(ctx)
+			})
+			if _, err := lockThenQueueWF.Start(bg, e, "holder", "q"); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, func() bool { return historyHas(e, "holder", "ActivityScheduled") })
+			time.Sleep(3 * 300 * time.Millisecond) // well past the lock's ttl
+			comps.reset("contender")
+			_, err = lockWF.Run(waitCtx(t), e, "contender", lockIn{Key: "q"})
+			if c.want == nil && err != nil || c.want != nil && !errors.Is(err, c.want) {
+				t.Fatalf("contender: %v, want %v", err, c.want)
+			}
+		})
+	}
+}
+
+var elsewhereRuns atomic.Int32
+
+var queuedElsewhere = DefineActivity("test.queue.elsewhere",
+	func(context.Context, Key, int) (int, int, error) { elsewhereRuns.Add(1); return 0, 0, nil }, nil, WithQueue("elsewhere"))
+
+var queuedElsewhereWF = DefineWorkflow("test.queue.elsewhere", 1, func(c Ctx, _ int) (int, error) {
+	return queuedElsewhere.Run(c, 1)
+})
+
+// Found in T9.4: eager execution ran an activity of a queue the engine does
+// not run (WithQueue routes it to other engines).
+func TestEagerKeepsToItsQueues(t *testing.T) {
+	e := testEngine(t)
+	if _, err := queuedElsewhereWF.Start(bg, e, "elsewhere", 0); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return historyHas(e, "elsewhere", "ActivityScheduled") })
+	time.Sleep(100 * time.Millisecond)
+	if n := elsewhereRuns.Load(); n != 0 {
+		t.Fatalf("ran %d times on an engine without its queue", n)
+	}
+}

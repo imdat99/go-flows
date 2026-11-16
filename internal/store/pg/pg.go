@@ -829,29 +829,34 @@ const insertActivities = `
 	RETURNING id, schedule_id, compensate, owner_id,
 	          CASE WHEN owner_id = '' THEN ` + notifyA + "queue)" + ` END`
 
-// acquireLock answers lock request $2 (schedule id $3, ttl $4 µs) of
-// execution $1 with a pending LockAcquired or LockHeld; taking over an
+// acquireLock answers lock request $2 (schedule id $3, ttl $4 µs, hold $5
+// µs) of execution $1 with a pending LockAcquired or LockHeld; taking over an
 // expired lock of another active execution delivers LockLost to it. The
 // conflict clause re-checks the row a concurrent request may have created.
 const acquireLock = `
 	WITH cur AS (
-		SELECT execution_id, sched, until > now() AS live FROM flows.lock WHERE key = $2 FOR UPDATE
+		SELECT execution_id, sched, until, hold_us, until > now() AS live FROM flows.lock WHERE key = $2 FOR UPDATE
 	), prev AS (
 		-- The expired holder's row, unless it runs: its row is locked (being
 		-- claimed or completed), its lease is live, or one of its activities
-		-- runs. Then the lock stays its own (its renewals extend it).
+		-- runs. Then the lock stays its own (its renewals extend it). So it
+		-- does, up to hold_us past until, while one of its activities waits
+		-- (in its queue, for a retry, or for a new lease).
 		SELECT x.id, x.queue, x.locked_until, cur.sched FROM flows.execution x, cur
 		WHERE x.id = cur.execution_id AND cur.execution_id <> $1 AND NOT cur.live
 		  AND (x.locked_until IS NULL OR x.locked_until <= now())
 		  AND NOT EXISTS (SELECT 1 FROM flows.activity_task t
-		                  WHERE t.execution_id = x.id AND t.owner_id <> '' AND t.locked_until > now())
+		                  WHERE t.execution_id = x.id
+		                    AND (t.owner_id <> '' AND t.locked_until > now()
+		                         OR cur.until + cur.hold_us * interval '1 microsecond' > now()))
 		FOR NO KEY UPDATE OF x SKIP LOCKED
 	), take AS (
-		INSERT INTO flows.lock AS k (key, execution_id, sched, until, ttl_us)
-		SELECT $2, $1, $3, now() + $4::bigint * interval '1 microsecond', $4
+		INSERT INTO flows.lock AS k (key, execution_id, sched, until, ttl_us, hold_us)
+		SELECT $2, $1, $3, now() + $4::bigint * interval '1 microsecond', $4, $5::bigint
 		WHERE NOT EXISTS (SELECT 1 FROM cur WHERE execution_id <> $1 AND (live OR NOT EXISTS (SELECT 1 FROM prev)))
 		ON CONFLICT (key) DO UPDATE
-		SET execution_id = excluded.execution_id, sched = excluded.sched, until = excluded.until, ttl_us = excluded.ttl_us
+		SET execution_id = excluded.execution_id, sched = excluded.sched, until = excluded.until,
+		    ttl_us = excluded.ttl_us, hold_us = excluded.hold_us
 		WHERE k.until <= now() OR k.execution_id = $1
 		RETURNING 1
 	), lost AS (
@@ -1223,7 +1228,7 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		queue(cancelActivities, l.ID, c.CanceledActivities)
 	}
 	for _, k := range sortedLocks(c.Locks) {
-		queue(acquireLock, l.ID, k.Key, k.ScheduleID, micros(k.TTL))
+		queue(acquireLock, l.ID, k.Key, k.ScheduleID, micros(k.TTL), micros(k.Hold))
 	}
 	for _, sched := range c.CompensateChildren {
 		queue(compensateChild, l.ID, sched)

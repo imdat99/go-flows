@@ -106,8 +106,8 @@ var charge = flows.DefineActivity("charge",
   `[]byte`. Giữ chúng nhỏ: ID,
   không phải cả tài liệu.
 
-**Thực thi eager.** Khi một workflow task lên lịch activity và engine còn
-slot trống, activity task được tạo với lease thuộc sẵn engine đó, trong cùng
+**Thực thi eager.** Khi một workflow task lên lịch activity thuộc queue mà
+engine chạy, và engine còn slot trống, activity task được tạo với lease thuộc sẵn engine đó, trong cùng
 transaction, và chạy ngay. Khi activity xong, workflow chạy tiếp trong cùng
 round trip. Poll chỉ dùng cho khôi phục và cho việc bắt đầu ở nơi khác.
 
@@ -183,6 +183,9 @@ execution (`ttl` được nâng lên ít nhất bằng `LeaseTTL` của engine):
 - **Nhả:** khi kết thúc, hoặc khi continue-as-new.
 - **Được giữ sống khi execution làm việc:** khi nó chạy một task hoặc một
   activity của nó đang chạy.
+- **Được giữ thêm tối đa `Options.LockHold` (mặc định 1h) sau `ttl`** khi một
+  activity của nó đang chờ: trong queue, chờ retry, hoặc chờ engine khác sau
+  crash.
 - **Hết hạn sau `ttl` trong các trường hợp khác:** khi execution ngủ, chờ
   hoặc đã chết. Execution khác khi đó có thể lấy lock, và execution đầu lỗi
   `ErrLockLost` ở task kế tiếp.

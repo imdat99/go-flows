@@ -195,6 +195,7 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 			fb.Str(k.Key)
 			fb.Int(int64(k.ScheduleID))
 			fb.Int(micros(k.TTL))
+			fb.Int(micros(k.Hold))
 		})
 	}
 	for _, sched := range c.CompensateChildren {

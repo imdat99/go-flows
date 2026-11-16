@@ -108,8 +108,8 @@ var charge = flows.DefineActivity("charge",
   them small: IDs,
   not documents.
 
-**Eager execution.** When a workflow task schedules an activity and the
-engine has a free slot, the activity task is created already leased to that
+**Eager execution.** When a workflow task schedules an activity of a
+queue the engine runs, and the engine has a free slot, the activity task is created already leased to that
 engine, in the same transaction, and runs at once. When it completes, the
 workflow continues in the same round trip. Polling is used only for recovery
 and for work started elsewhere.
@@ -189,6 +189,9 @@ execution (`ttl` is raised to at least the engine's `LeaseTTL`):
 - **Release:** at the end, or at continue-as-new.
 - **Kept alive while the execution works:** while it runs a task or one of
   its activities runs.
+- **Kept up to `Options.LockHold` (default 1h) past `ttl`** while one of its
+  activities waits: in its queue, for a retry, or for another engine after a
+  crash.
 - **Lapses after `ttl` otherwise:** while the execution sleeps, waits or is
   dead. Another execution may then take the lock, and the first one fails
   with `ErrLockLost` at its next task.

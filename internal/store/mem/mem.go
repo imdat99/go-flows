@@ -95,6 +95,7 @@ type lockRow struct {
 	sched int32 // its acquiring schedule id
 	until time.Time
 	ttl   time.Duration
+	hold  time.Duration // store.LockRequest.Hold
 }
 
 type execution struct {
@@ -783,7 +784,8 @@ func (s *Store) acquireLocks(e *execution, reqs []store.LockRequest, now time.Ti
 	for _, r := range reqs {
 		k, ok := s.locks[r.Key]
 		switch {
-		case ok && k.exec != e.ID && (k.until.After(now) || s.running(k.exec, now)):
+		case ok && k.exec != e.ID && (k.until.After(now) || s.running(k.exec, now) ||
+			k.until.Add(k.hold).After(now) && s.hasActivity(k.exec)):
 			holder := s.executions[k.exec].InstanceID
 			s.addPending(e, history.Event{Type: history.LockHeld, ScheduleID: r.ScheduleID, Name: r.Key, Err: holder}, now)
 			continue
@@ -793,7 +795,7 @@ func (s *Store) acquireLocks(e *execution, reqs []store.LockRequest, now time.Ti
 				s.hint(store.WorkflowWork, prev.Queue)
 			}
 		}
-		s.locks[r.Key] = &lockRow{exec: e.ID, sched: r.ScheduleID, until: now.Add(r.TTL), ttl: r.TTL}
+		s.locks[r.Key] = &lockRow{exec: e.ID, sched: r.ScheduleID, until: now.Add(r.TTL), ttl: r.TTL, hold: r.Hold}
 		s.addPending(e, history.Event{Type: history.LockAcquired, ScheduleID: r.ScheduleID, Name: r.Key}, now)
 	}
 }
@@ -806,6 +808,17 @@ func (s *Store) running(id int64, now time.Time) bool {
 	}
 	for _, t := range s.tasks {
 		if t.ExecutionID == id && t.Lease.Owner != "" && t.lockedUntil.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasActivity reports whether execution id has an activity task, running
+// or waiting (in its queue, for a retry, or for a new lease).
+func (s *Store) hasActivity(id int64) bool {
+	for _, t := range s.tasks {
+		if t.ExecutionID == id {
 			return true
 		}
 	}

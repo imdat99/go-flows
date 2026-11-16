@@ -495,10 +495,18 @@ Các mục được rút ra từ phần "Còn mở" của T8.x, xếp theo thứ
     - `ReopenParked` (Engine.Resume) xoá `stuck_seq`: lần kẹt đầu sau Resume vẫn được bàn giao như trước. Continue-as-new bắt đầu với `NULL`.
     - Test: `TestStuckIsCountedAcrossWorkers` (2 worker, đỏ: 3 lần thử), conformance `NoteStuck` (mem, pg fast/pgx, gồm cả sau Resume), `TestStuckWorkflowIsParkedAndResumed`.
     - Review 1 lần: đạt (sửa thêm: xoá đếm khi Resume, log lỗi NoteStuck).
-- [ ] **T9.4** Giữ lock khi activity đang chờ queue hoặc chờ retry:
+- [x] **T9.4** Giữ lock khi activity đang chờ queue hoặc chờ retry:
     - heartbeat gia hạn lock của execution còn activity task chưa xong;
     - có giới hạn tuyệt đối để workflow bị bỏ quên không giữ lock mãi.
     Test: activity chờ retry lâu hơn TTL của lock mà lock vẫn còn; quá giới hạn thì lock hết hạn.
+    - Cách làm: kiểm tra lười thay cho heartbeat (không tốn gì mỗi nhịp). Khi bên khác lấy lock đã hết `ttl`, holder vẫn giữ nếu còn activity task (trong queue, chờ retry, hoặc lease chết) và `until + hold_us > now()`. Migration `00011_lock_hold.sql` (cột `hold_us`, default hằng nên không rewrite); `store.LockRequest.Hold`; `Options.LockHold` (mặc định 1h, âm = không giữ). Cả fast path và pgx path.
+    - "Giới hạn tuyệt đối" tính từ lần gia hạn cuối (`until`): workflow bị bỏ quên (không ai claim gì) hết hạn sau `ttl + LockHold`; activity còn được retry thì vẫn làm mới `until` cho tới khi hết retry policy (nó đang chạy, như trước).
+    - Sửa thêm lỗi tìm thấy khi test: thực thi eager chạy cả activity thuộc queue engine không phục vụ (`WithQueue` bị bỏ qua). Nay chỉ eager với queue của engine (`slices.Contains`, 0 alloc). Test `TestEagerKeepsToItsQueues`.
+    - Sửa test lỏng của T9.1 (`TestDelayedWorkOfAnotherWorkerIsOnTime`, đỏ 3/12 lần với `-race` ở HEAD): điều kiện chờ `== 1` thành `>= 1`; 12/12 xanh.
+    - Test: conformance `LockKeptWhileActivityWaits` (queue, chờ retry, lease chết, quá Hold; mem, pg fast/pgx), `TestLockKeptWhileActivityWaits` (engine, mặc định và LockHold âm). Đỏ trước khi sửa.
+    - Bench gate đạt: ActivityRun 76.5 allocs/op, Public 140.5, Replay 30.
+    - Review 1 lần: đạt (sửa thêm tài liệu concepts/operations vi+en, kiểm tra `Hold < 0`).
+    - Còn mở: kết quả activity đã xong nhưng workflow task còn chờ trong queue lâu hơn `ttl` thì lock vẫn hết hạn (không tính `pending_event`); khi nâng cấp cuốn chiếu, binary cũ lấy lại lock không ghi `hold_us`.
 - [ ] **T9.5** Bỏ chu trình deadlock giữa child kết thúc (`dropEnded`, `notifyParent`) và cha lấy lock (`acquireLock`): sắp lại thứ tự khoá, hoặc dùng `SKIP LOCKED` rồi thử lại. Test tái hiện tranh chấp (pg).
 - [ ] **T9.6** `Options.ListenDSN`: kết nối `LISTEN` riêng, đi thẳng tới Postgres khi pool chạy qua PgBouncer ở transaction mode. Test: engine với pool không có `LISTEN` vẫn nhận hint qua `ListenDSN`.
 - [ ] **T9.7** ⚡ Lấy lock trong 1 round trip: kết quả lock được trả về ngay trong completion, không cần resume riêng. Bench `BenchmarkEagerActivity` và một bench có lock.

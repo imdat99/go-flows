@@ -63,6 +63,12 @@ type Options struct {
 	// count is in the database). Each attempt leaves a goroutine running
 	// until its process exits.
 	StuckTimeout time.Duration
+	// LockHold bounds how long, past its ttl, an execution keeps a lock
+	// (Lock) while none of its code or activities runs but one of its
+	// activities waits: in its queue, for a retry, or for another engine
+	// after its process died (default 1h; negative: not at all, the lock
+	// lapses after its ttl). It is recorded with the lock when taken.
+	LockHold time.Duration
 }
 
 // Engine runs the workflows and activities defined in this binary against
@@ -125,7 +131,7 @@ func newEngineWith(st store.Store, acts worker.Activities, opts Options) (*Engin
 		MaxWorkflowTasks: opts.MaxWorkflowTasks, MaxActivities: opts.MaxActivities,
 		Eager: !opts.DisableEager, EagerWindow: opts.EagerWindow, StickyFor: opts.StickyFor,
 		PollMax: opts.PollMax, CacheSize: opts.CacheSize, Errors: errorCodec{}, Logger: opts.Logger,
-		Observer: obs, Tracer: tr, StuckTimeout: opts.StuckTimeout,
+		Observer: obs, Tracer: tr, StuckTimeout: opts.StuckTimeout, LockHold: opts.LockHold,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("flows: %w", err)

@@ -76,6 +76,7 @@ defer engine.Stop(shutdownCtx)
 | `PollMax` | 1s | The longest idle poll interval. Notifications and local due times wake pollers earlier. |
 | `StickyFor`, `CacheSize` | 10s, 1000 | Keep a replayed execution in memory, with its next task on this engine. `CacheSize: -1` disables the cache (every task replays). |
 | `DisableEager` | false | Run every activity through the queue instead of in the scheduling engine. |
+| `LockHold` | 1h | How long past its `ttl` an execution keeps a lock while one of its activities waits (in its queue, for a retry, or for another engine after a crash). Bounds how long a forgotten workflow keeps others out; negative: the lock lapses after its `ttl`. |
 | `StuckTimeout` | 10s | How long workflow code may run without yielding. Once: handed back; twice at the same point, on any engine (counted in the database): parked (`ErrStuck`); `Resume` resets the count. Raise it if workflow code legitimately computes for long. |
 | `EagerWindow` | 200ms | How long an execution waits for its eager activities before letting signals and timers in. |
 
@@ -169,4 +170,4 @@ and write through the engine's API.
 | An execution stays `compensating` | It waits for an activity that ignores its context, runs on a queue no engine serves, or retries for a long time. | Check `flows.activity_task` for the execution. `Terminate` ends it without compensation. |
 | An execution stays `running` with nothing in progress | It waits for a signal, a timer or a child, as designed. | Send the signal, or `Cancel` it, which lets the workflow clean up and compensate. |
 | Work resumes slowly after a crash | Leases of the dead engine run until `LeaseTTL`. | Lower `LeaseTTL` if recovery time matters more than renewal traffic. |
-| A workflow fails with `ErrLockLost` | Its lock lapsed while it slept or waited longer than the lock's `ttl`, and another execution took it. | Choose a `ttl` above the expected waits (queue waits, retry delays, sleeps). |
+| A workflow fails with `ErrLockLost` | Its lock lapsed while it slept or waited longer than the lock's `ttl`, and another execution took it. | Choose a `ttl` above the expected sleeps and awaits; activities waiting in a queue or for a retry are covered by `LockHold` (raise it for longer waits). |
