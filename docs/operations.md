@@ -96,6 +96,14 @@ Measured costs and their causes are in [benchmarks.md](benchmarks.md).
   `ctx` is done, and cancels the rest. Their leases are released or left to
   expire, and another engine resumes them. Sticky executions are released at
   once, so the next engine does not wait `StickyFor`.
+- **Claims at `Stop`.** No claim starts once `Stop` has begun. A claim
+  already in flight may commit in the database even if canceled, so `Stop`
+  lets it complete, for up to 1 second (or until `ctx` is done, if sooner),
+  and the tasks it claimed run as part of the drain. A claim still running
+  then (a database out of reach) is canceled: the stop of an idle engine
+  stays prompt, and `Stop` returns `nil` when no task was interrupted.
+  Tasks such a canceled claim may have committed stay leased to the stopped
+  engine until `LeaseTTL` passes, then another engine takes them.
 - **Rolling deploys are safe:**
   - executions of a version the new binary lacks are handed to old
     engines;

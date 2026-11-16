@@ -96,6 +96,14 @@ Chi phí đo được và nguyên nhân nằm trong [benchmarks.md](../benchmark
   chạy cho tới khi `ctx` kết thúc, rồi huỷ phần còn lại. Lease của chúng được
   nhả hoặc để hết hạn, và engine khác chạy tiếp. Các execution đang sticky
   được nhả ngay, nên engine kế tiếp không phải chờ `StickyFor`.
+- **Claim lúc `Stop`.** Khi `Stop` đã bắt đầu thì không claim nào bắt đầu
+  nữa. Claim đang chạy dở có thể đã commit trong database dù bị huỷ, nên
+  `Stop` cho nó chạy xong, tối đa 1 giây (hoặc tới khi `ctx` kết thúc, nếu
+  sớm hơn), và các task nó claim được chạy trong lúc drain. Claim vẫn chưa
+  xong sau đó (database không với tới được) bị huỷ: engine rảnh vẫn dừng
+  nhanh, và `Stop` trả `nil` khi không task nào bị ngắt. Task mà claim bị huỷ
+  đó có thể đã commit vẫn bị lease cho engine đã dừng tới khi hết
+  `LeaseTTL`, rồi engine khác nhận.
 - **Deploy cuốn chiếu là an toàn:**
   - execution có version mà binary mới không có sẽ được giao cho engine cũ;
   - activity chạy ít nhất một lần qua lúc chuyển đổi;

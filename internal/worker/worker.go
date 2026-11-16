@@ -253,9 +253,15 @@ type Worker struct {
 	pollCancel context.CancelFunc
 	tasksCtx   context.Context //nolint:containedctx // the lifetime of the worker's tasks
 	taskCancel context.CancelCauseFunc
-	pollers    sync.WaitGroup // pollers and watch
-	beat       sync.WaitGroup // heartbeat
-	tasks      sync.WaitGroup // in-flight tasks
+	// claimsCtx is the context of the claims (claimCtx); Stop cancels it
+	// once the claims in flight had stopGrace to complete. stopping, set
+	// as Stop begins, keeps new claims from starting.
+	claimsCtx    context.Context //nolint:containedctx // the lifetime of the worker's claims
+	claimsCancel context.CancelFunc
+	stopping     atomic.Bool
+	pollers      sync.WaitGroup // pollers and watch
+	beat         sync.WaitGroup // heartbeat
+	tasks        sync.WaitGroup // in-flight tasks
 	// detached counts the recorders of detached eager outcomes (driver
 	// detach): the only tasks that hold no slot (Busy).
 	detached atomic.Int64
@@ -329,6 +335,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	base := context.WithoutCancel(ctx)
 	pctx, pollCancel := context.WithCancel(base)
 	w.tasksCtx, w.taskCancel = context.WithCancelCause(base)
+	w.claimsCtx, w.claimsCancel = context.WithCancel(base)
 	w.detachedCtx = context.WithoutCancel(w.tasksCtx)
 	w.pollCancel = pollCancel
 	w.beat.Go(func() { w.hb.run(w.tasksCtx) })
@@ -342,21 +349,28 @@ func (w *Worker) Start(ctx context.Context) error {
 
 func (w *Worker) taskCtx() context.Context { return w.tasksCtx }
 
-// claimCtx is the context of the claims: not the polls' (Stop cancels
-// those first) but the tasks' (canceled at Stop's deadline). A claim in
-// flight when Stop begins may commit in the store anyway; canceled, its
-// tasks were lost to this worker yet stayed leased to it for a whole
-// LeaseTTL, and other workers found them only at a timed poll (kept
-// leases are not due times). Completed, its tasks run as the stop's.
-func (w *Worker) claimCtx() context.Context { return w.tasksCtx }
+// claimCtx is the context of the claims, not the polls' (Stop cancels
+// those first). A claim in flight when Stop begins may commit in the
+// store anyway; canceled, its tasks were lost to this worker yet stayed
+// leased to it for a whole LeaseTTL, and other workers found them only at
+// a timed poll (kept leases are not due times). So Stop lets it complete
+// (its tasks run as the stop's) for stopGrace, or until Stop's deadline
+// if sooner, then cancels it: a claim that does not return (a database
+// out of reach) does not hold up the stop of an idle worker.
+func (w *Worker) claimCtx() context.Context { return w.claimsCtx }
+
+// stopGrace bounds Stop's wait for the claims in flight.
+const stopGrace = time.Second
 
 // errStopping is the cause of the task contexts canceled at Stop's
 // deadline: an activity interrupted this way did not fail, its outcome is
 // not recorded, and another instance runs it again once its lease expires.
 var errStopping = errors.New("worker stopping")
 
-// Stop stops claiming, then waits for in-flight tasks until ctx is done;
-// tasks still running then are canceled. Workflow leases kept for eager
+// Stop stops claiming (no claim starts after it begins; one in flight
+// completes, within stopGrace and ctx, else it is canceled), then waits
+// for in-flight tasks until ctx is done; tasks still running then are
+// canceled, and Stop returns ctx's error. Workflow leases kept for eager
 // execution are released as their tasks end, so another instance can
 // continue at once.
 func (w *Worker) Stop(ctx context.Context) error {
@@ -366,18 +380,24 @@ func (w *Worker) Stop(ctx context.Context) error {
 	if pollCancel == nil {
 		return nil
 	}
+	w.stopping.Store(true) // no claim starts from now on
 	pollCancel()
+	// A claim in flight completes (claimCtx), within stopGrace and the
+	// deadline; canceled after, it returns promptly.
+	gctx, gcancel := context.WithTimeout(ctx, stopGrace)
+	if !waitUntilDone(gctx, w.pollers.Wait) {
+		w.claimsCancel()
+		w.pollers.Wait()
+	}
+	gcancel()
+	w.claimsCancel()
 	var err error
-	// A claim in flight completes (claimCtx), within the deadline; then
-	// the tasks.
-	for _, wait := range []func(){w.pollers.Wait, w.tasks.Wait} {
-		if !waitUntilDone(ctx, wait) {
-			if err == nil {
-				err = fmt.Errorf("worker: stop: %w", ctx.Err())
-			}
-			taskCancel(errStopping)
-			wait() // canceled claims and tasks return promptly
+	if !waitUntilDone(ctx, w.tasks.Wait) {
+		if w.Busy() { // not an idle worker whose deadline came first
+			err = fmt.Errorf("worker: stop: %w", ctx.Err())
 		}
+		taskCancel(errStopping)
+		w.tasks.Wait() // canceled tasks return promptly
 	}
 	taskCancel(errStopping)
 	w.runnersOnce.Do(func() { close(w.runnersStop) }) // the tasks drained: no job is in flight
@@ -506,6 +526,12 @@ func (w *Worker) poll(ctx context.Context, slots, hint chan struct{}, due *dueTi
 	for {
 		n := acquire(ctx, slots)
 		if n == 0 {
+			return
+		}
+		if w.stopping.Load() {
+			// Stop began meanwhile (acquire may pick a free slot over
+			// ctx.Done): only a claim already in flight may complete.
+			release(slots, n)
 			return
 		}
 		polled := time.Now()

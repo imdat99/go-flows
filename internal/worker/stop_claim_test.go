@@ -149,3 +149,113 @@ func TestClaimInFlightAtStopIsNotDropped(t *testing.T) {
 		})
 	}
 }
+
+// stopProbe watches the claims around a Stop: its first workflow claim
+// waits until the worker's watch ended (Stop began) and claims nothing,
+// or (hang) waits until its context is done; every later claim counts as
+// started after Stop began.
+type stopProbe struct {
+	*mem.Store
+	hang                     bool
+	first                    atomic.Bool
+	late                     atomic.Int32
+	inClaim, watching, ended chan struct{}
+	inOnce, wOnce, eOnce     sync.Once
+}
+
+func newStopProbe(hang bool) *stopProbe {
+	return &stopProbe{Store: mem.New(nil), hang: hang, inClaim: make(chan struct{}), watching: make(chan struct{}), ended: make(chan struct{})}
+}
+
+func (s *stopProbe) Watch(ctx context.Context, wake func(store.WorkKind, string)) error {
+	s.wOnce.Do(func() { close(s.watching) })
+	err := s.Store.Watch(ctx, wake)
+	if ctx.Err() != nil {
+		s.eOnce.Do(func() { close(s.ended) })
+	}
+	return err
+}
+
+func (s *stopProbe) ClaimWorkflowTasksDue(ctx context.Context, owner string, queues []string, n int, ttl time.Duration) ([]store.WorkflowTask, time.Duration, error) {
+	if s.first.CompareAndSwap(false, true) {
+		s.inOnce.Do(func() { close(s.inClaim) })
+		if s.hang {
+			<-ctx.Done() // a store that does not answer
+			return nil, 0, ctx.Err()
+		}
+		<-s.ended
+		return nil, 0, nil
+	}
+	s.late.Add(1)
+	return s.Store.ClaimWorkflowTasksDue(ctx, owner, queues, n, ttl)
+}
+
+// T10.13 review: Stop stops claiming. A claim in flight when it begins
+// completes, but no claim starts after: here the poller finds both a hint
+// (work created while its claim was in flight) and the stop when that
+// claim returns.
+func TestNoClaimStartsAfterStop(t *testing.T) {
+	reg := newRegistry()
+	reg.addWorkflow("w", func(coro.Context, []byte) ([]byte, error) { return nil, nil })
+	for i := range 20 {
+		st := newStopProbe(false)
+		w, err := worker.New(st, reg, reg, worker.Options{
+			Owner: "b", Queues: []string{q}, LeaseTTL: time.Hour, PollMax: 50 * time.Millisecond, MaxWorkflowTasks: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		<-st.inClaim
+		<-st.watching
+		create(t, st, "x", "w", "") // a hint while the claim is in flight
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err = w.Stop(ctx)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := st.late.Load(); n > 0 {
+			t.Fatalf("run %d: %d claims started after Stop began", i, n)
+		}
+	}
+}
+
+// T10.13 review: a claim that does not return (a partitioned database, an
+// exhausted pool) does not hold up the Stop of an idle worker: it is
+// canceled after a short grace, and Stop returns nil (no task was
+// interrupted), whatever its context.
+func TestIdleStopWithHungClaimIsPrompt(t *testing.T) {
+	reg := newRegistry()
+	for _, deadline := range []time.Duration{0, 200 * time.Millisecond} {
+		t.Run(deadline.String(), func(t *testing.T) {
+			st := newStopProbe(true)
+			w, err := worker.New(st, reg, reg, worker.Options{Owner: "b", Queues: []string{q}, LeaseTTL: time.Hour, PollMax: 50 * time.Millisecond})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			<-st.inClaim
+			ctx := context.Background()
+			if deadline > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, deadline)
+				defer cancel()
+			}
+			done := make(chan error, 1)
+			go func() { done <- w.Stop(ctx) }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("idle stop: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("Stop waits for a claim that does not return")
+			}
+		})
+	}
+}
