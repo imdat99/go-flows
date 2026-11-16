@@ -9,8 +9,9 @@
 -- is its owner, with no sticky_until), so a binary older than due_owner,
 -- which clears sticky_owner when it releases or completes the execution
 -- and never writes due_owner, leaves no stale mark hiding a due time. Both
--- are only written with ready_at (completions, releases, Unstick), so
--- claims and lease renewals stay HOT updates.
+-- are only written by completions, releases and Unstick, which change
+-- indexed columns anyway (ready_at, sticky_until): claims and lease
+-- renewals never write them and stay HOT updates.
 ALTER TABLE flows.execution ADD COLUMN IF NOT EXISTS due_owner text NOT NULL DEFAULT '';
 
 -- Due times of the executions of a queue another engine may claim: the

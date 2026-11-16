@@ -38,6 +38,7 @@ type driver struct {
 	ctx      context.Context       // canceled when the workflow lease is lost or at the stop deadline
 	detached context.Context       // context.WithoutCancel(ctx), made once (recordResult)
 	resumed  [2]store.WorkflowTask // reused for the tasks resumed with an activity's result
+	taskAt   time.Time             // sent the current task's claim or resume (stickyTimer)
 	eagerBuf []int                 // reused by eager
 	flip     bool
 	lease    store.Lease
@@ -80,7 +81,7 @@ func (w *Worker) runWorkflowTask(pollCtx context.Context, task *store.WorkflowTa
 	tctx, tracked := w.hb.track(w.taskCtx(), false, task.Lease, claimed)
 	// results and running are made by the first eager launch: most tasks
 	// launch none (a channel of MaxActivities results is ~24 KiB).
-	d := &driver{w: w, ctx: tctx, lease: task.Lease, held: true, tracked: tracked}
+	d := &driver{w: w, ctx: tctx, lease: task.Lease, held: true, tracked: tracked, taskAt: claimed}
 	defer func() {
 		if r := recover(); r != nil {
 			w.log.LogAttrs(pollCtx, slog.LevelError, "flows: panic in workflow task", slog.Any("panic", r))
@@ -199,6 +200,9 @@ func (d *driver) recordResult(r eagerResult, resume bool) *store.WorkflowTask {
 		d.detached = d.w.detachedCtx // d.ctx's values (none of its own), never canceled
 	}
 	into := d.nextResumeBuffer()
+	if lease != nil {
+		d.taskAt = time.Now()
+	}
 	next, resumeLost, err := d.w.record(d.detached, &r.task, r.outcome, lease, into)
 	if err != nil {
 		d.w.log.LogAttrs(d.ctx, slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
@@ -270,17 +274,7 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 	case !stopping && !d.compensating && w.cache.fits(d.ex): // only an executor kept in the cache gains from it
 		c.StickyFor = w.opts.StickyFor
 	}
-	// Sticky, this worker wakes for the execution's next timer (whoever
-	// committed it): the store leaves it to this worker (T10.3) when it
-	// falls within DueKnown, half the horizon of the local due times (a
-	// margin for the clocks of both).
-	var nextTimer time.Time
-	if c.StickyFor > 0 && d.ex != nil {
-		var ok bool
-		if nextTimer, ok = d.ex.NextTimer(); ok {
-			c.DueKnown = w.wfDue.horizon / 2
-		}
-	}
+	nextTimer := d.stickyTimer(c)
 	sent := time.Now()
 	// The worker's task context, not d.ctx: a lease lost meanwhile is
 	// caught by the store's fence anyway, and a long-lived context costs the
@@ -314,11 +308,35 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 	if locks && d.held {
 		// The answers are pending already: run the next task at once.
 		if resumed {
+			d.taskAt = sent
 			return next
 		}
 		d.lost() // kept, yet not resumed: the lease moved on meanwhile
 	}
 	return nil
+}
+
+// stickyTimer returns the execution's next timer (whoever committed it)
+// when c leaves the execution sticky to this worker, which then wakes for
+// it: the store leaves it to this worker (T10.3) when it falls within
+// c.DueKnown, set here. The local due time counts from the task's store
+// time, so it is late by the task's run time: DueKnown is half the horizon
+// of the local due times less that, so that what the store hides stays
+// within the horizon (with a margin for the clocks).
+func (d *driver) stickyTimer(c *store.Completion) time.Time {
+	if c.StickyFor <= 0 || d.ex == nil {
+		return time.Time{}
+	}
+	at, ok := d.ex.NextTimer()
+	if !ok {
+		return time.Time{}
+	}
+	known := d.w.wfDue.horizon/2 - time.Since(d.taskAt)
+	if known <= 0 {
+		return time.Time{}
+	}
+	c.DueKnown = known
+	return at
 }
 
 // execute produces the completion of a task: by running the workflow, or,
@@ -377,6 +395,7 @@ func (d *driver) completeFailed(task *store.WorkflowTask, err error) *store.Work
 	d.ledger = nil
 	switch {
 	case errors.Is(err, store.ErrPendingEvents):
+		d.taskAt = time.Now()
 		next, rerr := w.st.ResumeWorkflowTask(d.ctx, d.lease, w.opts.LeaseTTL)
 		if rerr == nil {
 			return &next

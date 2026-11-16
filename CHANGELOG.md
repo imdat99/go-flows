@@ -21,10 +21,29 @@ must take care of.
 
 - `Engine.Terminate` no longer reads the execution again for the observer,
   and a hooked end no longer costs an extra `SELECT` round trip (T10.9).
+- `PollMax` is capped at a third of `LeaseTTL`: idle engines poll at least
+  that often, so the work of a crashed engine resumes within about
+  `LeaseTTL` instead of waiting for a long `PollMax` (T10.1).
+- The due time a claim reports no longer stops at 64 kept leases: a timer
+  behind any number of them is found through an index (T10.2). A timer
+  falling due while its execution is sticky to the engine that will claim
+  it is no longer reported to other engines, which woke for an empty claim
+  (T10.3).
+
+### Migrations
+
+| Migration | Adds | For |
+|---|---|---|
+| `00013_due_owner` | `execution.due_owner`, `execution_due_idx` | due times of kept leases and sticky timers are their owner's (T10.2, T10.3) |
 
 ### Upgrade notes
 
-- No new migration yet.
+- `00013` adds a column with a constant default (no table rewrite) and an
+  index built without `CONCURRENTLY`: writes to `flows.execution` wait while
+  it builds. On large tables, run the migration in a quiet window.
+- While old and new binaries run side by side, a timer behind more than 64
+  leases kept by old binaries is found by the timed poll (at most
+  `PollMax` late) instead of the reported due time.
 
 ## v0.1.0 (2026-11-16)
 
