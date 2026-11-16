@@ -268,7 +268,7 @@ func (s *Store) create(ne store.NewExecution, now time.Time) *execution {
 	e := &execution{
 		ID: s.id(), InstanceID: ne.InstanceID, Workflow: ne.Workflow, Version: ne.Version, Queue: ne.Queue,
 		Status: store.StatusRunning, ParentID: ne.ParentID, ParentSched: ne.ParentSched,
-		Input: clone(ne.Input), CreatedAt: now,
+		Input: clone(ne.Input), CreatedAt: now, Trace: clone(ne.Trace),
 	}
 	s.executions[e.ID] = e
 	s.latest[ne.InstanceID] = e.ID
@@ -676,6 +676,7 @@ func (s *Store) createActivities(e *execution, owner string, acts []store.NewAct
 		t := &activityTask{
 			ExecutionID: e.ID, InstanceID: e.InstanceID, ScheduleID: a.ScheduleID, Name: a.Name,
 			Queue: a.Queue, Input: clone(a.Input), Compensate: a.Compensate, Uncertain: a.Uncertain, visibleAt: now,
+			Trace: e.Trace, // never modified: shared, copied out by claims
 		}
 		t.Lease.ID = s.id()
 		t.created = t.Lease.ID
@@ -733,6 +734,7 @@ func (s *Store) end(e *execution, c *store.Completion, now time.Time) {
 	if c.ContinueAsNew != nil {
 		next := *c.ContinueAsNew
 		next.InstanceID, next.ParentID, next.ParentSched = e.InstanceID, e.ParentID, e.ParentSched
+		next.Trace = e.Trace // the trace goes on (create copies it)
 		n := s.create(next, now)
 		for _, ev := range c.Carry {
 			s.addPending(n, history.Event{Type: ev.Type, Name: ev.Name, Payload: clone(ev.Payload)}, now)
@@ -832,7 +834,7 @@ func (s *Store) ClaimActivityTasks(_ context.Context, owner string, queues []str
 		t.lockedUntil = now.Add(ttl)
 		s.extendLocks(t.ExecutionID, now)
 		at := t.ActivityTask
-		at.Input, at.CompData = clone(at.Input), clone(at.CompData)
+		at.Input, at.CompData, at.Trace = clone(at.Input), clone(at.CompData), clone(at.Trace)
 		at.CancelRequested = t.cancelRequested
 		out = append(out, at)
 	}
@@ -1209,7 +1211,7 @@ func cloneEvent(ev history.Event) history.Event {
 }
 
 func cloneExecution(e store.Execution) store.Execution {
-	e.Input, e.Output = clone(e.Input), clone(e.Output)
+	e.Input, e.Output, e.Trace = clone(e.Input), clone(e.Output), clone(e.Trace)
 	return e
 }
 

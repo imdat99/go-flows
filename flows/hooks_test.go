@@ -211,14 +211,25 @@ func (f *fakeTracer) StartActivity(ctx context.Context, a ActivityInfo) (context
 	}
 }
 
-func (f *fakeTracer) StartWorkflowTask(_ context.Context, w WorkflowTaskInfo) func(Status, error) {
+func (f *fakeTracer) StartWorkflowTask(ctx context.Context, w WorkflowTaskInfo) (context.Context, func(Status, error)) {
 	if f.boom {
 		panic("tracer bug")
 	}
-	return func(s Status, _ error) {
+	return ctx, func(s Status, _ error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.tasks = append(f.tasks, w.Workflow+":"+string(s))
+	}
+}
+
+func (f *fakeTracer) StartWorkflow(context.Context, StartInfo) ([]byte, func(error)) {
+	if f.boom {
+		panic("tracer bug")
+	}
+	return []byte("t"), func(error) {
+		if f.boom {
+			panic("tracer bug")
+		}
 	}
 }
 
@@ -306,15 +317,33 @@ func (b *balanceTracer) StartActivity(ctx context.Context, a ActivityInfo) (cont
 	return ctx, end
 }
 
-func (b *balanceTracer) StartWorkflowTask(_ context.Context, w WorkflowTaskInfo) func(Status, error) {
+func (b *balanceTracer) StartWorkflowTask(ctx context.Context, w WorkflowTaskInfo) (context.Context, func(Status, error)) {
 	b.mu.Lock()
 	b.starts++
 	b.mu.Unlock()
-	return func(s Status, err error) {
+	if b.mode == "nilctx" {
+		ctx = nil
+	}
+	return ctx, func(s Status, err error) {
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		b.ends++
 		b.taskEnds = append(b.taskEnds, string(s)+"/"+strconv.FormatBool(err != nil))
+	}
+}
+
+func (b *balanceTracer) StartWorkflow(context.Context, StartInfo) ([]byte, func(error)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.starts++
+	if b.mode == "nilend" {
+		b.ends++ // no end will come
+		return nil, nil
+	}
+	return nil, func(error) {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.ends++
 	}
 }
 

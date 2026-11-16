@@ -135,7 +135,14 @@ type Execution struct {
 	ErrKinds    string
 	CreatedAt   time.Time
 	EndedAt     time.Time // zero while active
+	// Trace is the execution's trace context: opaque bytes a tracer gave
+	// when it was started (nil without one), carried to continue-as-new.
+	Trace []byte
 }
+
+// MaxTrace is the largest trace context a store keeps; a longer one is
+// dropped (a tracer's bug must not bloat every row).
+const MaxTrace = 256
 
 // NewExecution describes an execution to create.
 type NewExecution struct {
@@ -146,6 +153,7 @@ type NewExecution struct {
 	Input       []byte
 	ParentID    int64
 	ParentSched int32
+	Trace       []byte // see Execution.Trace (at most MaxTrace bytes)
 }
 
 // Lease identifies the ownership of a claimed task, which every write made
@@ -353,6 +361,8 @@ type ActivityTask struct {
 	// before this attempt: the worker records the cancel instead of running
 	// it.
 	CancelRequested bool
+	// Trace is the trace context of the task's execution (Execution.Trace).
+	Trace []byte
 }
 
 // ActivityResult ends an activity task: Event (ActivityCompleted or

@@ -16,6 +16,11 @@ must take care of.
 - `Options.CacheBytes`: the sticky executor cache is bounded by an
   estimate of its size too (default 256 MiB, `-1` for a count bound only),
   evicting the least recently used executors (T10.6).
+- Traces follow executions (T10.10): the trace context is captured at
+  `Workflow.Start` (and when a workflow starts a child), stored with the
+  execution and carried to every workflow task and activity attempt;
+  `flows.ErrLeaseLost`; `ExecutionID` and `Trace` on `ActivityInfo` and
+  `WorkflowTaskInfo`; otelflows marks lost leases `flows.outcome=lease_lost`.
 
 ### Changed
 
@@ -35,6 +40,8 @@ must take care of.
   returning the zero value returns no data, and the earlier data is kept.
   Previously a timeout followed by a declined attempt compensated with the
   zero value (T10.7).
+- `flows.Tracer` (breaking for custom tracers): new method `StartWorkflow`,
+  and `StartWorkflowTask` returns the task's context too (T10.10).
 
 ### Migrations
 
@@ -42,6 +49,7 @@ must take care of.
 |---|---|---|
 | `00013_due_owner` | `execution.due_owner`, `execution_due_idx` | due times of kept leases and sticky timers are their owner's (T10.2, T10.3) |
 | `00014_kept_comp_data` | `activity_task.comp_data` | compensation data kept across attempts (T10.7) |
+| `00015_trace_context` | `execution.trace`, `activity_task.trace` | the trace context of an execution (T10.10) |
 
 ### Upgrade notes
 
@@ -54,6 +62,10 @@ must take care of.
 - While old and new binaries run side by side, a timer behind more than 64
   leases kept by old binaries is found by the timed poll (at most
   `PollMax` late) instead of the reported due time.
+- `00015` adds nullable `trace` columns with no default (metadata only).
+  Executions started before it, or by an old binary during a rolling
+  deploy, carry no trace context: their spans are roots, as before
+  (T10.10).
 
 ## v0.1.0 (2026-11-16)
 

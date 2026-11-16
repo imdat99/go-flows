@@ -134,8 +134,12 @@ type Tracer interface {
 	// StartTask starts a workflow task of e; end gets the status the task
 	// committed ("" when unchanged or nothing was stored; needs_attention
 	// for a park) and the error that ended it early (handed back, the
-	// completion refused, a park's reason).
-	StartTask(ctx context.Context, e *store.Execution) func(status store.Status, err error)
+	// completion refused, a park's reason). The returned context is the
+	// task's (StartChild).
+	StartTask(ctx context.Context, e *store.Execution) (context.Context, func(status store.Status, err error))
+	// StartChild starts child ne of parent under ctx (the context of the
+	// task starting it) and sets ne.Trace; end follows its storing.
+	StartChild(ctx context.Context, parent *store.Execution, ne *store.NewExecution) func(err error)
 }
 
 // Observer receives measurements (see Options.Observer).

@@ -90,9 +90,25 @@ func (o observer) Ended(e store.EndInfo) { o.o.RunEnded(runInfo(e)) }
 // Tracer wraps engine work in spans; package otelflows implements it with
 // OpenTelemetry. Unset, it costs nothing. Its panics are recovered and
 // logged. Workflow code itself is replayed and not traced: a span covers a
-// whole workflow task. Spans are not linked across tasks and attempts
-// (each is a root, tied to the others by the instance id).
+// whole workflow task.
+//
+// The trace context of an execution is taken when it is started:
+// StartWorkflow, from the caller's context (Workflow.Start) or from the
+// starting workflow task's (a child), returns it as opaque bytes, stored
+// with the execution and handed back to every task and attempt of it, in
+// any process (WorkflowTaskInfo.Trace, ActivityInfo.Trace); continue-as-new
+// keeps it. The engine never interprets them. An attempt or task whose
+// lease was lost (another engine runs it again) ends with an error
+// matching ErrLeaseLost.
 type Tracer interface {
+	// StartWorkflow starts an execution: by Workflow.Start (ctx is the
+	// caller's) or by a workflow starting a child (ctx is the context
+	// StartWorkflowTask returned for the task starting it). It returns the
+	// trace context to store with the execution (nil: none; over
+	// MaxTraceContext bytes it is dropped) and end, called once the start
+	// is stored (nil) or failed. Starting an instance id that exists
+	// stores nothing: the existing execution keeps its trace context.
+	StartWorkflow(ctx context.Context, w StartInfo) (trace []byte, end func(err error))
 	// StartActivity starts an attempt of an activity or compensator. The
 	// returned context is the attempt's: spans the activity makes are its
 	// children. It must derive from ctx (context.WithValue), or the
@@ -104,28 +120,54 @@ type Tracer interface {
 	// task committed ("" when it still runs, or nothing was stored;
 	// needs_attention for a park) and the error that ended it early (handed
 	// back to another instance, the completion refused, a park's reason).
-	StartWorkflowTask(ctx context.Context, w WorkflowTaskInfo) func(status Status, err error)
+	// The returned context is the task's: children the task starts get it
+	// (StartWorkflow).
+	StartWorkflowTask(ctx context.Context, w WorkflowTaskInfo) (context.Context, func(status Status, err error))
+}
+
+// MaxTraceContext is the largest trace context an execution keeps
+// (Tracer.StartWorkflow).
+const MaxTraceContext = store.MaxTrace
+
+// StartInfo describes an execution being started.
+type StartInfo struct {
+	InstanceID string
+	Workflow   string
+	Version    int
+	// Parent is the instance id of the workflow starting it as a child,
+	// "" for Workflow.Start.
+	Parent string
 }
 
 // ActivityInfo describes an activity attempt.
 type ActivityInfo struct {
-	InstanceID   string
+	InstanceID string
+	// ExecutionID identifies the execution (one run of the instance id;
+	// continue-as-new starts another), as WorkflowTaskInfo.ExecutionID.
+	ExecutionID  int64
 	Activity     string
 	Attempt      int
 	Compensation bool
 	// Uncertain: for an invocation, an earlier attempt may have had its
 	// effect; for a compensation, the activity may not have had one.
 	Uncertain bool
+	// Trace is the execution's trace context (Tracer.StartWorkflow), nil
+	// when none was stored. It must not be modified.
+	Trace []byte
 }
 
 // WorkflowTaskInfo describes a workflow task.
 type WorkflowTaskInfo struct {
 	InstanceID string
-	Workflow   string
-	Version    int
+	// ExecutionID identifies the execution (unique in its store).
+	ExecutionID int64
+	Workflow    string
+	Version     int
 	// Status is the execution's status when the task starts (running or
 	// compensating).
 	Status Status
+	// Trace is the execution's trace context, as ActivityInfo.Trace.
+	Trace []byte
 }
 
 // tracer adapts a Tracer to the worker.
@@ -135,16 +177,58 @@ var _ worker.Tracer = tracer{}
 
 func (t tracer) StartAttempt(ctx context.Context, a *store.ActivityTask) (context.Context, func(error)) {
 	return t.t.StartActivity(ctx, ActivityInfo{
-		InstanceID: a.InstanceID, Activity: a.Name, Attempt: int(a.Attempt), Compensation: a.Compensate, Uncertain: a.Uncertain,
+		InstanceID: a.InstanceID, ExecutionID: a.ExecutionID, Activity: a.Name, Attempt: int(a.Attempt),
+		Compensation: a.Compensate, Uncertain: a.Uncertain, Trace: a.Trace,
 	})
 }
 
-func (t tracer) StartTask(ctx context.Context, e *store.Execution) func(store.Status, error) {
-	end := t.t.StartWorkflowTask(ctx, WorkflowTaskInfo{
-		InstanceID: e.InstanceID, Workflow: e.Workflow, Version: int(e.Version), Status: e.Status,
+func (t tracer) StartTask(ctx context.Context, e *store.Execution) (context.Context, func(store.Status, error)) {
+	tctx, end := t.t.StartWorkflowTask(ctx, WorkflowTaskInfo{
+		InstanceID: e.InstanceID, ExecutionID: e.ID, Workflow: e.Workflow, Version: int(e.Version),
+		Status: e.Status, Trace: e.Trace,
 	})
 	if end == nil {
+		return tctx, nil
+	}
+	return tctx, end
+}
+
+func (t tracer) StartChild(ctx context.Context, parent *store.Execution, ne *store.NewExecution) func(error) {
+	tr, end := t.t.StartWorkflow(ctx, StartInfo{
+		InstanceID: ne.InstanceID, Workflow: ne.Workflow, Version: int(ne.Version), Parent: parent.InstanceID,
+	})
+	ne.Trace = keptTrace(tr)
+	return end
+}
+
+// keptTrace is tr, or nil when too long to store.
+func keptTrace(tr []byte) []byte {
+	if len(tr) > store.MaxTrace {
 		return nil
+	}
+	return tr
+}
+
+// startTraced starts ne under the engine's tracer (if any): its trace
+// context goes into ne, end (never nil) follows the start. The tracer's
+// panics are recovered: the start goes on untraced.
+func (e *Engine) startTraced(ctx context.Context, ne *store.NewExecution) (end func(error)) {
+	end = func(error) {}
+	if e.tracer == nil {
+		return end
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			ne.Trace, end = nil, func(error) {}
+		}
+	}()
+	tr, tend := e.tracer.StartWorkflow(ctx, StartInfo{InstanceID: ne.InstanceID, Workflow: ne.Workflow, Version: int(ne.Version)})
+	ne.Trace = keptTrace(tr)
+	if tend != nil {
+		end = func(err error) {
+			defer func() { _ = recover() }() // a broken tracer must not fail Start
+			tend(err)
+		}
 	}
 	return end
 }

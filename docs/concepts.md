@@ -222,7 +222,9 @@ execution (`ttl` is raised to at least the engine's `LeaseTTL`):
   (`Terminate` from a client-only engine runs that engine's hook).
 - **`Options.Observer`** receives activity attempts and ends after the fact,
   for metrics.
-- **`Options.Tracer`** wraps attempts and workflow tasks in spans.
+- **`Options.Tracer`** wraps starts, workflow tasks and attempts in spans;
+  the trace context taken at the start is stored with the execution, so
+  all its spans share the caller's trace.
   `otelflows` implements both the tracer and the observer with
   OpenTelemetry.
 - Unset, they cost nothing.

@@ -149,6 +149,7 @@ func Run(t *testing.T, h Harness) {
 		{"CompDataAcrossAttempts", testCompDataAcrossAttempts},
 		{"GW13_ActivityCancelReachesItsWorker", testActivityCancel},
 		{"GW13_CancelBeforeRetry", testCancelBeforeRetry},
+		{"TraceContext", testTraceContext},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

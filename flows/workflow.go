@@ -104,9 +104,11 @@ func (w *Workflow[I, O]) Start(ctx context.Context, e *Engine, instanceID string
 	if err != nil {
 		return nil, fmt.Errorf("flows: encode input of %s: %w", w.name, err)
 	}
-	if _, _, err := e.st.CreateExecution(ctx, store.NewExecution{
-		InstanceID: instanceID, Workflow: w.name, Version: w.version, Queue: w.queue, Input: b,
-	}); err != nil {
+	ne := store.NewExecution{InstanceID: instanceID, Workflow: w.name, Version: w.version, Queue: w.queue, Input: b}
+	end := e.startTraced(ctx, &ne)
+	_, _, err = e.st.CreateExecution(ctx, ne)
+	end(err)
+	if err != nil {
 		return nil, err
 	}
 	return w.Handle(e, instanceID), nil

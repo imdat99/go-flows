@@ -178,6 +178,7 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 			fb.Int(l.ID)
 			fb.Int(int64(ch.ParentSched))
 			fb.Bytes(ch.Input)
+			fb.Bytes(ch.Trace)
 		})
 	}
 	if len(c.ChildCancels) > 0 {
@@ -450,33 +451,50 @@ func (fb *fastBatch) resume(l store.Lease, ttl time.Duration) {
 	})
 }
 
-// decodeTask decodes executionColumns + lease_version, last_seq, now().
+// execWidth is the number of executionColumns, taskExecWidth of
+// taskColumns (without input and output), taskWidth the columns
+// decodeTask reads.
+const (
+	execWidth     = 15
+	taskExecWidth = execWidth - 2
+	taskWidth     = taskExecWidth + 3
+)
+
+// decodeTask decodes taskColumns + lease_version, last_seq, now().
 // prevID, when equal to the decoded instance id, is shared rather than
 // copied (a resumed task is most likely of the execution of the last one).
 func decodeTask(v [][]byte, t *store.WorkflowTask, owner, prevID string) error {
-	if len(v) != 17 {
+	if len(v) != taskWidth {
 		return fmt.Errorf("%w: %d task columns", errBadValue, len(v))
 	}
-	if err := decodeExecution(v[:14], &t.Execution, prevID); err != nil {
+	if err := decodeExecution(v[:taskExecWidth], &t.Execution, prevID); err != nil {
 		return err
 	}
 	var err error
-	if t.Lease.Version, err = decodeInt(v[14]); err != nil {
+	if t.Lease.Version, err = decodeInt(v[taskExecWidth]); err != nil {
 		return err
 	}
-	if t.LastSeq, err = decodeInt(v[15]); err != nil {
+	if t.LastSeq, err = decodeInt(v[taskExecWidth+1]); err != nil {
 		return err
 	}
-	if t.Now, err = decodeTime(v[16]); err != nil {
+	if t.Now, err = decodeTime(v[taskExecWidth+2]); err != nil {
 		return err
 	}
 	t.Lease.ID, t.Lease.Owner = t.Execution.ID, owner
 	return nil
 }
 
-// decodeExecution decodes executionColumns (prevID: see decodeTask).
+// decodeExecution decodes executionColumns, or taskColumns (prevID: see
+// decodeTask).
 func decodeExecution(v [][]byte, e *store.Execution, prevID string) error {
-	if len(v) != 14 {
+	o := 0 // offset of the columns after input and output
+	switch len(v) {
+	case execWidth:
+		e.Input, e.Output = cloneBytes(v[8]), cloneBytes(v[9])
+		o = 2
+	case taskExecWidth:
+		e.Input, e.Output = nil, nil
+	default:
 		return fmt.Errorf("%w: %d execution columns", errBadValue, len(v))
 	}
 	var err error
@@ -502,13 +520,15 @@ func decodeExecution(v [][]byte, e *store.Execution, prevID string) error {
 	}
 	e.Workflow, e.Queue = intern(v[2]), intern(v[4])
 	e.Status = store.Status(intern(v[5]))
-	e.Input, e.Output = cloneBytes(v[8]), cloneBytes(v[9])
-	e.Err, e.ErrKinds = string(v[10]), string(v[11])
-	if e.CreatedAt, err = decodeTime(v[12]); err != nil {
+	e.Err, e.ErrKinds = string(v[8+o]), string(v[9+o])
+	if e.CreatedAt, err = decodeTime(v[10+o]); err != nil {
 		return err
 	}
-	e.EndedAt, err = decodeTime(v[13])
-	return err
+	if e.EndedAt, err = decodeTime(v[11+o]); err != nil {
+		return err
+	}
+	e.Trace = cloneBytes(v[12+o]) // NULL without a tracer: nil, no allocation
+	return nil
 }
 
 // createFast is the insert of CreateExecution on the fast path; ok is
@@ -530,6 +550,7 @@ func (s *Store) createFast(ctx context.Context, ne *store.NewExecution) (e store
 		fb.Int(ne.ParentID)
 		fb.Int(int64(ne.ParentSched))
 		fb.Bytes(ne.Input)
+		fb.Bytes(ne.Trace)
 	})
 	err = fb.exec(func(_ int, v [][]byte) error {
 		ok = true
@@ -594,14 +615,14 @@ func (s *Store) claimFast(ctx context.Context, owner string, queues []string, li
 		if i == 1 {
 			return decodeDue(v, &next)
 		}
-		if len(v) != 17+claimedArrays {
+		if len(v) != taskWidth+claimedArrays {
 			return fmt.Errorf("%w: %d claim columns", errBadValue, len(v))
 		}
 		var t store.WorkflowTask
-		if err := decodeTask(v[:17], &t, owner, ""); err != nil {
+		if err := decodeTask(v[:taskWidth], &t, owner, ""); err != nil {
 			return err
 		}
-		pending, err := fb.decodePendingArrays(v[17:])
+		pending, err := fb.decodePendingArrays(v[taskWidth:])
 		if err != nil {
 			return err
 		}
@@ -747,7 +768,7 @@ func (s *Store) claimActivitiesFast(ctx context.Context, owner string, queues []
 		if i == 1 {
 			return decodeDue(v, &next)
 		}
-		if len(v) != 13 {
+		if len(v) != 14 {
 			return fmt.Errorf("%w: %d activity task columns", errBadValue, len(v))
 		}
 		t := store.ActivityTask{Lease: store.Lease{Owner: owner}}
@@ -767,6 +788,7 @@ func (s *Store) claimActivitiesFast(ctx context.Context, owner string, queues []
 		t.CancelRequested = len(v[10]) == 1 && v[10][0] == 1
 		t.Uncertain = len(v[11]) == 1 && v[11][0] == 1
 		t.CompData = cloneBytes(v[12]) // NULL: nil, no allocation
+		t.Trace = cloneBytes(v[13]) // NULL without a tracer: nil
 		out = append(out, t)
 		return nil
 	})

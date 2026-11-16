@@ -216,6 +216,8 @@ execution (`ttl` được nâng lên ít nhất bằng `LeaseTTL` của engine):
   engine chỉ làm client chạy hook của chính engine đó).
 - **`Options.Observer`** nhận các attempt của activity và việc kết thúc,
   sau khi chúng xảy ra, để làm metric.
-- **`Options.Tracer`** bọc attempt và workflow task trong span. `otelflows`
+- **`Options.Tracer`** bọc lần start, workflow task và attempt trong span;
+  trace context lấy lúc start được lưu cùng execution, nên mọi span của nó
+  nằm trong trace của bên gọi. `otelflows`
   cài đặt cả tracer lẫn observer bằng OpenTelemetry.
 - Không đặt thì không tốn gì.

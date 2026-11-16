@@ -94,9 +94,10 @@ type Options struct {
 // a Postgres database. Several processes can run engines on the same
 // database: tasks are leased, and every write is fenced.
 type Engine struct {
-	st  store.Store
-	w   *worker.Worker
-	obs Observer
+	st     store.Store
+	w      *worker.Worker
+	obs    Observer
+	tracer Tracer
 }
 
 // New returns a stopped engine on pool. Run Migrate first.
@@ -163,7 +164,7 @@ func newEngineWith(st store.Store, acts worker.Activities, opts Options) (*Engin
 	if err != nil {
 		return nil, fmt.Errorf("flows: %w", err)
 	}
-	return &Engine{st: st, w: w, obs: opts.Observer}, nil
+	return &Engine{st: st, w: w, obs: opts.Observer, tracer: opts.Tracer}, nil
 }
 
 // Start starts running tasks. Without Start, an engine still starts

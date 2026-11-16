@@ -170,21 +170,35 @@ func retry(ctx context.Context, fn func() error) error {
 }
 
 const executionColumns = `id, instance_id, workflow, version, queue, status, parent_id, parent_sched,
-	input, output, err, err_kinds, created_at, ended_at`
+	input, output, err, err_kinds, created_at, ended_at, trace`
 
-// taskColumns are executionColumns without input and output (NULL: tasks
-// do not carry them, store.WorkflowTask).
+// taskColumns are executionColumns without input and output: tasks do
+// not carry them (store.WorkflowTask). A claim's row (taskColumns, three
+// more, then the pending arrays) stays within 32 columns: pgx reallocates
+// a row's values whenever row widths on a connection differ by more than
+// 32 (pgproto3.DataRow.Decode), as against the one-column due rows.
 const taskColumns = `id, instance_id, workflow, version, queue, status, parent_id, parent_sched,
-	NULL::bytea AS input, NULL::bytea AS output, err, err_kinds, created_at, ended_at`
+	err, err_kinds, created_at, ended_at, trace`
 
 func scanExecution(row pgx.Row, extra ...any) (store.Execution, error) {
+	return scanExecutionIO(row, true, extra)
+}
+
+// scanTask scans taskColumns, then extra.
+func scanTask(row pgx.Row, extra ...any) (store.Execution, error) {
+	return scanExecutionIO(row, false, extra)
+}
+
+func scanExecutionIO(row pgx.Row, io bool, extra []any) (store.Execution, error) {
 	var e store.Execution
 	var status string
 	var ended pgtype.Timestamptz
-	dest := append([]any{
-		&e.ID, &e.InstanceID, &e.Workflow, &e.Version, &e.Queue, &status, &e.ParentID, &e.ParentSched,
-		&e.Input, &e.Output, &e.Err, &e.ErrKinds, &e.CreatedAt, &ended,
-	}, extra...)
+	dest := []any{&e.ID, &e.InstanceID, &e.Workflow, &e.Version, &e.Queue, &status, &e.ParentID, &e.ParentSched}
+	if io {
+		dest = append(dest, &e.Input, &e.Output)
+	}
+	dest = append(dest, &e.Err, &e.ErrKinds, &e.CreatedAt, &ended, &e.Trace)
+	dest = append(dest, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return e, err
 	}
@@ -276,8 +290,8 @@ func (s *Store) Now(ctx context.Context) (time.Time, error) {
 // inserted concurrently. $8 = 0 for a root execution.
 const insertExecution = `
 	WITH ins AS (
-		INSERT INTO flows.execution (instance_id, workflow, version, queue, status, parent_id, parent_sched, input, ready_at)
-		SELECT $1, $2, $3, $4, 'running', $5, $6, $7, now()
+		INSERT INTO flows.execution (instance_id, workflow, version, queue, status, parent_id, parent_sched, input, ready_at, trace)
+		SELECT $1, $2, $3, $4, 'running', $5, $6, $7, now(), $8
 		WHERE NOT EXISTS (SELECT 1 FROM flows.execution WHERE instance_id = $1)
 		ON CONFLICT (instance_id) WHERE status IN ` + activeStatuses + ` DO NOTHING
 		RETURNING ` + executionColumns + `
@@ -302,7 +316,7 @@ func (s *Store) CreateExecution(ctx context.Context, ne store.NewExecution) (sto
 			}
 		} else {
 			e, err = scanExecution(s.pool.QueryRow(ctx, insertExecution,
-				ne.InstanceID, ne.Workflow, ne.Version, ne.Queue, ne.ParentID, ne.ParentSched, ne.Input))
+				ne.InstanceID, ne.Workflow, ne.Version, ne.Queue, ne.ParentID, ne.ParentSched, ne.Input, ne.Trace))
 		}
 		if err == nil {
 			return e, true, nil
@@ -384,7 +398,7 @@ var claimWorkflow = `
 		    locked_until = now() + $4::bigint * interval '1 microsecond', not_before = NULL
 		WHERE e.id = ANY(ARRAY(SELECT id FROM c)) -- a join may scan the table (generic plans)
 		RETURNING e.id, e.instance_id, e.workflow, e.version, e.queue, e.status, e.parent_id, e.parent_sched,
-		          NULL::bytea AS input, NULL::bytea AS output, e.err, e.err_kinds, e.created_at, e.ended_at,
+		          e.err, e.err_kinds, e.created_at, e.ended_at, e.trace,
 		          e.lease_version, e.last_seq
 	)
 	SELECT u.*, now(), a.*
@@ -531,7 +545,7 @@ func readClaimed(rows pgx.Rows, owner string) ([]store.WorkflowTask, error) {
 	var a claimedEvents
 	for rows.Next() {
 		var t store.WorkflowTask
-		e, err := scanExecution(rows, &t.Lease.Version, &t.LastSeq, &t.Now,
+		e, err := scanTask(rows, &t.Lease.Version, &t.LastSeq, &t.Now,
 			&a.ids, &a.types, &a.scheds, &a.attempts, &a.names, &a.versions, &a.refs, &a.queues, &a.hashes,
 			&a.payloads, &a.comps, &a.errs, &a.kinds, &a.uncertain, &a.permanent, &a.ats)
 		if err != nil {
@@ -561,7 +575,7 @@ func readTasks(rows pgx.Rows, owner string) ([]store.WorkflowTask, error) {
 	var tasks []store.WorkflowTask
 	for rows.Next() {
 		var t store.WorkflowTask
-		e, err := scanExecution(rows, &t.Lease.Version, &t.LastSeq, &t.Now)
+		e, err := scanTask(rows, &t.Lease.Version, &t.LastSeq, &t.Now)
 		if err != nil {
 			return nil, err
 		}
@@ -834,13 +848,13 @@ const deletePending = `
 // created leased to $8 (eager execution).
 const insertActivities = `
 	INSERT INTO flows.activity_task (execution_id, instance_id, schedule_id, compensate, name, queue, input,
-	                                 attempt, owner_id, lease_version, locked_until, visible_at, uncertain)
+	                                 attempt, owner_id, lease_version, locked_until, visible_at, uncertain, trace)
 	SELECT $1, e.instance_id, u.sched, u.comp, u.name, u.queue, u.input,
 	       CASE WHEN u.claim > 0 THEN 1 ELSE 0 END,
 	       CASE WHEN u.claim > 0 THEN $8 ELSE '' END,
 	       CASE WHEN u.claim > 0 THEN 1 ELSE 0 END,
 	       CASE WHEN u.claim > 0 THEN now() + u.claim * interval '1 microsecond' END,
-	       now() + greatest(u.claim, 0) * interval '1 microsecond', u.uncertain
+	       now() + greatest(u.claim, 0) * interval '1 microsecond', u.uncertain, e.trace
 	FROM flows.execution e,
 	     unnest($2::int[], $3::boolean[], $4::text[], $5::text[], $6::bytea[], $7::bigint[], $9::boolean[])
 	       AS u(sched, comp, name, queue, input, claim, uncertain)
@@ -1065,8 +1079,8 @@ const (
 // (instance_exists) to the parent $5 when the id is taken.
 const insertChild = `
 	WITH ins AS (
-		INSERT INTO flows.execution (instance_id, workflow, version, queue, status, parent_id, parent_sched, input, ready_at)
-		SELECT $1, $2, $3, $4, 'running', $5, $6, $7, now()
+		INSERT INTO flows.execution (instance_id, workflow, version, queue, status, parent_id, parent_sched, input, ready_at, trace)
+		SELECT $1, $2, $3, $4, 'running', $5, $6, $7, now(), $8
 		WHERE NOT EXISTS (SELECT 1 FROM flows.execution WHERE instance_id = $1)
 		ON CONFLICT (instance_id) WHERE status IN ` + activeStatuses + ` DO NOTHING
 		RETURNING id
@@ -1149,10 +1163,10 @@ const (
 		WHERE id = $1`
 	continueAsNew = `
 		WITH old AS (
-			SELECT instance_id, parent_id, parent_sched FROM flows.execution WHERE id = $1
+			SELECT instance_id, parent_id, parent_sched, trace FROM flows.execution WHERE id = $1
 		), ins AS (
-			INSERT INTO flows.execution (instance_id, workflow, version, queue, status, parent_id, parent_sched, input, ready_at)
-			SELECT old.instance_id, $2, $3, $4, 'running', old.parent_id, old.parent_sched, $5, now() FROM old
+			INSERT INTO flows.execution (instance_id, workflow, version, queue, status, parent_id, parent_sched, input, ready_at, trace)
+			SELECT old.instance_id, $2, $3, $4, 'running', old.parent_id, old.parent_sched, $5, now(), old.trace FROM old
 			RETURNING id
 		)
 		INSERT INTO flows.pending_event (execution_id, visible_at, type, name, version, queue, payload)
@@ -1408,7 +1422,7 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		queue(insertActivities, l.ID, scheds, comps, names, queues, inputs, claims, l.Owner, uncertain)
 	}
 	for _, ch := range c.Children {
-		queue(insertChild, ch.InstanceID, ch.Workflow, ch.Version, ch.Queue, l.ID, ch.ParentSched, ch.Input)
+		queue(insertChild, ch.InstanceID, ch.Workflow, ch.Version, ch.Queue, l.ID, ch.ParentSched, ch.Input, ch.Trace)
 	}
 	if len(c.ChildCancels) > 0 {
 		queue(cancelChildren, l.ID, c.ChildCancels)
@@ -1539,7 +1553,7 @@ const claimActivities = `
 	    visible_at = now() + $4::bigint * interval '1 microsecond'
 	WHERE t.id = ANY(ARRAY(SELECT id FROM c)) -- a join may scan the table (generic plans)
 	RETURNING t.id, t.lease_version, t.execution_id, t.instance_id, t.schedule_id, t.name, t.queue,
-	          t.input, t.compensate, t.attempt, t.cancel_requested, t.uncertain, t.comp_data`
+	          t.input, t.compensate, t.attempt, t.cancel_requested, t.uncertain, t.comp_data, t.trace`
 
 // ClaimActivityTasks implements store.Store.
 func (s *Store) ClaimActivityTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.ActivityTask, error) {
@@ -1578,7 +1592,7 @@ func (s *Store) claimActivityTasks(ctx context.Context, owner string, queues []s
 		for rows.Next() {
 			var t store.ActivityTask
 			if err := rows.Scan(&t.Lease.ID, &t.Lease.Version, &t.ExecutionID, &t.InstanceID, &t.ScheduleID,
-				&t.Name, &t.Queue, &t.Input, &t.Compensate, &t.Attempt, &t.CancelRequested, &t.Uncertain, &t.CompData); err != nil {
+				&t.Name, &t.Queue, &t.Input, &t.Compensate, &t.Attempt, &t.CancelRequested, &t.Uncertain, &t.CompData, &t.Trace); err != nil {
 				rows.Close()
 				return err
 			}

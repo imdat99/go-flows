@@ -137,7 +137,20 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // ended over 30 days ag
   - `flows.activity.attempts` and `flows.activity.duration` are labeled by
     activity, outcome (`completed`, `failed`, `retrying`) and compensation.
   - `flows.runs.ended` is labeled by workflow and status.
-  - Spans are roots, tied together by `flows.instance_id`.
+  - Traces follow executions. `Workflow.Start` emits a short span
+    `flows.start <workflow>`, a child of the span in the caller's context
+    (a new root without one). Its span context (26 bytes) is stored with the
+    execution (column `trace`, migration 00016) and returned by the claims,
+    so every workflow task and activity attempt, in any process, is a child
+    of it. A child workflow's start span is a child of the parent's task
+    that started it; continue-as-new keeps the trace.
+  - Sampling is decided once, at the start, by your sampler; the decision
+    stored with the execution holds for all its spans (`ParentBased`).
+  - An attempt or task whose lease was lost ends with an error status and
+    `flows.outcome=lease_lost`; the attempt that replaces it is in the same
+    trace. Spans carry `flows.instance_id` and `flows.execution_id`.
+  - Executions started before the upgrade, or without a tracer, have no
+    stored trace context: their spans are roots.
 - **Alerts:**
   - any execution in `needs_attention`;
   - a growing count of `compensating` executions;
