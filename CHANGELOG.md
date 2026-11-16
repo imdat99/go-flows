@@ -29,15 +29,25 @@ must take care of.
   falling due while its execution is sticky to the engine that will claim
   it is no longer reported to other engines, which woke for an empty claim
   (T10.3).
+- A compensator receives the compensation data of the most recent attempt
+  that may have had its effect (a timeout, panic, `ErrUncertain` or
+  interrupted attempt that was retried), not the last attempt's: an attempt
+  returning the zero value returns no data, and the earlier data is kept.
+  Previously a timeout followed by a declined attempt compensated with the
+  zero value (T10.7).
 
 ### Migrations
 
 | Migration | Adds | For |
 |---|---|---|
 | `00013_due_owner` | `execution.due_owner`, `execution_due_idx` | due times of kept leases and sticky timers are their owner's (T10.2, T10.3) |
+| `00014_kept_comp_data` | `activity_task.comp_data` | compensation data kept across attempts (T10.7) |
 
 ### Upgrade notes
 
+- `00014` adds a nullable column with no default: a metadata-only change
+  (no table rewrite). Old binaries ignore it; activities they retry keep no
+  data, as before.
 - `00013` adds a column with a constant default (no table rewrite) and an
   index built without `CONCURRENTLY`: writes to `flows.execution` wait while
   it builds. On large tables, run the migration in a quiet window.

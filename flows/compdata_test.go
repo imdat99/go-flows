@@ -62,7 +62,7 @@ var (
 	keptCancelWF = DefineWorkflow("test.kept-cancel-wf", 1, func(c Ctx, plan []string) (string, error) {
 		ac, cancel := WithCancel(c)
 		f := keptSlowRetry.Start(ac, plan)
-		if err := Sleep(c, time.Second); err != nil {
+		if err := Sleep(c, 3*time.Second); err != nil {
 			return "", err
 		}
 		cancel()

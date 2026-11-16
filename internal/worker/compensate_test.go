@@ -123,41 +123,26 @@ func TestKeptCompDataNeedsACompensator(t *testing.T) {
 	})
 	startOn(t, st, "wf", wfs, compRegistry{wfs, nil}, []string{q}, false)
 
-	// Binary A, with the compensator: its attempt 1 may have had its effect.
-	var ran atomic.Int32
-	withComp := newRegistry()
-	withComp.addActivity("x", &worker.Activity{
-		Retry: worker.RetryPolicy{Attempts: 2, Initial: 3 * time.Second},
-		Run: func(context.Context, *store.ActivityTask) ([]byte, []byte, error) {
-			ran.Add(1)
-			return nil, []byte(`"charge-1"`), worker.ErrUncertain
-		},
-	})
-	comp := &worker.Activity{Run: func(context.Context, *store.ActivityTask) ([]byte, []byte, error) { return nil, nil, nil }}
-	a, err := worker.New(st, withComp, compRegistry{withComp, map[string]*worker.Activity{"x": comp}}, worker.Options{
-		Owner: "a", Queues: []string{"qa"}, LeaseTTL: 5 * time.Second, PollMax: 20 * time.Millisecond, HandBack: 20 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := a.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 	if _, _, err := st.CreateExecution(context.Background(), store.NewExecution{InstanceID: "kept-nocomp", Workflow: "saga", Version: 1, Queue: q}); err != nil {
 		t.Fatal(err)
 	}
+
+	// Binary A, with the compensator, simulated at the store: its attempt 1
+	// may have had its effect and kept its data for the next attempt.
+	var tasks []store.ActivityTask
 	deadline := time.Now().Add(10 * time.Second)
-	for ran.Load() == 0 {
+	for len(tasks) == 0 {
 		if time.Now().After(deadline) {
-			t.Fatal("attempt 1 did not run")
+			t.Fatal("activity not scheduled")
 		}
 		time.Sleep(5 * time.Millisecond)
+		var err error
+		if tasks, err = st.ClaimActivityTasks(context.Background(), "a", []string{"qa"}, 1, 5*time.Second); err != nil {
+			t.Fatal(err)
+		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	_ = a.Stop(ctx) // before its retry is due
-	cancel()
-	if ran.Load() != 1 {
-		t.Skip("binary A ran the retry too: machine too slow for this test")
+	if err := st.RetryActivityTask(context.Background(), tasks[0].Lease, 0, true, []byte(`"charge-1"`)); err != nil {
+		t.Fatal(err)
 	}
 
 	// Binary B knows x without a compensator: its final attempt fails.

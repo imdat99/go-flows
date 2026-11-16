@@ -115,11 +115,11 @@ func (c *crashable) CompleteActivityTask(ctx context.Context, l store.Lease, r s
 	return c.st.CompleteActivityTask(ctx, l, r)
 }
 
-func (c *crashable) RetryActivityTask(ctx context.Context, l store.Lease, d time.Duration, uncertain bool) error {
+func (c *crashable) RetryActivityTask(ctx context.Context, l store.Lease, d time.Duration, uncertain bool, compData []byte) error {
 	if c.dead() {
 		return errCrashed
 	}
-	return c.st.RetryActivityTask(ctx, l, d, uncertain)
+	return c.st.RetryActivityTask(ctx, l, d, uncertain, compData)
 }
 
 func (c *crashable) Unstick(ctx context.Context, owner string) error {
