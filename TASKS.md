@@ -658,6 +658,7 @@ Gom mọi mục "Còn mở" ở trên, xếp theo mức độ ảnh hưởng. Qu
     - Bench: PublicActivityRun 140–147 → 137–143 allocs/op, ActivityRun không đổi.
     - Review độc lập 1 lần: đạt (so sánh với cờ theo execution, `created_at`, breaking change: epoch đáng giữ). Đã sửa các ghi chú: id lặp lại sau `TRUNCATE ... RESTART IDENTITY`/`setval`; restore chỉ dữ liệu phải mang theo dòng `key_epoch`; version của example.
     - Còn mở: khi chạy lẫn engine cũ và mới sau migrate, activity của execution mới có thể nhận key cũ từ engine cũ (CHANGELOG: dừng engine cũ trước `Migrate`); tên activity cũ kết thúc bằng `:<số>` có thể trùng với key mới (trường hợp hiếm).
+- [ ] **T10.21** ⚡ (ưu tiên thấp) Activity poller giữ mọi slot activity trống trong suốt round trip của claim (`acquire` rồi trả phần thừa, worker.go), nên eager launch trong lúc đó (`tryAcquire`, driver.go) hụt slot và activity đi qua queue: thêm NOTIFY, thêm một round trip claim, thêm trễ poll. Tỉ lệ ≈ thời gian claim / chu kỳ poll; lớn khi nhiều engine (mỗi insert không eager NOTIFY đánh thức mọi poller) hoặc `PollMax` ngắn. Bước đầu: đếm số eager launch bị hụt (counter hoặc Observer) trong bench nhiều engine; chỉ khi đáng kể mới sửa (claim chừa một slot khi có hơn một slot trống, hoặc eager lấy slot từ phần claim đang giữ). Phát hiện khi làm T10.15.
 
 ## File và hàm tái sử dụng
 
