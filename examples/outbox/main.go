@@ -17,8 +17,8 @@
 // The flow here:
 //
 //  1. An activity stages a business event (ready = false) in its own
-//     transaction, deduplicated by the activity's Key: activities run at
-//     least once, so a retry finds the row already there.
+//     transaction, deduplicated by its event id: activities run at least
+//     once, so a retry finds the row already there.
 //  2. The RunHook runs inside the transaction that ends the execution: on
 //     completed it releases the staged events (ready = true); on any other
 //     end (failed, compensated, canceled, terminated) it drops them. It
@@ -30,9 +30,20 @@
 //
 // Delivery is at least once: the relay can publish and crash before it
 // marks the row sent, and then publishes it again. Every event carries a
-// stable event id that consumers deduplicate on. Events of one key (here,
-// one order) are published in the order they were staged: a row is not
-// claimed while an earlier unsent row of the same key exists.
+// stable event id that consumers deduplicate on.
+//
+// Ordering: among released rows, the events of one key (here, one order)
+// are published in id order: a row is not claimed while an earlier unsent
+// released row of the same key exists. That is the staging order when one
+// execution writes the key. There is no attempt cap or dead letter here, so
+// an event the bus keeps refusing blocks its key forever.
+//
+// Not covered: ContinueAsNew. The hook does not run for a continued
+// execution, only for the final one, and its rows are selected by instance
+// id: the final execution's status would release or drop the events of
+// every earlier segment too (a failure in the last segment drops the events
+// of the successful ones). A workflow that continues as new should release
+// its events itself before continuing, or key the rows by segment.
 package main
 
 import (
@@ -42,6 +53,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -67,7 +79,10 @@ CREATE TABLE IF NOT EXISTS app_outbox.events (
 	last_error  text,
 	sent_at     timestamptz
 );
+-- The relay's scan (ORDER BY id) and its per-key ordering check (key, id < $).
 CREATE INDEX IF NOT EXISTS events_pending ON app_outbox.events (id) WHERE ready AND sent_at IS NULL;
+CREATE INDEX IF NOT EXISTS events_pending_key ON app_outbox.events (key, id) WHERE ready AND sent_at IS NULL;
+-- The hook's release or drop, and the cleanup of orphans (see stageConfirmed).
 CREATE INDEX IF NOT EXISTS events_instance ON app_outbox.events (instance_id) WHERE NOT ready;`
 
 // EventBus is the external system (Kafka, NATS, SNS, a webhook...).
@@ -94,6 +109,12 @@ type Order struct {
 	Ship   string `json:"ship"` // "nowhere" cannot be shipped to
 }
 
+// staged is the input of stageConfirmed.
+type staged struct {
+	Order Order  `json:"order"`
+	Nonce string `json:"nonce"` // drawn once per execution, see placeOrder
+}
+
 var errUnshippable = errors.New("destination not served")
 
 func init() { flows.RegisterErrorKind("order_unshippable", errUnshippable) }
@@ -102,20 +123,32 @@ func init() { flows.RegisterErrorKind("order_unshippable", errUnshippable) }
 var db *pgxpool.Pool
 
 var (
-	// stageConfirmed stages order.confirmed. The event id is the activity's
-	// Key, the same on every attempt: a retried attempt inserts nothing. The
-	// row commits in the activity's own transaction but stays invisible to
-	// the relay (ready = false) until the execution completes.
+	// stageConfirmed stages order.confirmed. The row commits in the
+	// activity's own transaction but stays invisible to the relay
+	// (ready = false) until the execution completes.
+	//
+	// The event id is the activity's Key plus the execution's nonce, the
+	// same on every attempt: a retried attempt inserts nothing. The Key
+	// alone is not enough: it is "instance:schedule:name", and the schedule
+	// number restarts with each execution of an instance (ContinueAsNew, or
+	// an instance id reused after retention), so a later execution would hit
+	// ON CONFLICT and lose its event silently. The nonce assumes one nonce
+	// per execution, drawn by the workflow (replayed from history).
+	//
+	// A late attempt can still insert after the run ended (the attempt
+	// outlived its lease, then the run failed and the hook dropped what was
+	// there): that orphan row is never released. A periodic job should
+	// delete rows that stay not ready for long, say a day.
 	stageConfirmed = flows.DefineActivity("outbox.stage-confirmed",
-		func(ctx context.Context, k flows.Key, o Order) (struct{}, struct{}, error) {
-			payload, err := json.Marshal(o)
+		func(ctx context.Context, k flows.Key, in staged) (struct{}, struct{}, error) {
+			payload, err := json.Marshal(in.Order)
 			if err != nil {
-				return struct{}{}, struct{}{}, flows.Permanent(err)
+				return struct{}{}, struct{}{}, flows.Permanent(fmt.Errorf("encode order.confirmed: %w", err))
 			}
 			_, err = db.Exec(ctx, `
 				INSERT INTO app_outbox.events (event_id, instance_id, topic, key, payload)
 				VALUES ($1, $2, 'order.confirmed', $3, $4)
-				ON CONFLICT (event_id) DO NOTHING`, string(k), o.ID, o.ID, payload)
+				ON CONFLICT (event_id) DO NOTHING`, string(k)+"/"+in.Nonce, in.Order.ID, in.Order.ID, payload)
 			if err != nil {
 				return struct{}{}, struct{}{}, fmt.Errorf("stage order.confirmed: %w", err)
 			}
@@ -131,7 +164,11 @@ var (
 		}, nil)
 
 	placeOrder = flows.DefineWorkflow("outbox.place-order", 1, func(c flows.Ctx, o Order) (string, error) {
-		if _, err := stageConfirmed.Run(c, o); err != nil {
+		n, err := flows.Rand(c)
+		if err != nil {
+			return "", err
+		}
+		if _, err := stageConfirmed.Run(c, staged{Order: o, Nonce: strconv.FormatUint(n, 36)}); err != nil {
 			return "", err
 		}
 		return ship.Run(c, o) // failing here drops the staged order.confirmed
@@ -162,13 +199,16 @@ func (outboxHook) RunEnded(ctx context.Context, tx pgx.Tx, r flows.RunInfo) erro
 		"instance_id": r.InstanceID, "workflow": r.Workflow, "status": string(r.Status), "error": r.Error,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("encode workflow.ended: %w", err)
 	}
 	// event_id defaults to a fresh uuid: this insert commits once, with the end.
 	_, err = tx.Exec(ctx, `
 		INSERT INTO app_outbox.events (instance_id, topic, key, payload, ready)
 		VALUES ($1, 'workflow.ended', $1, $2, true)`, r.InstanceID, payload)
-	return err
+	if err != nil {
+		return fmt.Errorf("stage workflow.ended of %s: %w", r.InstanceID, err)
+	}
+	return nil
 }
 
 // relay publishes ready events until ctx is done.
@@ -177,7 +217,7 @@ func relay(ctx context.Context, pool *pgxpool.Pool, bus EventBus) {
 	defer t.Stop()
 	for {
 		if err := relayBatch(ctx, pool, bus, 10); err != nil && ctx.Err() == nil {
-			fmt.Println("  relay:", err)
+			fmt.Printf("  relay: %v\n", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -194,7 +234,7 @@ func relay(ctx context.Context, pool *pgxpool.Pool, bus EventBus) {
 func relayBatch(ctx context.Context, pool *pgxpool.Pool, bus EventBus, n int) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin relay batch: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -231,11 +271,11 @@ func relayBatch(ctx context.Context, pool *pgxpool.Pool, bus EventBus, n int) er
 		// so consumers can drop the duplicates at-least-once delivery makes.
 		msg, err := json.Marshal(map[string]any{"event_id": e.eventID, "data": json.RawMessage(e.payload)})
 		if err != nil {
-			return err
+			return fmt.Errorf("encode %s: %w", e.eventID, err)
 		}
 		if perr := bus.Publish(ctx, e.topic, e.key, msg); perr != nil {
 			if ctx.Err() != nil {
-				return ctx.Err() // stopping: leave the rest to the next relay
+				return fmt.Errorf("relay stopped: %w", ctx.Err()) // stopping: leave the rest to the next relay
 			}
 			backoff := min(100*time.Millisecond<<e.attempts, 5*time.Second)
 			if _, err := tx.Exec(ctx, `
@@ -270,12 +310,12 @@ func run() error {
 	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		return err
+		return fmt.Errorf("connect: %w", err)
 	}
 	defer pool.Close()
 	db = pool
 	if err := flows.Migrate(ctx, pool); err != nil {
-		return err
+		return fmt.Errorf("migrate: %w", err)
 	}
 	if _, err := pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("create outbox: %w", err)
@@ -283,10 +323,10 @@ func run() error {
 	// Set the hook on every engine, client-only ones included.
 	engine, err := flows.New(pool, flows.Options{Hook: outboxHook{}})
 	if err != nil {
-		return err
+		return fmt.Errorf("new engine: %w", err)
 	}
 	if err := engine.Start(ctx); err != nil {
-		return err
+		return fmt.Errorf("start engine: %w", err)
 	}
 	defer func() { _ = engine.Stop(context.Background()) }()
 
@@ -302,14 +342,14 @@ func run() error {
 	suffix := time.Now().Format("150405.000")
 	ok := Order{ID: "order-ok-" + suffix, Amount: 25, Ship: "Hanoi"}
 	if _, err := placeOrder.Run(ctx, engine, ok.ID, ok); err != nil {
-		return err
+		return fmt.Errorf("%s: %w", ok.ID, err)
 	}
-	fmt.Println(ok.ID, "completed: order.confirmed released")
+	fmt.Println(ok.ID, "completed")
 	bad := Order{ID: "order-bad-" + suffix, Amount: 40, Ship: "nowhere"}
 	if _, err := placeOrder.Run(ctx, engine, bad.ID, bad); !errors.Is(err, errUnshippable) {
 		return fmt.Errorf("%s should have failed, got %w", bad.ID, err)
 	}
-	fmt.Println(bad.ID, "failed: order.confirmed dropped")
+	fmt.Println(bad.ID, "failed")
 
 	// Wait for the relay to drain these orders, then stop it gracefully.
 	for {
@@ -317,14 +357,14 @@ func run() error {
 		if err := pool.QueryRow(ctx, `
 			SELECT count(*) FROM app_outbox.events
 			WHERE instance_id = ANY($1) AND ready AND sent_at IS NULL`, []string{ok.ID, bad.ID}).Scan(&pending); err != nil {
-			return err
+			return fmt.Errorf("count pending events: %w", err)
 		}
 		if pending == 0 {
 			break
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("wait for the relay: %w", ctx.Err())
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
@@ -335,14 +375,22 @@ func run() error {
 		SELECT instance_id, topic, attempts FROM app_outbox.events
 		WHERE instance_id = ANY($1) ORDER BY id`, []string{ok.ID, bad.ID})
 	if err != nil {
-		return err
+		return fmt.Errorf("list events: %w", err)
 	}
+	// The failed order has no order.confirmed row: the hook dropped it.
 	fmt.Println("outbox:")
 	var inst, topic string
 	var attempts int
-	_, err = pgx.ForEachRow(rows, []any{&inst, &topic, &attempts}, func() error {
+	var badConfirmed bool
+	if _, err := pgx.ForEachRow(rows, []any{&inst, &topic, &attempts}, func() error {
+		badConfirmed = badConfirmed || (inst == bad.ID && topic == "order.confirmed")
 		fmt.Printf("  %-26s %-16s sent after %d failed attempt(s)\n", inst, topic, attempts)
 		return nil
-	})
-	return err
+	}); err != nil {
+		return fmt.Errorf("list events: %w", err)
+	}
+	if badConfirmed {
+		return fmt.Errorf("%s: order.confirmed was not dropped", bad.ID)
+	}
+	return nil
 }
