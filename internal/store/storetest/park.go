@@ -3,6 +3,7 @@ package storetest
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -12,8 +13,8 @@ import (
 )
 
 // park parks the execution id as non-deterministic, consuming its pending
-// events (wakeTask's signal).
-func (seq lockSeq) park(t *testing.T, s store.Store, h Harness, id string) {
+// events (wakeTask's signal, and any other), which it returns.
+func (seq lockSeq) park(t *testing.T, s store.Store, h Harness, id string) []store.PendingEvent {
 	t.Helper()
 	task := wakeTask(t, s, h, id)
 	c := &store.Completion{Consumed: pendingIDs(task), Status: store.StatusNeedsAttention, Err: "wrong code", ErrKinds: store.KindNonDeterministic}
@@ -23,6 +24,7 @@ func (seq lockSeq) park(t *testing.T, s store.Store, h Harness, id string) {
 	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, c); err != nil {
 		t.Fatal(err)
 	}
+	return task.Pending
 }
 
 // T10.14: a parked holder (needs_attention) does not run, so its lock is
@@ -36,35 +38,44 @@ func testLockHolderParked(t *testing.T, h Harness) {
 		mustCreate(t, s, id)
 		seq.consume(t, s, claimOne(t, s, owner, h.TTL))
 	}
-	if ev := seq.queueForTTL(t, s, h, "i1", 1, "k", 0, 0, h.TTL); ev.Type != history.LockAcquired {
+	ttl := 3 * h.TTL // the steps before the lapse take far less on a loaded machine
+	if ev := seq.queueForTTL(t, s, h, "i1", 1, "k", 0, 0, ttl); ev.Type != history.LockAcquired {
 		t.Fatalf("free: %+v", ev)
 	}
-	granted, err := s.Now(ctx)
-	if err != nil {
-		t.Fatal(err)
+	granted := storeNow(t, s)
+	within := func() bool { return storeNow(t, s).Sub(granted) < ttl }
+	// i2 waits (its timer an hour away), then i1 parks.
+	ev := seq.queueForTTL(t, s, h, "i2", 1, "k", time.Hour, time.Hour, ttl)
+	taker := ""
+	switch {
+	case ev.Type == history.LockAcquired: // too slow: lapsed already
+		taker = "i2"
+	case ev.Err != "i1":
+		t.Fatalf("waiter: %+v", ev)
 	}
-	seq.park(t, s, h, "i1")
-	// Kept while the TTL lasts: a waiter is refused, and the park wakes it
-	// not (its timer is an hour away). On a machine too loaded to ask
-	// within the TTL, the lock may have lapsed already: not asserted then.
-	ev := seq.queueForTTL(t, s, h, "i2", 1, "k", time.Hour, time.Hour, h.TTL)
-	asked, err := s.Now(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if asked.Sub(granted) < h.TTL && (ev.Type != history.LockHeld || ev.Err != "i1") {
-		t.Fatalf("lock of a just parked holder: %+v", ev)
-	}
-	if ev.Type != history.LockHeld {
-		t.Skipf("too slow: %v between the grant and the next request (TTL %v)", asked.Sub(granted), h.TTL)
-	}
+	parked := seq.park(t, s, h, "i1")
+	// The park is not an end: it wakes nobody.
 	if tasks := claim(t, s, owner, h.TTL); len(tasks) != 0 {
 		t.Fatalf("the park woke %s", tasks[0].Execution.InstanceID)
 	}
-	h.Advance(t, s, h.TTL+h.TTL/2)
-	// Lapsed: anyone's (a lapse wakes nobody, not even the waiter i2).
-	if ev := seq.queueForTTL(t, s, h, "i3", 1, "k", 0, 0, h.TTL); ev.Type != history.LockAcquired {
-		t.Fatalf("lapsed lock of a parked holder: %+v", ev)
+	if taker == "" {
+		// Kept while its TTL lasts: the waiter is still refused.
+		ev = seq.queueForTTL(t, s, h, "i2", 2, "k", time.Hour, time.Hour, ttl)
+		if ev.Type == history.LockAcquired {
+			if within() {
+				t.Fatalf("lock of a parked holder taken within its TTL: %+v", ev)
+			}
+			taker = "i2"
+		} else if ev.Err != "i1" {
+			t.Fatalf("waiter after the park: %+v", ev)
+		}
+	}
+	h.Advance(t, s, ttl+ttl/2)
+	if taker == "" {
+		// Lapsed: anyone's (a lapse wakes nobody, not even the waiter i2).
+		if ev := seq.queueForTTL(t, s, h, "i3", 1, "k", 0, 0, ttl); ev.Type != history.LockAcquired {
+			t.Fatalf("lapsed lock of a parked holder: %+v", ev)
+		}
 	}
 	// The parked holder is told, but stays parked until reopened.
 	if tasks := claim(t, s, owner, h.TTL); len(tasks) != 0 {
@@ -73,7 +84,19 @@ func testLockHolderParked(t *testing.T, h Harness) {
 	if e, err := s.GetExecution(ctx, "i1"); err != nil || e.Status != store.StatusNeedsAttention {
 		t.Fatalf("holder: %+v %v", e, err)
 	}
+	if slices.ContainsFunc(parked, func(p store.PendingEvent) bool { return p.Event.Type == history.LockLost }) {
+		return // lost before it parked (a slow machine): told then
+	}
 	reopenLost(t, s, h, "i1", 1, "k")
+}
+
+func storeNow(t *testing.T, s store.Store) time.Time {
+	t.Helper()
+	now, err := s.Now(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return now
 }
 
 // reopenLost reopens the parked execution id and expects it told that it
@@ -130,22 +153,22 @@ func testLockHolderParkedTerminated(t *testing.T, h Harness) {
 // T10.14: a completion that would end the execution while events wait
 // (ErrPendingEvents) is refused before the end hook: the hook neither
 // sees it nor commits anything, and the execution runs on; the re-run's
-// end is the hook's only call.
+// end is the hook's only call. Without hook support, the refusal and the
+// re-run are still checked.
 func testEndHookPendingEvents(t *testing.T, h Harness) {
-	if h.SetHook == nil {
-		t.Skip("no hook support")
-	}
 	s := h.New(t)
 	var (
 		mu   sync.Mutex
 		seen []store.EndInfo
 	)
-	h.SetHook(s, func(_ context.Context, e store.EndInfo) error {
-		mu.Lock()
-		defer mu.Unlock()
-		seen = append(seen, e)
-		return nil
-	})
+	if h.SetHook != nil {
+		h.SetHook(s, func(_ context.Context, e store.EndInfo) error {
+			mu.Lock()
+			defer mu.Unlock()
+			seen = append(seen, e)
+			return nil
+		})
+	}
 	mustCreate(t, s, "i1")
 	task := claimOne(t, s, owner, h.TTL)
 	if err := s.Signal(ctx, "i1", "late", []byte(`1`)); err != nil {
@@ -177,6 +200,9 @@ func testEndHookPendingEvents(t *testing.T, h Harness) {
 		t.Fatal(err)
 	}
 	task = claimOne(t, s, owner, h.TTL)
+	if len(task.Pending) != 3 {
+		t.Fatalf("re-run pending %v, want the start, the signal and the cancel", pendingTypes(task))
+	}
 	c := &store.Completion{Consumed: pendingIDs(task), Status: store.StatusCanceled}
 	for i, p := range task.Pending {
 		ev := p.Event
@@ -186,6 +212,12 @@ func testEndHookPendingEvents(t *testing.T, h Harness) {
 	c.History = append(c.History, history.Event{Seq: int64(len(c.History) + 1), Type: history.ExecutionCanceled})
 	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, c); err != nil {
 		t.Fatalf("end after the re-run: %v", err)
+	}
+	if e, _ := s.GetExecution(ctx, "i1"); e.Status != store.StatusCanceled {
+		t.Fatalf("status after the re-run: %s", e.Status)
+	}
+	if h.SetHook == nil {
+		return
 	}
 	mu.Lock()
 	defer mu.Unlock()

@@ -316,7 +316,9 @@ func TestOldLockWaitExecutionIsParked(t *testing.T) {
 // request granted at once, and a waiter refused then woken by the release,
 // both complete (no park).
 func TestLockWaitWithoutCache(t *testing.T) {
-	e := startedEngine(t, mem.New(nil), Options{InstanceID: "lock-cold", CacheSize: -1, LeaseTTL: 2 * time.Second})
+	// A long LeaseTTL raises the locks' TTL: no lapse on a loaded machine
+	// (not what this tests).
+	e := startedEngine(t, mem.New(nil), Options{InstanceID: "lock-cold", CacheSize: -1, LeaseTTL: 30 * time.Second})
 	a := startLock(t, e, "cold-a", lockIn{Key: "c", Wait: true, Await: true}) // granted at once
 	waitFor(t, func() bool { return historyHas(e, "cold-a", "LockAcquired") })
 	b := startLock(t, e, "cold-b", lockIn{Key: "c", Wait: true, Sleep: 20 * time.Millisecond})
