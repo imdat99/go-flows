@@ -3,6 +3,9 @@ package worker_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -239,12 +242,15 @@ func waitUntil(t *testing.T, cond func() bool) {
 type dueWfClaims struct {
 	*pg.Store
 	claims, due atomic.Int32
+	// explained, if set, tells whether a reported due time has a cause other
+	// than kept leases (it is then not counted).
+	explained func(next time.Duration) bool
 }
 
 func (c *dueWfClaims) ClaimWorkflowTasksDue(ctx context.Context, owner string, queues []string, n int, ttl time.Duration) ([]store.WorkflowTask, time.Duration, error) {
 	tasks, next, err := c.Store.ClaimWorkflowTasksDue(ctx, owner, queues, n, ttl)
 	c.claims.Add(1)
-	if next > 0 {
+	if next > 0 && (c.explained == nil || !c.explained(next)) {
 		c.due.Add(1)
 	}
 	return tasks, next, err
@@ -271,6 +277,7 @@ func TestKeptExecutionsAreNotDue(t *testing.T) {
 		// (a claimable execution, rightly reported); still well inside the 4s
 		// below, so reported expiries would show.
 		Owner: "b", Queues: []string{q}, Eager: true, LeaseTTL: 2 * time.Second, EagerWindow: time.Minute,
+		Logger: testLogger(t, "b"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -284,9 +291,41 @@ func TestKeptExecutionsAreNotDue(t *testing.T) {
 	}
 	time.Sleep(500 * time.Millisecond) // B runs the three chains, keeping their leases
 	st := &dueWfClaims{Store: pg.New(pool)}
+	// Under a starved CPU, B may hand a chain over (its lease lapsing, or
+	// with nothing to run eagerly): the released execution is ready work
+	// another transaction committed after A's claim began, reported due in
+	// a moment (right: A's claim skipped it). A due with every execution
+	// leased, or not within moments, is a kept lease's expiry, the bug this
+	// test is about (T10.18: the CI flake was the former).
+	st.explained = func(next time.Duration) bool {
+		rows, err := pool.Query(context.Background(), `SELECT instance_id, owner_id, locked_until IS NULL,
+			ready_at - now(), not_before - now(), sticky_owner FROM flows.execution ORDER BY id`)
+		if err != nil {
+			t.Logf("due in %v: dump: %v", next, err)
+			return false
+		}
+		defer rows.Close()
+		var b strings.Builder
+		released := false
+		for rows.Next() {
+			var id, own, sticky string
+			var unleased bool
+			var ready, notBefore *time.Duration
+			if err := rows.Scan(&id, &own, &unleased, &ready, &notBefore, &sticky); err != nil {
+				t.Logf("due in %v: dump: %v", next, err)
+				return false
+			}
+			released = released || unleased
+			fmt.Fprintf(&b, " [%s owner=%q unleased=%v ready_in=%v not_before_in=%v sticky=%q]", id, own, unleased, ready, notBefore, sticky)
+		}
+		t.Logf("due in %v (handed over: %v):%s", next, released, b.String())
+		// A handed-over execution is due within moments; a kept lease's
+		// expiry is hundreds of milliseconds to the 2s lease ahead.
+		return released && next < 100*time.Millisecond
+	}
 	a, err := worker.New(st, reg, reg, worker.Options{
 		Owner: "a", Queues: []string{q}, LeaseTTL: 5 * time.Second,
-		PollMin: 3 * time.Second, PollMax: 3 * time.Second,
+		PollMin: 3 * time.Second, PollMax: 3 * time.Second, Logger: testLogger(t, "a"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -302,4 +341,20 @@ func TestKeptExecutionsAreNotDue(t *testing.T) {
 	if st.claims.Load() == 0 || st.due.Load() != 0 {
 		t.Fatalf("%d of %d workflow claims reported a due time", st.due.Load(), st.claims.Load())
 	}
+}
+
+// testLogger logs warnings and errors of a worker to t, prefixed.
+func testLogger(t *testing.T, name string) *slog.Logger {
+	t.Helper()
+	return slog.New(slog.NewTextHandler(tWriter{t, name}, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+type tWriter struct {
+	t    *testing.T
+	name string
+}
+
+func (w tWriter) Write(p []byte) (int, error) {
+	w.t.Logf("%s: %s", w.name, strings.TrimSpace(string(p)))
+	return len(p), nil
 }

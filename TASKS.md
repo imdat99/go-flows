@@ -543,6 +543,47 @@ Các mục được rút ra từ phần "Còn mở" của T8.x, xếp theo thứ
     - Người dùng chọn sửa rồi review lần 5. Đã sửa: `dropLocksOf` chỉ chọn bên chờ được đánh thức trong transaction này (`woken_until = now() + ttl` của dòng lock); `woken_until` bị xoá khi xếp hàng lại; bên chờ đang park không được đánh thức (pg và mem). Test thêm: `LockWaiterStaleWoken` (đỏ trên pg trước khi sửa), `LockWaiterTerminatedHolder`. Review lần 5 đạt; thêm `LockWaiterParkedSkipped`, ghi "không bị park" trong tài liệu, bỏ trường thừa ở mem.
     - Lưu ý nâng cấp: execution đang ngủ trong `LockWait` từ code cũ khi replay gặp timer `flows.lock:<key>` mới (khác lịch sử) nên bị park `needs_attention` (không fail). Cần ghi trong ghi chú phát hành.
 
+### P10 — Xử lý hết các mục còn mở
+
+Gom mọi mục "Còn mở" ở trên, xếp theo mức độ ảnh hưởng. Quy trình như cũ: test đỏ trước, cài đặt, `make test`, `make lint`, bench và benchgate với task ⚡, review độc lập; không đạt quá 3 lần thì dừng và báo người dùng. Bước đầu của mỗi task là kiểm tra lại mục đó còn đúng không (code đã đổi nhiều qua P9).
+
+Đã xong nhờ P9, chỉ cần gạch trong các ghi chú cũ: lấy lock tốn 2 round trip (T9.7); activity chờ queue hoặc retry làm lock hết hạn (T9.4); mục tiêu ≤ 80 alloc (đang 76); child tạo ở task kết thúc bị bỏ âm thầm (T9.2).
+
+**A. Độ trễ và khôi phục**
+- [ ] **T10.1** Khôi phục nhanh sau khi engine crash. Hiện việc của engine chết chỉ được nhận ở lần poll theo giờ (`PollMax`), vì T9.1 cố ý không báo hạn lease đang chạy (heartbeat đẩy nó lên liên tục). Hướng: báo hạn của lease không còn được gia hạn (ví dụ `locked_until` cũ hơn một nửa TTL so với lần gia hạn dự kiến), hoặc ghi `renewed_at` và chỉ báo lease quá hạn gia hạn. Test: kill một engine (chaos hoặc store giả), engine kia nhận việc trong khoảng `LeaseTTL` chứ không phải `PollMax`.
+- [ ] **T10.2** Hàng đợi có hơn 64 execution giữ lease đến hạn trước timer đầu tiên thì quay về poll theo giờ. Thay giới hạn cứng 64 của `nextWorkflowDue` bằng truy vấn dùng index (`min(ready_at)` trên các execution không giữ lease), giữ số dòng đọc thấp (`TestDueStatementsReadFewRows`).
+- [ ] **T10.3** Timer của execution đang sticky với engine khác làm engine rảnh claim rỗng một lần: báo hạn có tính `sticky_until`. Test đếm số claim.
+
+**B. Lock và thứ tự khoá**
+- [ ] **T10.4** Thứ tự khoá dòng lock và execution còn lại:
+    - `dropLocksOf` và Terminate xoá lock row theo thứ tự quét: khoá theo key trước (`ORDER BY key FOR UPDATE`), khớp thứ tự của claim và `acquireLock`;
+    - `Unstick` cập nhật nhiều execution row theo thứ tự lưu trữ: khoá theo `id`;
+    - claim khoá dư tới `$3` dòng lock mỗi queue: chỉ khoá lock của các execution thực sự được claim.
+    Test kiểu `TestEndsLockRowsInOrder` (NOWAIT) cho từng chỗ.
+- [ ] **T10.5** Lock vẫn hết hạn khi kết quả activity đã xong nhưng workflow task còn chờ trong queue lâu hơn `ttl`: tính cả `pending_event` chưa xử lý vào điều kiện giữ lock (cùng giới hạn `LockHold`). Ghi vào tài liệu nâng cấp: khi nâng cấp cuốn chiếu, binary cũ lấy lại lock không ghi `hold_us`, và execution đang ngủ trong `LockWait` sẽ bị park.
+
+**C. Saga và executor**
+- [ ] **T10.6** ⚡ Cache executor giới hạn theo tổng byte (mục còn thiếu của T3.3), không chỉ theo số lượng; evict LRU khi vượt. Bench `BenchmarkActivityRun` không tăng alloc.
+- [ ] **T10.7** Comp data của attempt uncertain trước đó bị mất: compensator nhận data của attempt cuối (thường là zero). Giữ comp data khác rỗng gần nhất qua các attempt (cột trên `activity_task`), compensator nhận nó. Test: attempt 1 trả comp data rồi timeout, attempt 2 lỗi; compensator thấy data của attempt 1.
+- [ ] **T10.8** Store bộ nhớ: `cancelChildrenOf` và `Wake` quét toàn bộ execution; thêm chỉ mục theo cha và theo trạng thái.
+
+**D. Round trip và quan sát**
+- [ ] **T10.9** `Terminate` đọc `GetExecution` riêng để báo cho observer: trả thông tin cần thiết ngay từ câu lệnh terminate. Khi có hook, `inTx` tốn thêm một round trip `SELECT`: gộp vào batch.
+- [ ] **T10.10** Tracing: nối span qua các task của một execution (link tới span của task trước, hoặc span cha theo instance); test cho attempt mất lease.
+- [ ] **T10.11** flowtest: báo future bị bỏ cho cả child, không chỉ instance truyền vào `Run`; hook có recover. Xem lại giới hạn activity chờ cancel do timer của workflow (`ErrNeverIdle`): sửa nếu được, nếu không thì giữ tài liệu.
+- [ ] **T10.12** analyzer: channel không gán vào biến (`foo(make(chan int))`), field kiểu channel hoặc mutex; không báo nhầm `SideEffect` để trong biến.
+
+**E. Test và chaos**
+- [ ] **T10.13** Bỏ sleep thật trong test lock và test due: dùng đồng hồ của store (mem) hoặc chờ theo điều kiện; làm chắc `LockRenewal` (pg), `TestDelayedWorkOfAnotherWorkerIsOnTime`, `TestDelayedWorkIsNotPollMaxLate/pg`, `TestLockLost`. Chạy `make race10` để xác nhận.
+- [ ] **T10.14** Test còn thiếu: holder lock đang `needs_attention`; replay của `LockWait`; hook đi cùng `ErrPendingEvents`; park do non-determinism tới hook ở mức engine; 0 alloc khi không cấu hình gì (observer, tracer, hook); bỏ sticky khi đang compensating.
+- [ ] **T10.15** Chaos: fencing ở mức workflow lease (ngủ ngắn hơn thời gian đóng băng); kịch bản cha và con, continue-as-new, timer; chứng minh nhiều racer thực sự tham gia ở C.
+
+**F. Bench, tài liệu, CI**
+- [ ] **T10.16** Bench: tìm nguyên nhân run thỉnh thoảng mất khoảng 1.5 s (đã thấy liên quan fsync của máy; xác nhận bằng trace, nếu là máy thì ghi lại); xem headroom của gate trên runner CI dùng chung.
+- [ ] **T10.17** Tài liệu: sửa thông tin sai của comment migration `00005` trong tài liệu (không sửa migration đã áp dụng); thêm `CHANGELOG.md` với ghi chú nâng cấp (LockWait park khi replay, `hold_us` khi nâng cấp cuốn chiếu, migration 00009–00012).
+- [ ] **T10.18** CI trên GitHub: chưa từng chạy (chưa push; input `install-only` của `golangci-lint-action@v8` chưa kiểm chứng). **Cần người dùng cho phép push** (remote `origin` có sẵn). Trước đó kiểm tra workflow cục bộ (`actionlint`, hoặc `act` nếu có).
+    - 2026-11-16: người dùng đã push; lint và bench đạt trên CI, test trượt `TestKeptExecutionsAreNotDue` ("1 of 10 workflow claims reported a due time"). Tái hiện cục bộ khi ép test và tải vào 1 core: B (CPU bị bóp) trả lại một chain; execution được nhả commit với `ready_at` = `now()` của B, sau khi transaction claim của A bắt đầu, nên được báo đến hạn sau khoảng 0.7ms. Đó là hành vi đúng (việc thật mà claim của A bỏ qua). Thử sửa engine bằng `clock_timestamp()` bị review bác: tạo lỗ lỡ đánh thức (việc đến hạn trong lúc claim chạy không được claim cũng không được báo). Đã hoàn nguyên; thêm test regression `TestDueCoversWhatTheClaimSkipped` (đỏ với `clock_timestamp()`); test worker chỉ bỏ qua hạn khi có execution được trả lại và hạn nhỏ hơn 100ms, kèm log chẩn đoán. Vẫn bắt được lỗi T9.1 (review kiểm chứng). Review 2 lần (2 không đạt), sửa theo review.
+
 ## File và hàm tái sử dụng
 
 | Lấy từ | Dùng cho |
