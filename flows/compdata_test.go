@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -222,10 +223,15 @@ func TestZeroEncodingRecovers(t *testing.T) {
 	if b := zeroEncoding(newCodec[string]()); string(b) != `""` {
 		t.Fatalf("zero encoding %q", b)
 	}
-	_ = DefineActivity("test.panic-zero", func(context.Context, Key, int) (int, panicZero, error) {
-		return 0, panicZero{V: 1}, nil
-	}, func(context.Context, Key, panicZero) error { return nil })
+	// Defining it once is enough (a second definition panics: -count > 1).
+	definePanicZero.Do(func() {
+		_ = DefineActivity("test.panic-zero", func(context.Context, Key, int) (int, panicZero, error) {
+			return 0, panicZero{V: 1}, nil
+		}, func(context.Context, Key, panicZero) error { return nil })
+	})
 }
+
+var definePanicZero sync.Once
 
 // startStopped starts e and stops it with the test.
 func startStopped(t *testing.T, e *Engine) {
