@@ -561,7 +561,7 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 	return leases, nil
 }
 
-// ownerDue tells whether, as Postgres' owner_due, the next due time of an
+// ownerDue tells whether, as Postgres' due_owner, the next due time of an
 // execution a completion leaves sticky is its owner's (T10.3): it falls
 // within the stickiness and within DueKnown, how far the owner wakes by
 // itself for the execution's due times.
@@ -1367,7 +1367,7 @@ func (s *Store) ClaimWorkflowTasksDue(ctx context.Context, owner string, queues 
 			// As Postgres' ready_at: the earliest pending event, if none is
 			// visible now (then the execution is ready, not due later), of an
 			// execution without a lease (a kept lease is its owner's), unless
-			// it is its sticky owner's (owner_due, T10.3).
+			// it is its sticky owner's (due_owner, T10.3).
 			if at, ok := e.readyAt(now); e.lockedUntil.IsZero() && (!ok || at.After(now)) {
 				if e.stickyOwner == "" || !e.ownerDue {
 					for _, p := range e.pending {

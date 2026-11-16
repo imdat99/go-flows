@@ -481,17 +481,21 @@ const nextWorkflowDue = `
 	SELECT (extract(epoch FROM min(least(r.t, n.t)) - now()) * 1000000)::bigint
 	FROM unnest($1::text[]) AS q(name)
 	LEFT JOIN LATERAL (
-		-- Kept leases are left out (owner_due, T10.2): their ready_at is
+		-- Kept leases are left out (due_owner, T10.2): their ready_at is
 		-- the lease expiry (recovery's, not a due time). So is a next due
 		-- time falling while sticky to an owner that wakes for it (T10.3,
 		-- store.Completion.DueKnown): it claims it; if it died, recovery's
-		-- timed poll does. The index leaves
-		-- them out, so the first entry after now() is the answer; locked_until
-		-- only filters leases kept by a binary older than owner_due.
-		SELECT ready_at FROM flows.execution
-		WHERE queue = q.name AND status IN ('running', 'compensating') AND ready_at IS NOT NULL
-		  AND NOT owner_due AND ready_at > now() AND locked_until IS NULL
-		ORDER BY ready_at LIMIT 1
+		-- timed poll does. The index leaves them out, so the first entry
+		-- after now() is the answer. Leases kept by a binary older than
+		-- due_owner are filtered after the index (locked_until), over at
+		-- most 64 rows: during a rolling upgrade, a timer behind more of
+		-- them is left to the timed poll.
+		SELECT min(x.ready_at) FROM (
+			SELECT ready_at, locked_until FROM flows.execution
+			WHERE queue = q.name AND status IN ('running', 'compensating') AND ready_at IS NOT NULL
+			  AND (due_owner = '' OR due_owner <> sticky_owner) AND ready_at > now()
+			ORDER BY ready_at LIMIT 64
+		) AS x WHERE x.locked_until IS NULL
 	) AS r(t) ON true
 	LEFT JOIN LATERAL (
 		SELECT not_before FROM flows.execution
@@ -672,7 +676,7 @@ func (s *Store) ReleaseWorkflowTask(ctx context.Context, l store.Lease, delay ti
 
 const releaseWorkflow = `
 	UPDATE flows.execution
-	SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL, owner_due = false,
+	SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL, due_owner = '',
 	    ready_at = (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
 	    not_before = CASE WHEN $2::bigint > 0 THEN now() + $2::bigint * interval '1 microsecond' END
 	WHERE id = $1
@@ -1119,14 +1123,17 @@ const updateRunning = `
 	                   now() + $4 * interval '1 microsecond')
 	        ELSE (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1) END,
 	    owner_id = CASE WHEN v.keep THEN e.owner_id ELSE '' END,
-	    -- The next due time is the owner's (T10.2, T10.3): a kept lease's, or
-	    -- the first event falling due while the execution is sticky to it
-	    -- and within $9 (store.Completion.DueKnown: the owner wakes for it).
-	    owner_due = v.keep OR coalesce($5::bigint > 0 AND $9::bigint > 0 AND
+	    -- The next due time is the owner's (due_owner, T10.2, T10.3): a
+	    -- kept lease's, or the first event falling due while the execution
+	    -- is sticky to it and within $9 (store.Completion.DueKnown: the owner
+	    -- wakes for it). The mark counts while sticky_owner names the owner:
+	    -- a kept lease's sticky_owner is its owner (no sticky_until).
+	    due_owner = CASE WHEN v.keep OR coalesce($5::bigint > 0 AND $9::bigint > 0 AND
 	        (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1)
-	            <= now() + least($5::bigint, $9::bigint) * interval '1 microsecond', false),
+	            <= now() + least($5::bigint, $9::bigint) * interval '1 microsecond', false)
+	        THEN $6 ELSE '' END,
 	    locked_until = CASE WHEN v.keep THEN now() + $4 * interval '1 microsecond' END,
-	    sticky_owner = CASE WHEN NOT v.keep AND $5::bigint > 0 THEN $6 ELSE '' END,
+	    sticky_owner = CASE WHEN v.keep OR $5::bigint > 0 THEN $6 ELSE '' END,
 	    sticky_until = CASE WHEN NOT v.keep AND $5::bigint > 0 THEN now() + $5 * interval '1 microsecond' END
 	FROM v WHERE e.id = $1
 	RETURNING CASE WHEN NOT v.keep AND e.ready_at <= now() THEN ` + notifyW + "e.queue)" + ` END`

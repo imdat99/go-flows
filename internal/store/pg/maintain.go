@@ -269,7 +269,7 @@ func (s *Store) Unstick(ctx context.Context, owner string) error {
 		// (timers this owner knew of) falls due (T9.1).
 		_, err := s.pool.Exec(ctx, `
 			WITH u AS (
-				UPDATE flows.execution SET sticky_owner = '', sticky_until = NULL, owner_due = false
+				UPDATE flows.execution SET sticky_owner = '', sticky_until = NULL, due_owner = ''
 				WHERE sticky_owner = $1 AND sticky_until > now()
 				RETURNING queue
 			)

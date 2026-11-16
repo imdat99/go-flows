@@ -128,8 +128,9 @@ polls then, so a backed-off poller does not run it up to `PollMax` late
   engine claims it, and an idle engine waking for it made an empty claim
   (`TestStickyTimersDoNotWakeOthers`, `TestStickyOwnerFiresTimersOfOthersOnTime`);
   if that engine dies, the timed poll above finds it. Both are marked
-  (`owner_due`, written only with `ready_at`, so renewals stay HOT updates;
-  `Unstick` clears it) and left out of a partial
+  (`due_owner`, written only with `ready_at`, so claims and renewals stay
+  HOT updates; it counts while `sticky_owner` names the same engine, which
+  older binaries clear, so they leave no stale mark; `Unstick` clears it) and left out of a partial
   index (`execution_due_idx`, T10.2), so the `ready_at` lookup reads one
   entry per queue however many kept leases fall due before the first timer.
 

@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/imdat99/go-flows/internal/history"
+	"github.com/imdat99/go-flows/internal/store"
 	"github.com/imdat99/go-flows/internal/testdb"
 )
 
@@ -62,5 +64,49 @@ func TestDueCoversWhatTheClaimSkipped(t *testing.T) {
 				t.Fatal("neither claimed nor reported due: a missed wake-up")
 			}
 		})
+	}
+}
+
+// T10.2 review: a row marked as its owner's (a kept lease) and then written
+// by a binary older than the mark (which clears stickiness and leases but
+// not the mark) is anyone's: its timer is reported. The mark only counts
+// while the sticky owner it names is the row's (due_owner = sticky_owner),
+// which every binary maintains.
+func TestDueMarkLeftByOldBinaryHidesNothing(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	st := New(pool)
+	if _, _, err := st.CreateExecution(ctx, store.NewExecution{InstanceID: "i1", Workflow: "w", Version: 1, Queue: "q"}); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := st.ClaimWorkflowTasks(ctx, "a", []string{"q"}, 1, time.Minute)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("claim: %v %v", tasks, err)
+	}
+	task := tasks[0]
+	c := &store.Completion{
+		History:  []history.Event{{Seq: task.LastSeq + 1, Type: history.ExecutionStarted, Name: "w", Version: 1, Queue: "q"}},
+		Consumed: []int64{task.Pending[0].ID},
+		KeepFor:  time.Minute,
+	}
+	if _, err := st.CompleteWorkflowTask(ctx, task.Lease, c); err != nil {
+		t.Fatal(err)
+	}
+	// An older binary takes the lapsed lease and releases the execution
+	// with a timer in an hour, sticky to nobody (its updateRunning).
+	if _, err := pool.Exec(ctx, `UPDATE flows.execution
+		SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL,
+		    lease_version = lease_version + 1, ready_at = now() + interval '1 hour'`); err != nil {
+		t.Fatal(err)
+	}
+	var us *int64
+	if err := pool.QueryRow(ctx, nextWorkflowDue, []string{"q"}).Scan(&us); err != nil {
+		t.Fatal(err)
+	}
+	if us == nil || time.Duration(*us)*time.Microsecond < 50*time.Minute {
+		t.Fatalf("the timer is not reported: next %v", us)
 	}
 }

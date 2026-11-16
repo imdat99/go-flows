@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/imdat99/go-flows/internal/testdb"
 )
@@ -148,8 +149,11 @@ func TestGW8_ClaimsReadOnlyWhatTheyClaim(t *testing.T) {
 // T9.1: the statements telling pollers when the next work falls due read a
 // bounded number of rows per queue from their indexes, however many
 // executions wait (rows the scans returned and rows their filters removed
-// both count): a row or so, and at most 64 index rows for the ready_at
-// lookup (it skips leased executions after the index).
+// both count): a row or so. T10.2: kept leases ahead of a queue's first
+// timer are skipped through the index (queue k: the timer is found behind
+// 5000 of them); leases kept by a binary older than due_owner are filtered
+// after the index, over at most 64 rows (queue o: bounded, the timer then
+// left to the timed poll).
 func TestDueStatementsReadFewRows(t *testing.T) {
 	pool := testdb.New(t)
 	ctx := context.Background()
@@ -165,12 +169,20 @@ func TestDueStatementsReadFewRows(t *testing.T) {
 		 FROM generate_series(1, 20000) g`,
 		`INSERT INTO flows.activity_task (execution_id, instance_id, schedule_id, name, queue, visible_at)
 		 SELECT id, instance_id, 1, 'a', 'q', now() + interval '1 hour' FROM flows.execution`,
-		// Kept leases due before the first timer (T10.2: a fixed number of
-		// rows read used to miss the timer behind them).
+		// Queues k and o: one timer in an hour behind 5000 kept leases (their
+		// ready_at the lease expiry), marked (k) or kept by an older binary (o).
+		`INSERT INTO flows.execution (instance_id, workflow, version, queue, status, ready_at)
+		 VALUES ('tk', 'w', 1, 'k', 'running', now() + interval '1 hour'),
+		        ('to', 'w', 1, 'o', 'running', now() + interval '1 hour')`,
 		`INSERT INTO flows.execution (instance_id, workflow, version, queue, status, ready_at,
-		                             owner_id, lease_version, locked_until, owner_due)
-		 SELECT 'k' || g, 'w', 1, 'q', 'running', now() + interval '30 minutes',
-		        'keeper', 1, now() + interval '30 minutes', true
+		                             owner_id, lease_version, locked_until, sticky_owner, due_owner)
+		 SELECT 'k' || g, 'w', 1, 'k', 'running', now() + interval '30 minutes',
+		        'keeper', 1, now() + interval '30 minutes', 'keeper', 'keeper'
+		 FROM generate_series(1, 5000) g`,
+		`INSERT INTO flows.execution (instance_id, workflow, version, queue, status, ready_at,
+		                             owner_id, lease_version, locked_until)
+		 SELECT 'o' || g, 'w', 1, 'o', 'running', now() + interval '30 minutes',
+		        'old', 1, now() + interval '30 minutes'
 		 FROM generate_series(1, 5000) g`,
 		`ANALYZE`,
 	} {
@@ -179,11 +191,16 @@ func TestDueStatementsReadFewRows(t *testing.T) {
 		}
 	}
 	numRe := regexp.MustCompile(`(?:actual time=[0-9.]+\.\.[0-9.]+ rows=|Rows Removed by Filter: )([0-9]+)`)
-	for _, c := range []struct{ name, sql string }{
-		{"next workflow due", nextWorkflowDue},
-		{"next activity due", nextActivityDue},
+	for _, c := range []struct {
+		name, sql, queue string
+		min, max         time.Duration // the due time reported (0: none)
+	}{
+		{"next workflow due", nextWorkflowDue, "q", 50 * time.Second, time.Minute}, // the hand-backs
+		{"next workflow due, kept leases", nextWorkflowDue, "k", 50 * time.Minute, time.Hour},
+		{"next workflow due, old kept leases", nextWorkflowDue, "o", 0, time.Hour}, // none, or the timer
+		{"next activity due", nextActivityDue, "q", 50 * time.Minute, time.Hour},
 	} {
-		rows, err := pool.Query(ctx, "EXPLAIN (ANALYZE) "+c.sql, []string{"q"})
+		rows, err := pool.Query(ctx, "EXPLAIN (ANALYZE) "+c.sql, []string{c.queue})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -205,8 +222,15 @@ func TestDueStatementsReadFewRows(t *testing.T) {
 			t.Errorf("%s reads %d rows:\n%s", c.name, read, plan.String())
 		}
 		var us *int64
-		if err := pool.QueryRow(ctx, c.sql, []string{"q"}).Scan(&us); err != nil || us == nil || *us <= 0 {
-			t.Errorf("%s: %v %v", c.name, us, err)
+		if err := pool.QueryRow(ctx, c.sql, []string{c.queue}).Scan(&us); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		var got time.Duration
+		if us != nil {
+			got = time.Duration(*us) * time.Microsecond
+		}
+		if got < c.min || got > c.max {
+			t.Errorf("%s: due in %v, want %v to %v", c.name, got, c.min, c.max)
 		}
 	}
 }
