@@ -563,7 +563,13 @@ Gom mọi mục "Còn mở" ở trên, xếp theo mức độ ảnh hưởng. Qu
 - [ ] **T10.5** Lock vẫn hết hạn khi kết quả activity đã xong nhưng workflow task còn chờ trong queue lâu hơn `ttl`: tính cả `pending_event` chưa xử lý vào điều kiện giữ lock (cùng giới hạn `LockHold`). Ghi vào tài liệu nâng cấp: khi nâng cấp cuốn chiếu, binary cũ lấy lại lock không ghi `hold_us`, và execution đang ngủ trong `LockWait` sẽ bị park.
 
 **C. Saga và executor**
-- [ ] **T10.6** ⚡ Cache executor giới hạn theo tổng byte (mục còn thiếu của T3.3), không chỉ theo số lượng; evict LRU khi vượt. Bench `BenchmarkActivityRun` không tăng alloc.
+- [x] **T10.6** ⚡ Cache executor giới hạn theo tổng byte (mục còn thiếu của T3.3), không chỉ theo số lượng; evict LRU khi vượt. Bench `BenchmarkActivityRun` không tăng alloc.
+    - `Executor.Size()`: ước lượng rẻ (4 KiB mỗi executor + 4 KiB mỗi coroutine sống + byte payload, comp data, err của mọi event), cộng dồn khi replay hoặc ghi event, không duyệt cấu trúc mỗi task; cùng history thì cùng size (live hay replay). Cache giữ size lúc put nên tổng chính xác; evict LRU khi vượt `CacheSize` hoặc `CacheBytes`; executor lớn hơn cả giới hạn bị đóng, không cache, không evict ai.
+    - Option `CacheBytes` (flows + worker), mặc định 256 MiB (`worker.DefaultCacheBytes`), `-1` = chỉ giới hạn số lượng. Tài liệu vi+en.
+    - Test: `TestExecutorSizeCountsPayloads`, `TestCacheEvictsLRUBeyondBytes`, `TestCacheDropsAnExecutorLargerThanTheLimit`, `TestCacheReplaceKeepsBytes`, `TestCacheWarmCycleAllocations`.
+    - Bench (n=12, máy chia sẻ với agent khác): ActivityRun 76 → 77.5 allocs/op (p=0.195, không có ý nghĩa; từng run 73–82 cả hai bên), B/op 14.59 → 14.42 KiB; Replay 30 allocs, 37.89 KiB không đổi. Gate ActivityRun: median 76 ≤ 85.
+    - Review 2 lần (1 không đạt: executor quá lớn evict hết các entry khác trước khi tự bị bỏ; input activity được tính sau replay nhưng không khi chạy live). Lần 2 đạt.
+    - Còn mở: ước lượng chỉ tăng, execution history rất dài (nhiều signal) có thể vượt `CacheBytes` rồi replay mỗi task (khó xảy ra với 256 MiB).
 - [ ] **T10.7** Comp data của attempt uncertain trước đó bị mất: compensator nhận data của attempt cuối (thường là zero). Giữ comp data khác rỗng gần nhất qua các attempt (cột trên `activity_task`), compensator nhận nó. Test: attempt 1 trả comp data rồi timeout, attempt 2 lỗi; compensator thấy data của attempt 1.
 - [ ] **T10.8** Store bộ nhớ: `cancelChildrenOf` và `Wake` quét toàn bộ execution; thêm chỉ mục theo cha và theo trạng thái.
 
