@@ -564,12 +564,19 @@ Gom mọi mục "Còn mở" ở trên, xếp theo mức độ ảnh hưởng. Qu
     - Review độc lập 2 lần (1 không đạt: timer do engine khác commit bị ẩn khi execution sticky với chủ mới, lỡ đánh thức; horizon cục bộ có thể bỏ due time bị ẩn). Lần 2 đạt; ghi chú nhỏ (thời gian chạy task làm due time cục bộ trễ) đã sửa ở 4766d0e.
 
 **B. Lock và thứ tự khoá**
-- [ ] **T10.4** Thứ tự khoá dòng lock và execution còn lại:
+- [x] **T10.4** Thứ tự khoá dòng lock và execution còn lại:
     - `dropLocksOf` và Terminate xoá lock row theo thứ tự quét: khoá theo key trước (`ORDER BY key FOR UPDATE`), khớp thứ tự của claim và `acquireLock`;
     - `Unstick` cập nhật nhiều execution row theo thứ tự lưu trữ: khoá theo `id`;
     - claim khoá dư tới `$3` dòng lock mỗi queue: chỉ khoá lock của các execution thực sự được claim.
     Test kiểu `TestEndsLockRowsInOrder` (NOWAIT) cho từng chỗ.
-- [ ] **T10.5** Lock vẫn hết hạn khi kết quả activity đã xong nhưng workflow task còn chờ trong queue lâu hơn `ttl`: tính cả `pending_event` chưa xử lý vào điều kiện giữ lock (cùng giới hạn `LockHold`). Ghi vào tài liệu nâng cấp: khi nâng cấp cuốn chiếu, binary cũ lấy lại lock không ghi `hold_us`, và execution đang ngủ trong `LockWait` sẽ bị park.
+    - Kiểm tra lại: mục "claim khoá dư dòng lock" không đúng (lock row chỉ của execution được claim); cái dư thật là dòng execution: mỗi LATERAL theo queue khoá tới `$3` dòng. Đã làm: `dropLocksOf` (cả Terminate) khoá dòng lock trước theo `key COLLATE "C"`; `Unstick` khoá dòng execution theo `id` (cùng thứ tự cha trước con); claim nhiều queue dùng câu lệnh riêng `claimWorkflowQueues` (đọc `$3` dòng sẵn sàng không khoá, chia phần theo queue, khoá đúng phần đó bằng `SKIP LOCKED`, bổ sung từ mọi queue chỉ khi thiếu); một queue giữ câu lệnh cũ. Mọi câu lệnh khoá nhiều dòng lock sắp theo `COLLATE "C"`, khớp `sortedLocks` của Go.
+    - Test: `TestEndsTakeLockRowsInKeyOrder`, `TestUnstickLocksRowsByID`, `TestClaimLocksOnlyWhatItClaims`, `TestClaimOverQueuesPassesLockedRows`, `TestLockRowsInByteOrder` (collation ICU `und-x-icu`; đỏ trước 8/8), `TestClaimOverQueuesInReadinessOrder`.
+    - Review độc lập 2 lần (1 không đạt: claim nhiều queue trả rỗng khi dòng được tính phần bị claim khác khoá, không có báo hạn, lỡ đánh thức tới PollMax; thứ tự key theo collation DB khác thứ tự byte của Go, deadlock dưới collation không phải C). Lần 2 đạt (300 lần thử ngẫu nhiên: luôn trả min(limit, số dòng claim được)). Bench: EagerActivity 6, LockStep 0 allocs/op.
+    - Còn mở: `claimActivities` nhiều queue vẫn khoá dư tới `$3` dòng activity mỗi queue; test GW-8 cho câu lệnh nhiều queue chưa có trường hợp bổ sung.
+- [x] **T10.5** Lock vẫn hết hạn khi kết quả activity đã xong nhưng workflow task còn chờ trong queue lâu hơn `ttl`: tính cả `pending_event` chưa xử lý vào điều kiện giữ lock (cùng giới hạn `LockHold`). Ghi vào tài liệu nâng cấp: khi nâng cấp cuốn chiếu, binary cũ lấy lại lock không ghi `hold_us`, và execution đang ngủ trong `LockWait` sẽ bị park.
+    - Lock hết hạn của holder đang running/compensating vẫn thuộc holder tới `hold_us` sau `until` khi holder có pending event đã hiển thị (`visible_at <= now()`); timer tương lai và holder đang park không tính. Giới hạn tính tuyệt đối từ `until` (chỉ claim và gia hạn lease làm mới). Không ảnh hưởng chỗ giữ của waiter (T9.8). Tài liệu vi+en, CHANGELOG (Fixed + ghi chú nâng cấp: binary cũ vẫn lấy lock đó).
+    - Test: conformance `LockKeptWhileEventsWait` (mem, pg fast, pgx; đỏ trước: "lock taken while its holder's result waits").
+    - Review độc lập 1 lần: đạt. Ghi nhận: một `LockLost` hiển thị cũng giữ các lock khác của holder tới `hold_us` khi queue của nó không ai phục vụ.
 
 **C. Saga và executor**
 - [x] **T10.6** ⚡ Cache executor giới hạn theo tổng byte (mục còn thiếu của T3.3), không chỉ theo số lượng; evict LRU khi vượt. Bench `BenchmarkActivityRun` không tăng alloc.
