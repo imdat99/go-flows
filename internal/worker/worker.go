@@ -342,6 +342,14 @@ func (w *Worker) Start(ctx context.Context) error {
 
 func (w *Worker) taskCtx() context.Context { return w.tasksCtx }
 
+// claimCtx is the context of the claims: not the polls' (Stop cancels
+// those first) but the tasks' (canceled at Stop's deadline). A claim in
+// flight when Stop begins may commit in the store anyway; canceled, its
+// tasks were lost to this worker yet stayed leased to it for a whole
+// LeaseTTL, and other workers found them only at a timed poll (kept
+// leases are not due times). Completed, its tasks run as the stop's.
+func (w *Worker) claimCtx() context.Context { return w.tasksCtx }
+
 // errStopping is the cause of the task contexts canceled at Stop's
 // deadline: an activity interrupted this way did not fail, its outcome is
 // not recorded, and another instance runs it again once its lease expires.
@@ -359,19 +367,17 @@ func (w *Worker) Stop(ctx context.Context) error {
 		return nil
 	}
 	pollCancel()
-	w.pollers.Wait()
-	done := make(chan struct{})
-	go func() {
-		w.tasks.Wait()
-		close(done)
-	}()
 	var err error
-	select {
-	case <-done:
-	case <-ctx.Done():
-		err = fmt.Errorf("worker: stop: %w", ctx.Err())
-		taskCancel(errStopping)
-		<-done // canceled tasks return promptly
+	// A claim in flight completes (claimCtx), within the deadline; then
+	// the tasks.
+	for _, wait := range []func(){w.pollers.Wait, w.tasks.Wait} {
+		if !waitUntilDone(ctx, wait) {
+			if err == nil {
+				err = fmt.Errorf("worker: stop: %w", ctx.Err())
+			}
+			taskCancel(errStopping)
+			wait() // canceled claims and tasks return promptly
+		}
 	}
 	taskCancel(errStopping)
 	w.runnersOnce.Do(func() { close(w.runnersStop) }) // the tasks drained: no job is in flight
@@ -386,6 +392,22 @@ func (w *Worker) Stop(ctx context.Context) error {
 	}
 	cancel()
 	return err
+}
+
+// waitUntilDone runs wait and reports whether it returned before ctx was
+// done (if not, wait still runs).
+func waitUntilDone(ctx context.Context, wait func()) bool {
+	done := make(chan struct{})
+	go func() {
+		wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func notify(ch chan struct{}) {
@@ -550,15 +572,16 @@ func (w *Worker) pollWorkflows(ctx context.Context) {
 	// does not ask: if that one comes back partial, the due times are
 	// learned at the next claim, PollMin later at most.
 	wantDue := true
+	cctx := w.claimCtx()
 	w.poll(ctx, w.wfSlots, w.wfHint, w.wfDue, func(n int) (int, error) {
 		at := time.Now()
 		var tasks []store.WorkflowTask
 		var next time.Duration
 		var err error
 		if dc != nil && wantDue {
-			tasks, next, err = dc.ClaimWorkflowTasksDue(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
+			tasks, next, err = dc.ClaimWorkflowTasksDue(cctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
 		} else {
-			tasks, err = w.st.ClaimWorkflowTasks(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
+			tasks, err = w.st.ClaimWorkflowTasks(cctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
 		}
 		for i := range tasks {
 			w.runTask(wfJob{pollCtx: ctx, task: tasks[i], at: at})
@@ -572,15 +595,16 @@ func (w *Worker) pollWorkflows(ctx context.Context) {
 func (w *Worker) pollActivities(ctx context.Context) {
 	dc, _ := w.st.(store.DueClaimer)
 	wantDue := true // as in pollWorkflows
+	cctx := w.claimCtx()
 	w.poll(ctx, w.actSlots, w.actHint, w.actDue, func(n int) (int, error) {
 		at := time.Now()
 		var tasks []store.ActivityTask
 		var next time.Duration
 		var err error
 		if dc != nil && wantDue {
-			tasks, next, err = dc.ClaimActivityTasksDue(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
+			tasks, next, err = dc.ClaimActivityTasksDue(cctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
 		} else {
-			tasks, err = w.st.ClaimActivityTasks(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
+			tasks, err = w.st.ClaimActivityTasks(cctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
 		}
 		for i := range tasks {
 			t := tasks[i]
