@@ -6,8 +6,9 @@
 // API. Workflow code is any function or function literal whose first
 // parameter is flows.Ctx (workflow functions, coroutines started with
 // flows.Go, helpers), recognized by type, not by import name. Function
-// literals passed to flows.SideEffect are not workflow code (their value is
-// recorded), nor are activities (their first parameter is a
+// literals passed to flows.SideEffect (inline, or through a local variable
+// used for nothing else) are not workflow code (their value is recorded),
+// nor are activities (their first parameter is a
 // context.Context).
 //
 // Use it as a golangci-lint module plugin ("flowsvet") or with go vet:
@@ -66,7 +67,8 @@ func run(pass *analysis.Pass) (any, error) {
 			if body == nil || !isWorkflowFunc(pass, ft) {
 				return true
 			}
-			checkBody(pass, body)
+			c := checker{pass: pass, sideEffectFns: sideEffectFuncs(pass, body)}
+			c.checkBody(body)
 			return false // nested workflow code was checked with it
 		})
 	}
@@ -91,7 +93,21 @@ func isFlows(t types.Type, name string) bool {
 	return obj.Pkg() != nil && obj.Pkg().Path() == FlowsPath && obj.Name() == name
 }
 
-func checkBody(pass *analysis.Pass, body *ast.BlockStmt) {
+// checker checks the body of one workflow function.
+type checker struct {
+	pass *analysis.Pass
+	// sideEffectFns are the function literals held in variables that are
+	// only passed to flows.SideEffect: not workflow code.
+	sideEffectFns map[*ast.FuncLit]bool
+}
+
+// checkExpr checks an expression as workflow code.
+func (c checker) checkExpr(e ast.Expr) {
+	c.checkBody(&ast.BlockStmt{List: []ast.Stmt{&ast.ExprStmt{X: e}}})
+}
+
+func (c checker) checkBody(body *ast.BlockStmt) {
+	pass := c.pass
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.GoStmt:
@@ -108,11 +124,16 @@ func checkBody(pass *analysis.Pass, body *ast.BlockStmt) {
 			checkRange(pass, n)
 		case *ast.ValueSpec, *ast.AssignStmt:
 			checkDefs(pass, n)
+		case *ast.FuncLit:
+			return !c.sideEffectFns[n]
 		case *ast.CallExpr:
-			return checkCall(pass, n)
+			if isMakeChan(pass, n) {
+				pass.Reportf(n.Pos(), "%s", typeReport(pass.TypesInfo.TypeOf(n), ""))
+			}
+			return c.checkCall(n)
 		case *ast.SelectorExpr:
 			checkFuncValue(pass, n)
-			checkBody(pass, &ast.BlockStmt{List: []ast.Stmt{&ast.ExprStmt{X: n.X}}})
+			c.checkExpr(n.X)
 			return false // not n.Sel again
 		case *ast.Ident:
 			checkFuncValue(pass, n)
@@ -189,44 +210,238 @@ func checkFuncValue(pass *analysis.Pass, e ast.Expr) {
 	}
 }
 
-// checkDefs reports variables of types that do not belong in workflow code.
+// checkDefs reports variables of types that do not belong in workflow code:
+// channels, sync primitives, and structs holding them in a field.
 func checkDefs(pass *analysis.Pass, n ast.Node) {
 	var idents []*ast.Ident
+	var values []ast.Expr
 	switch d := n.(type) {
 	case *ast.ValueSpec:
-		idents = d.Names
+		idents, values = d.Names, d.Values
 	case *ast.AssignStmt:
 		if d.Tok != token.DEFINE {
 			return
 		}
 		for _, l := range d.Lhs {
-			if id, ok := l.(*ast.Ident); ok {
-				idents = append(idents, id)
-			}
+			id, _ := l.(*ast.Ident)
+			idents = append(idents, id) // nil keeps idents aligned with values
 		}
+		values = d.Rhs
 	}
-	for _, id := range idents {
+	for i, id := range idents {
+		if id == nil {
+			continue
+		}
 		obj := pass.TypesInfo.Defs[id]
 		if obj == nil {
 			continue
+		}
+		if len(values) == len(idents) && isMakeChan(pass, values[i]) {
+			continue // reported at the make call
 		}
 		t := types.Unalias(obj.Type())
 		if p, ok := t.(*types.Pointer); ok {
 			t = types.Unalias(p.Elem())
 		}
-		if _, ok := t.Underlying().(*types.Chan); ok {
-			pass.Reportf(id.Pos(), "native channels are not allowed in workflow code: use signals (flows.Signals) or flows.Go with flows.WaitGroup")
+		t = arrayElem(t)
+		if msg := typeReport(t, ""); msg != "" {
+			pass.Reportf(id.Pos(), "%s", msg)
 			continue
 		}
-		if named, ok := t.(*types.Named); ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "sync" {
-			switch named.Obj().Name() {
-			case "WaitGroup":
-				pass.Reportf(id.Pos(), "sync.WaitGroup blocks workflow code: use flows.WaitGroup")
-			case "Mutex", "RWMutex", "Cond", "Once":
-				pass.Reportf(id.Pos(), "sync.%s is not needed in workflow code (coroutines never run in parallel) and can block it", named.Obj().Name())
-			}
+		checkFields(pass, id, t, "")
+	}
+}
+
+// checkFields reports, at id, the fields of t that hold a channel or a sync
+// primitive, through nested structs and arrays. Only structs declared in
+// the package being checked and anonymous ones are looked into (not
+// another package's internals), and not through pointers (the methods
+// called through them are reported).
+func checkFields(pass *analysis.Pass, id *ast.Ident, t types.Type, prefix string) {
+	if named, ok := t.(*types.Named); ok && named.Obj().Pkg() != pass.Pkg {
+		return
+	}
+	st, ok := t.Underlying().(*types.Struct)
+	if !ok {
+		return
+	}
+	for f := range st.Fields() {
+		ft := arrayElem(types.Unalias(f.Type()))
+		name := prefix + f.Name()
+		if msg := typeReport(ft, name); msg != "" {
+			pass.Reportf(id.Pos(), "%s", msg)
+			continue
+		}
+		checkFields(pass, id, ft, name+".")
+	}
+}
+
+// arrayElem is the element type of t if t is an array (of arrays), or t.
+func arrayElem(t types.Type) types.Type {
+	for {
+		a, ok := t.Underlying().(*types.Array)
+		if !ok {
+			return t
+		}
+		t = types.Unalias(a.Elem())
+	}
+}
+
+// typeReport returns the report for a value of type t in workflow code (a
+// channel or a sync primitive), or "". field names the struct field
+// holding the value, if any.
+func typeReport(t types.Type, field string) string {
+	if field != "" {
+		field = " (field " + field + ")"
+	}
+	if _, ok := coreType(t).(*types.Chan); ok {
+		return "native channels are not allowed in workflow code" + field + ": use signals (flows.Signals) or flows.Go with flows.WaitGroup"
+	}
+	named, ok := t.(*types.Named)
+	if !ok || named.Obj().Pkg() == nil || named.Obj().Pkg().Path() != "sync" {
+		return ""
+	}
+	switch name := named.Obj().Name(); name {
+	case "WaitGroup":
+		return "sync.WaitGroup" + field + " blocks workflow code: use flows.WaitGroup"
+	case "Mutex", "RWMutex", "Cond", "Once":
+		return "sync." + name + field + " is not needed in workflow code (coroutines never run in parallel) and can block it"
+	}
+	return ""
+}
+
+// isMakeChan reports whether e calls the builtin make to create a channel.
+func isMakeChan(pass *analysis.Pass, e ast.Expr) bool {
+	call, ok := ast.Unparen(e).(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	id, ok := ast.Unparen(call.Fun).(*ast.Ident)
+	if !ok {
+		return false
+	}
+	if b, ok := pass.TypesInfo.Uses[id].(*types.Builtin); !ok || b.Name() != "make" {
+		return false
+	}
+	t := pass.TypesInfo.TypeOf(call)
+	if t == nil {
+		return false
+	}
+	_, ok = coreType(t).(*types.Chan)
+	return ok
+}
+
+// sideEffectFuncs returns the function literals assigned to local variables
+// whose only uses are as the function argument of flows.SideEffect: their
+// value is recorded, so they are not workflow code. The literals of a
+// variable also called, or passed anywhere else, stay checked.
+func sideEffectFuncs(pass *analysis.Pass, body *ast.BlockStmt) map[*ast.FuncLit]bool {
+	lits := funcLitVars(pass, body)
+	if len(lits) == 0 {
+		return nil
+	}
+	var skip map[*ast.FuncLit]bool
+	for v, only := range sideEffectOnly(pass, body, lits) {
+		if !only {
+			continue
+		}
+		if skip == nil {
+			skip = map[*ast.FuncLit]bool{}
+		}
+		for _, l := range lits[v] {
+			skip[l] = true
 		}
 	}
+	return skip
+}
+
+// funcLitVars returns the function literals assigned (or given as initial
+// value) to each variable declared in body.
+func funcLitVars(pass *analysis.Pass, body *ast.BlockStmt) map[*types.Var][]*ast.FuncLit {
+	var lits map[*types.Var][]*ast.FuncLit
+	bind := func(l, r ast.Expr) {
+		id, ok := l.(*ast.Ident)
+		lit, isLit := ast.Unparen(r).(*ast.FuncLit)
+		if !ok || !isLit {
+			return
+		}
+		obj := pass.TypesInfo.Defs[id]
+		if obj == nil {
+			obj = pass.TypesInfo.Uses[id] // assigned, or redeclared by :=
+		}
+		// Only variables declared in the body: the uses of others are not
+		// all seen.
+		v, ok := obj.(*types.Var)
+		if !ok || v.Pos() < body.Pos() || v.Pos() >= body.End() {
+			return
+		}
+		if lits == nil {
+			lits = map[*types.Var][]*ast.FuncLit{}
+		}
+		lits[v] = append(lits[v], lit)
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch d := n.(type) {
+		case *ast.AssignStmt:
+			if len(d.Lhs) == len(d.Rhs) && (d.Tok == token.DEFINE || d.Tok == token.ASSIGN) {
+				for i := range d.Lhs {
+					bind(d.Lhs[i], d.Rhs[i])
+				}
+			}
+		case *ast.ValueSpec:
+			if len(d.Names) == len(d.Values) {
+				for i := range d.Names {
+					bind(d.Names[i], d.Values[i])
+				}
+			}
+		}
+		return true
+	})
+	return lits
+}
+
+// sideEffectOnly maps each variable of lits used in body to whether all its
+// uses (assignments aside) are as the function argument of
+// flows.SideEffect.
+func sideEffectOnly(pass *analysis.Pass, body *ast.BlockStmt, lits map[*types.Var][]*ast.FuncLit) map[*types.Var]bool {
+	// Parents are visited before their children: an identifier is known to
+	// be assigned to, or recorded, when it is reached.
+	assigned := map[*ast.Ident]bool{}
+	recorded := map[*ast.Ident]bool{}
+	only := map[*types.Var]bool{}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if n.Tok == token.DEFINE || n.Tok == token.ASSIGN {
+				for _, l := range n.Lhs {
+					if id, ok := l.(*ast.Ident); ok {
+						assigned[id] = true
+					}
+				}
+			}
+		case *ast.CallExpr:
+			if isSideEffect(pass, n) && len(n.Args) > 1 {
+				if id, ok := ast.Unparen(n.Args[1]).(*ast.Ident); ok {
+					recorded[id] = true
+				}
+			}
+		case *ast.Ident:
+			v, ok := pass.TypesInfo.Uses[n].(*types.Var)
+			if !ok || lits[v] == nil || assigned[n] {
+				return true
+			}
+			prev, seen := only[v]
+			only[v] = recorded[n] && (prev || !seen)
+		}
+		return true
+	})
+	return only
+}
+
+// isSideEffect reports whether call calls flows.SideEffect.
+func isSideEffect(pass *analysis.Pass, call *ast.CallExpr) bool {
+	fn := calledFunc(pass, call.Fun)
+	return fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == FlowsPath && fn.Name() == "SideEffect"
 }
 
 // forbidden maps package path and function to the advice given.
@@ -265,18 +480,18 @@ var randomConstructors = map[string]bool{"New": true, "NewSource": true, "NewPCG
 
 // checkCall reports forbidden calls, and returns false for flows.SideEffect
 // (its function argument runs once, outside replay: no checks there).
-func checkCall(pass *analysis.Pass, call *ast.CallExpr) bool {
+func (c checker) checkCall(call *ast.CallExpr) bool {
+	pass := c.pass
 	fn := calledFunc(pass, call.Fun)
 	if fn == nil || fn.Pkg() == nil {
 		return true
 	}
-	path, name := fn.Pkg().Path(), fn.Name()
-	if path == FlowsPath && name == "SideEffect" {
+	if isSideEffect(pass, call) {
 		// The function whose value is recorded runs outside replay; the
-		// Ctx argument is still workflow code. (A function held in a
-		// variable is not recognized: pass the literal inline.)
+		// Ctx argument is still workflow code. A literal held in a
+		// variable is skipped through sideEffectFns.
 		if len(call.Args) > 0 {
-			checkBody(pass, &ast.BlockStmt{List: []ast.Stmt{&ast.ExprStmt{X: call.Args[0]}}})
+			c.checkExpr(call.Args[0])
 		}
 		return false
 	}
@@ -285,10 +500,10 @@ func checkCall(pass *analysis.Pass, call *ast.CallExpr) bool {
 	}
 	// Check the arguments, not the callee (reported above, not as a value).
 	for _, a := range call.Args {
-		checkBody(pass, &ast.BlockStmt{List: []ast.Stmt{&ast.ExprStmt{X: a}}})
+		c.checkExpr(a)
 	}
 	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-		checkBody(pass, &ast.BlockStmt{List: []ast.Stmt{&ast.ExprStmt{X: sel.X}}})
+		c.checkExpr(sel.X)
 	}
 	return false
 }

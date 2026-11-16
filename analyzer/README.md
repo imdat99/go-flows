@@ -5,8 +5,12 @@ their history, so their code must be deterministic. `flowsvet` reports, in
 any function whose first parameter is `flows.Ctx`:
 
 - `go` statements: use `flows.Go`;
-- `select`, channel sends, receives and native channel types: use
-  `flows.Select`, signals, `flows.Go` with `flows.WaitGroup`;
+- `select`, channel sends, receives, native channel variables and every
+  `make(chan ...)`, even one passed straight to a call: use `flows.Select`,
+  signals, `flows.Go` with `flows.WaitGroup`;
+- variables of a struct type that holds a channel or a sync primitive in a
+  field (nested structs and arrays included, not behind pointers; only
+  structs declared in the checked package or anonymous ones);
 - ranging over a map: iterate over sorted keys;
 - the wall clock (`time.Now`, `Sleep`, `After`, `NewTimer`, ...): use
   `flows.Now`, `flows.Sleep`, `flows.NewTimer`;
@@ -22,8 +26,9 @@ any function whose first parameter is `flows.Ctx`:
   `flows.WaitGroup`.
 
 Function literals passed to `flows.SideEffect` are not checked (their value
-is recorded): pass the literal inline, as a function held in a variable is
-checked. Activities are not checked (they take a `context.Context`).
+is recorded), inline or held in a local variable whose only uses are as the
+argument of `flows.SideEffect` (a variable also called or passed elsewhere
+keeps its literals checked). Activities are not checked (they take a `context.Context`).
 Methods of a `math/rand` `Rand` and `sync.Map.Range` are reported too (the
 constructors `rand.New`, `NewSource`, `NewPCG`... are not), and so are
 forbidden functions used as values (`now := time.Now`).
