@@ -158,7 +158,10 @@ type Lease struct {
 
 // WorkflowTask is a claimed execution with the events to deliver to it.
 type WorkflowTask struct {
-	Lease     Lease
+	Lease Lease
+	// Execution is the execution the task is of, without its Input and
+	// Output (the workflow's input is in its ExecutionStarted event; not
+	// copying them spares every claim and resume): GetExecution has them.
 	Execution Execution
 	// LastSeq is the sequence number of the last history event; a cached
 	// executor whose history ends elsewhere must reload (GW-9).
@@ -255,6 +258,10 @@ type Completion struct {
 	// StickyFor (0 clears stickiness).
 	KeepFor   time.Duration
 	StickyFor time.Duration
+	// Leases is scratch space: CompleteWorkflowTask may return the leases
+	// of the eagerly claimed activities in its capacity (a completion
+	// reused across tasks then allocates none).
+	Leases []Lease
 }
 
 // LockRequest asks for the business lock Key for TTL.
@@ -316,6 +323,10 @@ type ActivityResult struct {
 	// to run next (eager execution).
 	Resume    *Lease
 	ResumeFor time.Duration
+	// Into, when set with Resume, is where the store may write the returned
+	// task (and returns Into): the caller's reused buffer, its Pending
+	// capacity included. A store may ignore it and allocate.
+	Into *WorkflowTask
 }
 
 // ValidShape reports whether a completion is consistent in itself (see
@@ -574,5 +585,8 @@ type Watcher interface {
 	// when full (Postgres stops delivering, and eventually rejects commits
 	// that notify, while a listener does not read its notifications).
 	// Queue names must stay well under 8000 bytes (the payload limit).
+	// Once listening (at the start, and again after a restart), Watch
+	// wakes both kinds with an empty queue, meaning every queue: work that
+	// became ready before it listened got no hint.
 	Watch(ctx context.Context, wake func(kind WorkKind, queue string)) error
 }

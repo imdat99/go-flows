@@ -10,6 +10,7 @@ import (
 	"github.com/imdat99/go-flows/internal/compensation"
 	"github.com/imdat99/go-flows/internal/coro"
 	"github.com/imdat99/go-flows/internal/executor"
+	"github.com/imdat99/go-flows/internal/history"
 	"github.com/imdat99/go-flows/internal/store"
 )
 
@@ -33,10 +34,14 @@ import (
 // workflow slot is free again.
 type driver struct {
 	w        *Worker
-	ctx      context.Context // canceled when the workflow lease is lost or at the stop deadline
+	ctx      context.Context       // canceled when the workflow lease is lost or at the stop deadline
+	detached context.Context       // context.WithoutCancel(ctx), made once (recordResult)
+	resumed  [2]store.WorkflowTask // reused for the tasks resumed with an activity's result
+	eagerBuf []int                 // reused by eager
+	flip     bool
 	lease    store.Lease
-	held     bool   // the workflow lease is held (kept between tasks)
-	untrack  func() // stops tracking the workflow lease in the heartbeat
+	held     bool     // the workflow lease is held (kept between tasks)
+	tracked  tracking // the workflow lease in the heartbeat (untrack)
 	ex       *executor.Executor
 	inflight int
 	results  chan eagerResult
@@ -59,18 +64,21 @@ type driver struct {
 // instance (unknown workflow version) or a later retry.
 var errHandedBack = errors.New("worker: task handed back")
 
+// untrack stops tracking the workflow lease in the heartbeat.
+func (d *driver) untrack() { d.tracked.untrack() }
+
 type eagerResult struct {
 	task    store.ActivityTask
 	outcome attemptOutcome
-	untrack func()
+	tracked tracking
 }
 
 // runWorkflowTask runs a claimed workflow task and everything it leads to.
 func (w *Worker) runWorkflowTask(pollCtx context.Context, task *store.WorkflowTask, claimed time.Time) {
-	tctx, untrack := w.hb.track(w.taskCtx(), false, task.Lease, claimed)
+	tctx, tracked := w.hb.track(w.taskCtx(), false, task.Lease, claimed)
 	// results and running are made by the first eager launch: most tasks
 	// launch none (a channel of MaxActivities results is ~24 KiB).
-	d := &driver{w: w, ctx: tctx, lease: task.Lease, held: true, untrack: untrack}
+	d := &driver{w: w, ctx: tctx, lease: task.Lease, held: true, tracked: tracked}
 	defer func() {
 		if r := recover(); r != nil {
 			w.log.LogAttrs(pollCtx, slog.LevelError, "flows: panic in workflow task", slog.Any("panic", r))
@@ -146,11 +154,11 @@ func (d *driver) detach() {
 		defer w.detached.Add(-1)
 		for range n {
 			r := <-results
-			if _, _, err := w.record(context.WithoutCancel(w.taskCtx()), &r.task, r.outcome, nil); err != nil {
+			if _, _, err := w.record(context.WithoutCancel(w.taskCtx()), &r.task, r.outcome, nil, nil); err != nil {
 				w.log.LogAttrs(w.taskCtx(), slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
 					slog.String("activity", r.task.Name), slog.Any("error", err))
 			}
-			r.untrack()
+			r.tracked.untrack()
 		}
 	})
 }
@@ -174,12 +182,22 @@ func (d *driver) handOver() {
 func (d *driver) recordResult(r eagerResult, resume bool) *store.WorkflowTask {
 	d.inflight--
 	delete(d.running, r.task.ScheduleID)
-	defer r.untrack()
+	defer r.tracked.untrack()
 	var lease *store.Lease
 	if resume && d.held && d.ctx.Err() == nil {
 		lease = &d.lease
 	}
-	next, resumeLost, err := d.w.record(context.WithoutCancel(d.ctx), &r.task, r.outcome, lease)
+	if d.detached == nil {
+		d.detached = context.WithoutCancel(d.ctx)
+	}
+	// The resumed task goes to one of two buffers in turn: the task this
+	// one follows may still be referenced while it is recorded.
+	d.flip = !d.flip
+	into := &d.resumed[0]
+	if d.flip {
+		into = &d.resumed[1]
+	}
+	next, resumeLost, err := d.w.record(d.detached, &r.task, r.outcome, lease, into)
 	if err != nil {
 		d.w.log.LogAttrs(d.ctx, slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
 			slog.String("activity", r.task.Name), slog.Any("error", err))
@@ -233,7 +251,11 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		c.StickyFor = w.opts.StickyFor
 	}
 	sent := time.Now()
-	leases, err := w.st.CompleteWorkflowTask(d.ctx, d.lease, c)
+	// The worker's task context, not d.ctx: a lease lost meanwhile is
+	// caught by the store's fence anyway, and a long-lived context costs the
+	// store's cancellation watch nothing per task (Stop's deadline still
+	// cancels it).
+	leases, err := w.st.CompleteWorkflowTask(w.taskCtx(), d.lease, c)
 	if err != nil {
 		for range eager {
 			release(w.actSlots, 1)
@@ -249,8 +271,9 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		// the local due time is never before the store's.
 		w.wfDue.add(sent.Add(c.Timers[i].At.Sub(task.Now)))
 	}
+	locks := len(c.Locks) > 0 // read before completed: it may hand c's executor to the cache
 	d.completed(task, c, eager, leases, sent)
-	if len(c.Locks) > 0 && d.held {
+	if locks && d.held {
 		// The answers are pending already: run the next task at once.
 		next, err := w.st.ResumeWorkflowTask(d.ctx, d.lease, w.opts.LeaseTTL)
 		if err == nil {
@@ -358,8 +381,14 @@ func (d *driver) completed(task *store.WorkflowTask, c *store.Completion, eager 
 	if c.Status != "" && (!c.Status.Active() || c.Status == store.StatusNeedsAttention) {
 		d.evict()
 	} else if d.ex != nil && !d.held && d.inflight == 0 && len(eager) == 0 {
-		w.cache.put(d.ex)
-		d.ex = nil
+		// Last: c is the executor's own completion, which the next task of
+		// the execution (another goroutine, once it is in the cache)
+		// rewrites. Nothing below reads c when this branch runs (no eager
+		// activity, no activity in flight to cancel).
+		defer func() {
+			w.cache.put(d.ex)
+			d.ex = nil
+		}()
 	}
 	// Activities this task canceled stop at once when they run here (others
 	// learn it from their heartbeat).
@@ -391,7 +420,7 @@ func (d *driver) eager(c *store.Completion, stopping bool) []int {
 	if !w.opts.Eager || stopping {
 		return nil
 	}
-	var idx []int
+	idx := d.eagerBuf[:0] // used within the task's completion only
 	for i := range c.Activities {
 		a := &c.Activities[i]
 		if _, ok := w.acts.Activity(a.Name, a.Compensate); !ok || !tryAcquire(w.actSlots) {
@@ -400,6 +429,7 @@ func (d *driver) eager(c *store.Completion, stopping bool) []int {
 		a.ClaimFor = w.opts.LeaseTTL
 		idx = append(idx, i)
 	}
+	d.eagerBuf = idx
 	return idx
 }
 
@@ -407,7 +437,7 @@ func (d *driver) eager(c *store.Completion, stopping bool) []int {
 // goes to the driver.
 func (d *driver) launch(t store.ActivityTask, claimed time.Time) {
 	w := d.w
-	actx, untrack := w.hb.track(w.taskCtx(), true, t.Lease, claimed)
+	actx, tracked := w.hb.track(w.taskCtx(), true, t.Lease, claimed)
 	if d.results == nil {
 		// Buffered for every activity that can run at once: an activity
 		// never blocks on a driver that stopped reading (panic, hand-over).
@@ -416,22 +446,67 @@ func (d *driver) launch(t store.ActivityTask, claimed time.Time) {
 	}
 	d.inflight++
 	d.running[t.ScheduleID] = t.Lease.ID
-	results := d.results
-	w.tasks.Go(func() {
-		defer release(w.actSlots, 1)
-		o := attemptOutcome{lost: true}
-		func() {
-			defer func() {
-				if r := recover(); r != nil { // attempt recovers user panics; this guards bugs
-					w.log.LogAttrs(actx, slog.LevelError, "flows: panic running activity", slog.Any("panic", r))
-				}
-			}()
-			if a, ok := w.acts.Activity(t.Name, t.Compensate); ok {
-				o = w.attempt(actx, a, &t)
+	w.runEager(eagerJob{ctx: actx, task: t, tracked: tracked, results: d.results})
+}
+
+// eagerJob is an eagerly claimed activity for a runner (runEager).
+type eagerJob struct {
+	ctx     context.Context //nolint:containedctx // the attempt's context, handed to the runner
+	task    store.ActivityTask
+	tracked tracking
+	results chan<- eagerResult
+}
+
+// runEager runs job on an idle runner goroutine, or on a new one: runners
+// are reused (a goroutine and its closure per activity cost allocations).
+// Each job holds an activity slot, so runners stay within about twice
+// MaxActivities (a runner that just released its slot may not be idle
+// yet). Jobs count in tasks (Stop waits for them).
+func (w *Worker) runEager(job eagerJob) {
+	w.tasks.Add(1)
+	select {
+	case w.eagerJobs <- job:
+		return
+	default:
+	}
+	w.spawnRunner(job)
+}
+
+// spawnRunner starts a runner with its first job (a function of its own:
+// the job captured by the closure escapes only here, not on every
+// runEager; inlined, it would move every job to the heap).
+//
+//go:noinline
+func (w *Worker) spawnRunner(job eagerJob) {
+	w.runners.Go(func() {
+		for {
+			w.eager1(&job)
+			select {
+			case job = <-w.eagerJobs:
+			case <-w.runnersStop:
+				return
+			}
+		}
+	})
+}
+
+// eager1 runs one eager activity and hands its outcome to its driver.
+func (w *Worker) eager1(job *eagerJob) {
+	defer w.tasks.Done()
+	defer release(w.actSlots, 1)
+	o := attemptOutcome{lost: true}
+	func() {
+		defer func() {
+			if r := recover(); r != nil { // attempt recovers user panics; this guards bugs
+				w.log.LogAttrs(job.ctx, slog.LevelError, "flows: panic running activity", slog.Any("panic", r))
 			}
 		}()
-		results <- eagerResult{task: t, outcome: o, untrack: untrack}
-	})
+		if a, ok := w.acts.Activity(job.task.Name, job.task.Compensate); ok {
+			o = w.attempt(job.ctx, a, &job.task)
+		}
+	}()
+	job.results <- eagerResult{task: job.task, outcome: o, tracked: job.tracked}
+	*job = eagerJob{} // the runner keeps no reference while idle
 }
 
 // build creates the executor of a task's execution by replaying its
@@ -452,9 +527,12 @@ func (d *driver) build(task *store.WorkflowTask) bool {
 	ex := executor.New(wf, e.ID, executor.Options{
 		StuckTimeout: w.opts.StuckTimeout, ErrorText: w.opts.Errors.Text, ErrorKinds: w.opts.Errors.Kinds,
 	})
-	hist, err := w.st.LoadHistory(d.ctx, e.ID, 0)
-	if err == nil {
-		err = ex.Replay(hist)
+	var err error
+	if task.LastSeq > 0 { // a new execution has no history yet
+		var hist []history.Event
+		if hist, err = w.st.LoadHistory(d.ctx, e.ID, 0); err == nil {
+			err = ex.Replay(hist)
+		}
 	}
 	if err != nil {
 		ex.Close()

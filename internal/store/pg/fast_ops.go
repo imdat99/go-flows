@@ -2,10 +2,10 @@ package pg
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"sync"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/imdat99/go-flows/internal/history"
 	"github.com/imdat99/go-flows/internal/store"
@@ -13,30 +13,32 @@ import (
 
 // Statement names of the fast path (prepared once per connection).
 var (
-	nFence          = stmtName(fence)
-	nNoUndelivered  = stmtName(noUndelivered)
-	nInsertHistory  = stmtName(insertHistory)
-	nDeletePending  = stmtName(deletePending)
-	nInsertPending  = stmtName(insertPending)
-	nInsertActs     = stmtName(insertActivities)
-	nInsertChild    = stmtName(insertChild)
-	nCancelChildren = stmtName(cancelChildren)
-	nCancelActs     = stmtName(cancelActivities)
-	nAcquireLock    = stmtName(acquireLock)
-	nCompChild      = stmtName(compensateChild)
-	nUpdateRunning  = stmtName(updateRunning)
-	nEndExecution   = stmtName(endExecution)
-	nContinueAsNew  = stmtName(continueAsNew)
-	nCarryPending   = stmtName(carryPending)
-	nCarrySignals   = stmtName(carrySignals)
-	nDropEnded      = stmtName(dropEnded)
-	nCancelChildOf  = stmtName(cancelChildrenOf)
-	nNotifyParent   = stmtName(notifyParent)
-	nWakeForTask    = stmtName(wakeForTask)
-	nFinishTask     = stmtName(finishTask)
-	nResumeExtend   = stmtName(resumeExtend)
-	nResumeWorkflow = stmtName(resumeWorkflow)
-	nResumePending  = stmtName(resumePending)
+	nFence           = stmtName(fence)
+	nNoUndelivered   = stmtName(noUndelivered)
+	nInsertHistory   = stmtName(insertHistory)
+	nDeletePending   = stmtName(deletePending)
+	nInsertPending   = stmtName(insertPending)
+	nInsertActs      = stmtName(insertActivities)
+	nInsertChild     = stmtName(insertChild)
+	nCancelChildren  = stmtName(cancelChildren)
+	nCancelActs      = stmtName(cancelActivities)
+	nAcquireLock     = stmtName(acquireLock)
+	nCompChild       = stmtName(compensateChild)
+	nUpdateRunning   = stmtName(updateRunning)
+	nEndExecution    = stmtName(endExecution)
+	nContinueAsNew   = stmtName(continueAsNew)
+	nCarryPending    = stmtName(carryPending)
+	nCarrySignals    = stmtName(carrySignals)
+	nDropEnded       = stmtName(dropEnded)
+	nCancelChildOf   = stmtName(cancelChildrenOf)
+	nNotifyParent    = stmtName(notifyParent)
+	nWakeForTask     = stmtName(wakeForTask)
+	nFinishTask      = stmtName(finishTask)
+	nResumeExtend    = stmtName(resumeExtend)
+	nResumeWorkflow  = stmtName(resumeWorkflow)
+	nResumePending   = stmtName(resumePending)
+	nClaimWorkflow   = stmtName(claimWorkflow)
+	nInsertExecution = stmtName(insertExecution)
 )
 
 // stmt starts and ends one statement of a fast batch.
@@ -75,15 +77,18 @@ func noTime(int) time.Time { return time.Time{} }
 
 // completeFast is CompleteWorkflowTask on the fast path: the same
 // statements as queueCompletion, encoded by hand.
+//
+// It returns the leases of the eagerly claimed activity tasks, in the order
+// of c.Activities (as CompleteWorkflowTask), filled from the rows directly.
 func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Completion, ending, terminal bool,
 	prevSeq, lastSeq int64,
-) (map[actKey]int64, error) {
+) ([]store.Lease, error) {
 	pc, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer pc.Release()
-	fb := getFastBatch(ctx, pc.Conn())
+	fb := s.getFastBatch(ctx, pc.Conn())
 	defer fb.release()
 
 	fb.stmt(fence, nFence, func() {
@@ -197,31 +202,47 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 	}
 	s.endFast(fb, l, c, ending, lastSeq)
 
-	var claimed map[actKey]int64
-	err = fb.exec(func(i int, rr *pgconn.ResultReader) error {
-		if i != activityAt {
+	leases := c.Leases[:0] // the completion's scratch space (store.Completion)
+	for _, a := range c.Activities {
+		if a.ClaimFor > 0 {
+			leases = append(leases, store.Lease{Owner: l.Owner, Version: 1})
+		}
+	}
+	c.Leases = leases
+	err = fb.exec(func(i int, v [][]byte) error {
+		if i != activityAt || len(v[3]) == 0 { // owner_id empty: not claimed eagerly
 			return nil
 		}
-		for rr.NextRow() {
-			v := rr.Values()
-			id, err := decodeInt(v[0])
-			if err != nil {
-				return err
-			}
-			sched, err := decodeInt(v[1])
-			if err != nil {
-				return err
-			}
-			if len(v[3]) > 0 { // owner_id: claimed eagerly
-				if claimed == nil {
-					claimed = make(map[actKey]int64, len(c.Activities))
-				}
-				claimed[actKey{sched: int32(sched), comp: len(v[2]) == 1 && v[2][0] == 1}] = id // int4 column
-			}
-		}
-		return nil
+		return setEagerLease(c, leases, v)
 	})
-	return claimed, err
+	return leases, err
+}
+
+// setEagerLease sets the id of the lease of the eagerly claimed activity
+// task in row v (id, schedule_id, compensate, owner_id); leases are those of
+// c's eager activities, in order.
+func setEagerLease(c *store.Completion, leases []store.Lease, v [][]byte) error {
+	id, err := decodeInt(v[0])
+	if err != nil {
+		return err
+	}
+	sched, err := decodeInt(v[1])
+	if err != nil {
+		return err
+	}
+	comp := len(v[2]) == 1 && v[2][0] == 1
+	j := 0 // the lease of this task: its rank among the eager activities
+	for _, a := range c.Activities {
+		if a.ClaimFor <= 0 {
+			continue
+		}
+		if a.ScheduleID == int32(sched) && a.Compensate == comp { // int4 column
+			leases[j].ID = id
+			return nil
+		}
+		j++
+	}
+	return fmt.Errorf("%w: claimed activity task %d is not in the completion", errBadValue, sched)
 }
 
 // endFast encodes the closing statements (running, or ended).
@@ -288,7 +309,7 @@ func (s *Store) completeActivityFast(ctx context.Context, l store.Lease, r *stor
 		return nil, err
 	}
 	defer pc.Release()
-	fb := getFastBatch(ctx, pc.Conn())
+	fb := s.getFastBatch(ctx, pc.Conn())
 	defer fb.release()
 	ev := &r.Event
 	fb.stmt(wakeForTask, nWakeForTask, func() { fb.Int(l.ID) })
@@ -308,32 +329,31 @@ func (s *Store) completeActivityFast(ctx context.Context, l store.Lease, r *stor
 		fb.resume(*r.Resume, r.ResumeFor)
 	}
 	var execID int64
-	var task store.WorkflowTask
+	task := r.Into
+	if task == nil {
+		task = new(store.WorkflowTask)
+	}
+	prevID := task.Execution.InstanceID                   // most likely the same execution's
+	*task = store.WorkflowTask{Pending: task.Pending[:0]} // keep its capacity
 	found := false
-	err = fb.exec(func(i int, rr *pgconn.ResultReader) error {
+	err = fb.exec(func(i int, v [][]byte) error {
 		switch i {
 		case 1: // finishTask: the execution id
-			for rr.NextRow() {
-				var err error
-				if execID, err = decodeInt(rr.Values()[0]); err != nil {
-					return err
-				}
+			var err error
+			if execID, err = decodeInt(v[0]); err != nil {
+				return err
 			}
 		case 3: // resumeWorkflow
-			for rr.NextRow() {
-				if err := decodeTask(rr.Values(), &task, r.Resume.Owner); err != nil {
-					return err
-				}
-				found = true
+			if err := decodeTask(v, task, r.Resume.Owner, prevID); err != nil {
+				return err
 			}
+			found = true
 		case 4: // resumePending
-			for rr.NextRow() {
-				p, err := decodePending(rr.Values())
-				if err != nil {
-					return err
-				}
-				task.Pending = append(task.Pending, p)
+			p, err := decodePending(v)
+			if err != nil {
+				return err
 			}
+			task.Pending = append(task.Pending, p)
 		}
 		return nil
 	})
@@ -343,7 +363,7 @@ func (s *Store) completeActivityFast(ctx context.Context, l store.Lease, r *stor
 	if r.Resume == nil || !found || task.Execution.ID != execID {
 		return nil, nil
 	}
-	return &task, nil
+	return task, nil
 }
 
 func (fb *fastBatch) resume(l store.Lease, ttl time.Duration) {
@@ -366,17 +386,40 @@ func (fb *fastBatch) resume(l store.Lease, ttl time.Duration) {
 }
 
 // decodeTask decodes executionColumns + lease_version, last_seq, now().
-func decodeTask(v [][]byte, t *store.WorkflowTask, owner string) error {
+// prevID, when equal to the decoded instance id, is shared rather than
+// copied (a resumed task is most likely of the execution of the last one).
+func decodeTask(v [][]byte, t *store.WorkflowTask, owner, prevID string) error {
 	if len(v) != 17 {
 		return fmt.Errorf("%w: %d task columns", errBadValue, len(v))
 	}
-	e := &t.Execution
+	if err := decodeExecution(v[:14], &t.Execution, prevID); err != nil {
+		return err
+	}
 	var err error
-	ints := [...]*int64{&e.ID, &e.ParentID, &t.Lease.Version, &t.LastSeq}
-	for i, col := range [...]int{0, 6, 14, 15} {
-		if *ints[i], err = decodeInt(v[col]); err != nil {
-			return err
-		}
+	if t.Lease.Version, err = decodeInt(v[14]); err != nil {
+		return err
+	}
+	if t.LastSeq, err = decodeInt(v[15]); err != nil {
+		return err
+	}
+	if t.Now, err = decodeTime(v[16]); err != nil {
+		return err
+	}
+	t.Lease.ID, t.Lease.Owner = t.Execution.ID, owner
+	return nil
+}
+
+// decodeExecution decodes executionColumns (prevID: see decodeTask).
+func decodeExecution(v [][]byte, e *store.Execution, prevID string) error {
+	if len(v) != 14 {
+		return fmt.Errorf("%w: %d execution columns", errBadValue, len(v))
+	}
+	var err error
+	if e.ID, err = decodeInt(v[0]); err != nil {
+		return err
+	}
+	if e.ParentID, err = decodeInt(v[6]); err != nil {
+		return err
 	}
 	version, err := decodeInt(v[3])
 	if err != nil {
@@ -387,21 +430,47 @@ func decodeTask(v [][]byte, t *store.WorkflowTask, owner string) error {
 		return err
 	}
 	e.Version, e.ParentSched = int32(version), int32(sched) // int4 columns
-	e.InstanceID, e.Workflow, e.Queue = string(v[1]), string(v[2]), string(v[4])
-	e.Status = store.Status(v[5])
+	if string(v[1]) == prevID {                             // a comparison with string(v[1]) does not copy it
+		e.InstanceID = prevID
+	} else {
+		e.InstanceID = string(v[1])
+	}
+	e.Workflow, e.Queue = intern(v[2]), intern(v[4])
+	e.Status = store.Status(intern(v[5]))
 	e.Input, e.Output = cloneBytes(v[8]), cloneBytes(v[9])
 	e.Err, e.ErrKinds = string(v[10]), string(v[11])
 	if e.CreatedAt, err = decodeTime(v[12]); err != nil {
 		return err
 	}
-	if e.EndedAt, err = decodeTime(v[13]); err != nil {
-		return err
+	e.EndedAt, err = decodeTime(v[13])
+	return err
+}
+
+// createFast is the insert of CreateExecution on the fast path; ok is
+// false when the instance id is taken (no row).
+func (s *Store) createFast(ctx context.Context, ne *store.NewExecution) (e store.Execution, ok bool, err error) {
+	pc, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return e, false, err
 	}
-	if t.Now, err = decodeTime(v[16]); err != nil {
-		return err
-	}
-	t.Lease.ID, t.Lease.Owner = e.ID, owner
-	return nil
+	defer pc.Release()
+	fb := s.getFastBatch(ctx, pc.Conn())
+	defer fb.release()
+	fb.oneShot = true // ctx is the application's (Workflow.Start), possibly never canceled
+	fb.stmt(insertExecution, nInsertExecution, func() {
+		fb.Str(ne.InstanceID)
+		fb.Str(ne.Workflow)
+		fb.Int(int64(ne.Version))
+		fb.Str(ne.Queue)
+		fb.Int(ne.ParentID)
+		fb.Int(int64(ne.ParentSched))
+		fb.Bytes(ne.Input)
+	})
+	err = fb.exec(func(_ int, v [][]byte) error {
+		ok = true
+		return decodeExecution(v, &e, ne.InstanceID)
+	})
+	return e, ok, err
 }
 
 // decodePending decodes "p.id, p.execution_id, " + event columns.
@@ -431,4 +500,148 @@ func decodePending(v [][]byte) (store.PendingEvent, error) {
 	at, err := decodeTime(v[16])
 	ev.At = at
 	return p, err
+}
+
+// claimFast is ClaimWorkflowTasks on the fast path: claimWorkflow, its
+// pending event arrays decoded by hand (pgx planned a scan per array).
+func (s *Store) claimFast(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.WorkflowTask, error) {
+	pc, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer pc.Release()
+	fb := s.getFastBatch(ctx, pc.Conn())
+	defer fb.release()
+	fb.stmt(claimWorkflow, nClaimWorkflow, func() {
+		fb.Strs(len(queues), func(i int) string { return queues[i] })
+		fb.Str(owner)
+		fb.Int(int64(limit))
+		fb.Int(micros(ttl))
+	})
+	var tasks []store.WorkflowTask
+	err = fb.exec(func(_ int, v [][]byte) error {
+		if len(v) != 17+claimedArrays {
+			return fmt.Errorf("%w: %d claim columns", errBadValue, len(v))
+		}
+		var t store.WorkflowTask
+		if err := decodeTask(v[:17], &t, owner, ""); err != nil {
+			return err
+		}
+		pending, err := fb.decodePendingArrays(v[17:])
+		if err != nil {
+			return err
+		}
+		t.Pending = pending
+		tasks = append(tasks, t)
+		return nil
+	})
+	return tasks, err
+}
+
+// claimedArrays is the number of pending event arrays of a claimed
+// execution (pendingAggs: id, then the 15 event columns).
+const claimedArrays = 16
+
+// decodePendingArrays decodes pendingAggs' arrays: element j of each is a
+// column of event j, laid out as decodePending's row (id, execution id,
+// event columns).
+func (fb *fastBatch) decodePendingArrays(arrs [][]byte) ([]store.PendingEvent, error) {
+	n := -1
+	for k, a := range arrs {
+		elems, err := decodeArray(a, fb.elems[k][:0])
+		if err != nil {
+			return nil, err
+		}
+		fb.elems[k] = elems
+		if n >= 0 && len(elems) != n {
+			return nil, fmt.Errorf("%w: pending arrays of %d and %d elements", errBadValue, n, len(elems))
+		}
+		n = len(elems)
+	}
+	if n <= 0 {
+		return nil, nil
+	}
+	out := make([]store.PendingEvent, n)
+	var row [17][]byte
+	for j := range n {
+		row[0] = fb.elems[0][j] // id; row[1], the execution id, is not read
+		for k := 1; k < claimedArrays; k++ {
+			row[k+1] = fb.elems[k][j]
+		}
+		p, err := decodePending(row[:])
+		if err != nil {
+			return nil, err
+		}
+		out[j] = p
+	}
+	for k := range fb.elems {
+		clear(fb.elems[k]) // do not keep views of the read buffer
+	}
+	return out, nil
+}
+
+// decodeArray appends to dst the elements (nil for NULL) of a binary
+// one-dimensional array: views into b.
+func decodeArray(b []byte, dst [][]byte) ([][]byte, error) {
+	if len(b) < 12 {
+		return dst, fmt.Errorf("%w: array of %d bytes", errBadValue, len(b))
+	}
+	ndim := int32(binary.BigEndian.Uint32(b)) // two's complement
+	b = b[12:]                                // ndim, has-null flag, element type
+	switch ndim {
+	case 0:
+		return dst, nil
+	case 1:
+	default:
+		return dst, fmt.Errorf("%w: array of %d dimensions", errBadValue, ndim)
+	}
+	if len(b) < 8 {
+		return dst, fmt.Errorf("%w: truncated array", errBadValue)
+	}
+	n := int(int32(binary.BigEndian.Uint32(b))) // two's complement
+	b = b[8:]                                   // length, lower bound
+	for range n {
+		if len(b) < 4 {
+			return dst, fmt.Errorf("%w: truncated array", errBadValue)
+		}
+		l := int(int32(binary.BigEndian.Uint32(b))) // two's complement; -1: NULL
+		b = b[4:]
+		if l < 0 {
+			dst = append(dst, nil)
+			continue
+		}
+		if len(b) < l {
+			return dst, fmt.Errorf("%w: truncated array element", errBadValue)
+		}
+		dst = append(dst, b[:l:l])
+		b = b[l:]
+	}
+	return dst, nil
+}
+
+// interned holds the strings of the few values tasks repeat (workflow
+// names, queues, statuses), so decoding a task does not copy them each
+// time. Bounded: past maxInterned strings it stops adding.
+var interned = struct {
+	sync.RWMutex
+	m map[string]string
+}{m: map[string]string{}}
+
+const maxInterned = 4096
+
+// intern returns b as a string, shared with earlier equal ones.
+func intern(b []byte) string {
+	interned.RLock()
+	s, ok := interned.m[string(b)] // a map lookup by string(b) does not copy b
+	interned.RUnlock()
+	if ok {
+		return s
+	}
+	s = string(b)
+	interned.Lock()
+	if len(interned.m) < maxInterned {
+		interned.m[s] = s
+	}
+	interned.Unlock()
+	return s
 }

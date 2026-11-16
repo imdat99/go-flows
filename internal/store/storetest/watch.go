@@ -61,6 +61,10 @@ func testWatch(t *testing.T, h Harness) {
 			}
 		}
 	}
+	// Once listening, the watch wakes both kinds for every queue (work made
+	// ready before it listened got no hint): T8.4.
+	expect("listening", hint{store.WorkflowWork, ""})
+	expect("listening", hint{store.ActivityWork, ""})
 	// Until the watch listens, hints are lost: create executions until one
 	// is hinted.
 	for i := 0; ; i++ {

@@ -318,12 +318,44 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
       - chứng minh nhiều racer thực sự tham gia ở C;
       - một lần A chạy mất 11s (vẫn đạt).
     - **Review:** lần 1 không đạt (B không kiểm tra fencing). Lần 2 không đạt (lập luận sai về heartbeat). Lần 3 đạt.
-- [ ] **T8.2** (bổ sung từ P3) Giảm alloc của vòng eager trên Postgres xuống gần mục tiêu ≤ 80 mỗi lần chạy 10 activity:
+- [x] **T8.2** (bổ sung từ P3) Giảm alloc của vòng eager trên Postgres xuống gần mục tiêu ≤ 80 mỗi lần chạy 10 activity:
     - gộp các câu lệnh trong batch (fence + history + xoá pending; resume);
     - tự ghi Bind/Execute thay cho `pgconn.Batch`, vì pgconn không cho tái dùng batch;
     - theo dõi context kiểu `Interrupt` của saga;
     - tuỳ chọn một commit mỗi activity (tương tự `AsyncStepStart`).
-    - **Chưa làm, để mở:** cần thiết kế lại SQL của store (gộp câu lệnh thành CTE, tự mã hoá wire, claim qua fast path). Phân tích và hướng đi nằm trong `docs/benchmarks.md`. Trong T8.2 chỉ giảm được 13.6% nhờ sửa vòng poll (bên dưới).
+    - **Kết quả:** `BenchmarkActivityRun` từ khoảng 1240 xuống khoảng 105 alloc mỗi workflow (−91%), cùng SQL và cùng số round trip. Đo bằng memprofile ở mỗi bước.
+      - `BenchmarkPublicActivityRun`: khoảng 1330 → 184.
+      - `BenchmarkEagerActivity`: 52 → 6 alloc (9.9 KiB → khoảng 740 B).
+      - `BenchmarkReplay`: 129 → 38.
+      - Thời gian: khoảng 150 ms mỗi workflow khi durable (trước 172 ms), khoảng 60 ms khi async (trước 80 ms).
+    - **Đã làm:**
+      - Fast path tự ghi Bind/Execute/Sync vào buffer có pool và đọc từng message (`ReceiveMessage`), thay cho `pgconn.Batch`.
+      - Context được theo dõi một lần cho mỗi context ở store (`ctxWatch`: cancel request rồi đặt deadline cho kết nối), thay cho watch của pgconn ở mỗi lời gọi. Test `TestFastPathHonorsContext` đỏ khi chưa gửi cancel request.
+      - Claim chạy trên fast path, tự giải mã mảng nhị phân (`decodeArray`, có test).
+      - Task không mang input/output.
+      - Execution mới không load history.
+      - Benchmark có warm up (trước đó tính cả SCRAM handshake của pool).
+      - Activity eager chạy trên goroutine runner được tái dùng.
+      - Heartbeat lưu entry theo giá trị; `tracking` là giá trị, không còn closure.
+      - Executor tái dùng completion; task được resume ghi vào 2 buffer của driver (`ActivityResult.Into`).
+      - Call được cấp theo khối 8; workflow, queue, status được intern.
+      - `CreateExecution` chạy trên fast path; lease trả về trong `Completion.Leases`.
+      - Watcher đánh thức mọi queue một lần khi bắt đầu nghe (sửa race lúc khởi động: việc làm sẵn trước LISTEN không có hint).
+    - **Chưa đạt ≤ 80** (đạt khoảng 105). Phần còn lại:
+      - context huỷ được của mỗi attempt (2 alloc mỗi activity);
+      - scheduler, state và coroutine đầu tiên của mỗi execution;
+      - bản sao payload;
+      - phần của pgx trên kết nối LISTEN và heartbeat.
+      - Bước tiếp theo (chưa làm): context activity nhẹ tạo lười; pool executor.
+    - **Lần chạy chậm thỉnh thoảng gặp** (0.5–1.7 s): trace các lời gọi store cho thấy mọi câu lệnh chậm 50–80 ms trong khi luồng engine bình thường. Đó là I/O (fsync) của máy dev, không phải lỗi engine.
+    - **Perf gate:**
+      - ActivityRun ≤ 140, PublicActivityRun ≤ 240: chừa khoảng 30% vì khi máy bận, trung vị là 123 và có lần chạy tới 148.
+      - EagerActivity ≤ 8 alloc và ≤ 1 KiB; Replay ≤ 42.
+    - **Review lần 1 không đạt:**
+      - Data race: driver đọc completion được tái dùng sau khi đã đưa executor vào cache (tái hiện bằng test bão signal; đã sửa).
+      - Cancel request gửi tuần tự, mỗi cái chặn tới 5 s: nay đặt deadline trước, gửi các cancel request song song, chờ tối đa 1 s.
+      - Context của ứng dụng (`CreateExecution`) giờ được theo dõi riêng cho từng lời gọi, không để lại gì.
+      - Khôi phục `TestTimestampRoundTrip`; lỗi decode không còn làm đóng kết nối; sửa comment về số runner; nới budget.
 - [x] **T8.2** Benchmark đầy đủ so với saga và go-workflows, viết `docs/benchmarks.md`, bật perf gate trong CI.
     - **So sánh** (10 activity no-op, Postgres cùng máy, durable commit):
       - saga: 96 ms, 63 alloc;

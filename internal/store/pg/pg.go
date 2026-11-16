@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -34,9 +35,10 @@ import (
 //   - 2201E (log of zero): undelivered signals or cancel requests are
 //     pending.
 type Store struct {
-	pool *pgxpool.Pool
-	fast bool // hot paths on pgconn (fast.go)
-	hook Hook // nil: no end hook
+	pool    *pgxpool.Pool
+	fast    bool     // hot paths on pgconn (fast.go)
+	hook    Hook     // nil: no end hook
+	watches sync.Map // done channel -> *ctxWatch (fast.go)
 }
 
 // Hook runs inside the transaction that ends or parks an execution
@@ -174,6 +176,11 @@ func retry(ctx context.Context, fn func() error) error {
 const executionColumns = `id, instance_id, workflow, version, queue, status, parent_id, parent_sched,
 	input, output, err, err_kinds, created_at, ended_at`
 
+// taskColumns are executionColumns without input and output (NULL: tasks
+// do not carry them, store.WorkflowTask).
+const taskColumns = `id, instance_id, workflow, version, queue, status, parent_id, parent_sched,
+	NULL::bytea AS input, NULL::bytea AS output, err, err_kinds, created_at, ended_at`
+
 func scanExecution(row pgx.Row, extra ...any) (store.Execution, error) {
 	var e store.Execution
 	var status string
@@ -290,8 +297,17 @@ const typeStarted = "1" // history.ExecutionStarted
 // CreateExecution implements store.Store.
 func (s *Store) CreateExecution(ctx context.Context, ne store.NewExecution) (store.Execution, bool, error) {
 	for range maxRetries {
-		e, err := scanExecution(s.pool.QueryRow(ctx, insertExecution,
-			ne.InstanceID, ne.Workflow, ne.Version, ne.Queue, ne.ParentID, ne.ParentSched, ne.Input))
+		var e store.Execution
+		var err error
+		if s.fast {
+			var created bool
+			if e, created, err = s.createFast(ctx, &ne); err == nil && !created {
+				err = pgx.ErrNoRows
+			}
+		} else {
+			e, err = scanExecution(s.pool.QueryRow(ctx, insertExecution,
+				ne.InstanceID, ne.Workflow, ne.Version, ne.Queue, ne.ParentID, ne.ParentSched, ne.Input))
+		}
 		if err == nil {
 			return e, true, nil
 		}
@@ -350,11 +366,11 @@ var claimWorkflow = `
 			  AND (not_before IS NULL OR not_before <= now())
 			  AND (sticky_until IS NULL OR sticky_until < now() OR sticky_owner = $2)
 			ORDER BY ready_at, id
-			LIMIT $3
+			LIMIT $3::bigint
 			FOR NO KEY UPDATE SKIP LOCKED
 		) x
 		ORDER BY x.ready_at, x.id
-		LIMIT $3
+		LIMIT $3::bigint
 	)
 	, k AS (
 		-- The locks of a running execution do not lapse (store.Completion.Locks).
@@ -369,10 +385,10 @@ var claimWorkflow = `
 	, u AS (
 		UPDATE flows.execution e
 		SET owner_id = $2, lease_version = e.lease_version + 1,
-		    locked_until = now() + $4 * interval '1 microsecond', not_before = NULL
+		    locked_until = now() + $4::bigint * interval '1 microsecond', not_before = NULL
 		WHERE e.id = ANY(ARRAY(SELECT id FROM c)) -- a join may scan the table (generic plans)
 		RETURNING e.id, e.instance_id, e.workflow, e.version, e.queue, e.status, e.parent_id, e.parent_sched,
-		          e.input, e.output, e.err, e.err_kinds, e.created_at, e.ended_at,
+		          NULL::bytea AS input, NULL::bytea AS output, e.err, e.err_kinds, e.created_at, e.ended_at,
 		          e.lease_version, e.last_seq
 	)
 	SELECT u.*, now(), a.*
@@ -401,6 +417,11 @@ func (s *Store) ClaimWorkflowTasks(ctx context.Context, owner string, queues []s
 	var tasks []store.WorkflowTask
 	err := retry(ctx, func() error {
 		tasks = tasks[:0]
+		if s.fast {
+			var err error
+			tasks, err = s.claimFast(ctx, owner, queues, limit, ttl)
+			return err
+		}
 		rows, err := s.pool.Query(ctx, claimWorkflow, queues, owner, limit, micros(ttl))
 		if err != nil {
 			return err
@@ -594,7 +615,7 @@ const (
 		WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''
 		  AND locked_until < now() + ($4::bigint / 2) * interval '1 microsecond'`
 	resumeWorkflow = `
-		SELECT ` + executionColumns + `, lease_version, last_seq, now()
+		SELECT ` + taskColumns + `, lease_version, last_seq, now()
 		FROM flows.execution
 		WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''
 		  AND status IN ('running', 'compensating')`
@@ -1002,10 +1023,12 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 	terminal := ending && c.Status != store.StatusContinued
 	hooked := s.hook != nil && store.Ends(c.Status)
 	var claimed map[actKey]int64
+	var fastLeases []store.Lease
+	fast := s.fast && !hooked
 	err := retry(ctx, func() error {
-		if s.fast && !hooked {
+		if fast {
 			var err error
-			claimed, err = s.completeFast(ctx, l, c, ending, terminal, prevSeq, lastSeq)
+			fastLeases, err = s.completeFast(ctx, l, c, ending, terminal, prevSeq, lastSeq)
 			return err
 		}
 		b := &pgx.Batch{}
@@ -1047,13 +1070,22 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 		}
 		return nil, fmt.Errorf("complete workflow task: %w", err)
 	}
+	if fast {
+		return fastLeases, nil
+	}
+	return eagerLeases(c, l.Owner, claimed), nil
+}
+
+// eagerLeases lists the leases of the eagerly claimed activity tasks, in the
+// order of c.Activities.
+func eagerLeases(c *store.Completion, owner string, claimed map[actKey]int64) []store.Lease {
 	var leases []store.Lease
 	for _, a := range c.Activities {
 		if a.ClaimFor > 0 {
-			leases = append(leases, store.Lease{ID: claimed[actKey{a.ScheduleID, a.Compensate}], Owner: l.Owner, Version: 1})
+			leases = append(leases, store.Lease{ID: claimed[actKey{a.ScheduleID, a.Compensate}], Owner: owner, Version: 1})
 		}
 	}
-	return leases, nil
+	return leases
 }
 
 // completionShape tells readCompletion which statements were queued after

@@ -33,7 +33,7 @@ func TestHeartbeatIgnoresReportsAboutOlderLeases(t *testing.T) {
 	ctx1, untrack1 := h.track(context.Background(), false, v1, time.Now())
 	var ctx2 context.Context
 	st.before = func() {
-		untrack1()
+		untrack1.untrack()
 		ctx2, _ = h.track(context.Background(), false, store.Lease{ID: 5, Owner: "o", Version: 2}, time.Now()) //nolint:fatcontext // created during the renewal on purpose
 	}
 	h.tick(context.Background())

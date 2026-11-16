@@ -81,6 +81,14 @@ func BenchmarkPublicActivityRun(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = e.Stop(ctx) })
+	// Warm up, as internal/worker's BenchmarkActivityRun: the pool's
+	// connections (SCRAM handshakes) and prepared statements.
+	for i := range 3 {
+		if _, err := benchChain.Start(ctx, e, "warm-"+strconv.Itoa(i), benchItem{SKU: "s"}); err != nil {
+			b.Fatal(err)
+		}
+		<-st.ended
+	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := range b.N {

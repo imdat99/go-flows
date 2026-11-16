@@ -119,6 +119,18 @@ type Executor struct {
 	// Counts for MayCompensate: activities scheduled, their outcomes, and
 	// the outcomes recorded with compensation data.
 	activities, outcomes, compensable int
+	// comp is the completion Execute returns, reused by the next one.
+	comp store.Completion
+}
+
+// resetCompletion empties the reused completion, keeping the capacity of
+// the slices every task fills (dropping their references).
+func (e *Executor) resetCompletion() *store.Completion {
+	c := &e.comp
+	clear(c.Activities)
+	consumed, acts, leases := c.Consumed[:0], c.Activities[:0], c.Leases[:0]
+	*c = store.Completion{Consumed: consumed, Activities: acts, Leases: leases}
+	return c
 }
 
 // errBroken wraps the first error for every later call.
@@ -254,6 +266,10 @@ func (e *Executor) applyBatch(batch []history.Event) error {
 // event). The history must have been replayed up to task.LastSeq. Any
 // error, including a task that does not continue the replayed history,
 // makes the executor unusable: the caller evicts it.
+//
+// The completion, and the slices it holds, belong to the executor: the
+// next Execute reuses them (a task's completion is stored before the next
+// task runs), so callers must be done with it by then.
 func (e *Executor) Execute(task *store.WorkflowTask) (c *store.Completion, err error) {
 	if e.broken != nil {
 		return nil, fmt.Errorf("%w: %w", errBroken, e.broken)
@@ -275,7 +291,7 @@ func (e *Executor) Execute(task *store.WorkflowTask) (c *store.Completion, err e
 	}
 	st.replaying = false
 	st.out = st.out[:0]
-	c = &store.Completion{}
+	c = e.resetCompletion()
 	wasFinished := e.finished
 
 	if !e.finished {
@@ -301,7 +317,7 @@ func (e *Executor) Execute(task *store.WorkflowTask) (c *store.Completion, err e
 	for i := range st.out {
 		st.out[i].Seq = e.lastSeq + int64(i) + 1
 	}
-	c.History = append(c.History, st.out...)
+	c.History = st.out // the executor's buffer, reused as the completion is
 	if n := len(st.out); n > 0 {
 		e.lastSeq = st.out[n-1].Seq
 	}

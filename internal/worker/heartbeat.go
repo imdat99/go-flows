@@ -34,7 +34,7 @@ type heartbeat struct {
 	log      *slog.Logger
 
 	mu   sync.Mutex
-	held map[heldKey]*held
+	held map[heldKey]held // by value: tracking a lease allocates no entry
 }
 
 type heldKey struct {
@@ -51,27 +51,44 @@ type held struct {
 func newHeartbeat(st store.Store, owner string, ttl time.Duration, log *slog.Logger) *heartbeat {
 	return &heartbeat{
 		st: st, owner: owner, ttl: ttl, interval: ttl / 3, log: log,
-		held: make(map[heldKey]*held),
+		held: make(map[heldKey]held),
 	}
 }
 
 // track registers a lease taken at claimed (local time just before the
 // claim) and returns a context canceled with ErrLeaseLost when the lease is
-// lost, and the function to untrack it (which also cancels the context).
-func (h *heartbeat) track(ctx context.Context, activity bool, l store.Lease, claimed time.Time) (context.Context, func()) {
+// lost, and the tracking to untrack it with (which also cancels the
+// context).
+func (h *heartbeat) track(ctx context.Context, activity bool, l store.Lease, claimed time.Time) (context.Context, tracking) {
 	tctx, cancel := context.WithCancelCause(ctx)
 	k := heldKey{activity: activity, id: l.ID}
 	h.mu.Lock()
-	h.held[k] = &held{lease: l, cancel: cancel, renewed: claimed}
+	h.held[k] = held{lease: l, cancel: cancel, renewed: claimed}
 	h.mu.Unlock()
-	return tctx, func() {
-		h.mu.Lock()
-		if cur, ok := h.held[k]; ok && cur.lease == l {
-			delete(h.held, k)
-		}
-		h.mu.Unlock()
-		cancel(context.Canceled)
+	return tctx, tracking{h: h, key: k, lease: l, cancel: cancel}
+}
+
+// tracking is a lease tracked by the heartbeat (a value: no closure to
+// allocate per lease). The zero value untracks nothing.
+type tracking struct {
+	h      *heartbeat
+	key    heldKey
+	lease  store.Lease
+	cancel context.CancelCauseFunc
+}
+
+// untrack stops tracking the lease and cancels its context; it can be
+// called more than once.
+func (t tracking) untrack() {
+	if t.h == nil {
+		return
 	}
+	t.h.mu.Lock()
+	if cur, ok := t.h.held[t.key]; ok && cur.lease == t.lease {
+		delete(t.h.held, t.key)
+	}
+	t.h.mu.Unlock()
+	t.cancel(context.Canceled)
 }
 
 // run renews every interval until ctx is done.
@@ -132,6 +149,7 @@ func (h *heartbeat) tick(ctx context.Context) {
 		default:
 			if !e.renewed.After(sent) {
 				e.renewed = sent
+				h.held[k] = e // updating the entry of the key ranged over is allowed
 			}
 		}
 	}
@@ -155,8 +173,10 @@ func (h *heartbeat) expire(now time.Time) {
 // renewed records an extension done by the task itself (a resume).
 func (h *heartbeat) renewedAt(activity bool, id int64, at time.Time) {
 	h.mu.Lock()
-	if e, ok := h.held[heldKey{activity, id}]; ok && e.renewed.Before(at) {
+	k := heldKey{activity, id}
+	if e, ok := h.held[k]; ok && e.renewed.Before(at) {
 		e.renewed = at
+		h.held[k] = e
 	}
 	h.mu.Unlock()
 }

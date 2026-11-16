@@ -222,6 +222,7 @@ func (e *execution) visiblePending(now time.Time) []pending {
 // task builds the workflow task of a claimed or resumed execution.
 func (e *execution) task(now time.Time) store.WorkflowTask {
 	t := store.WorkflowTask{Lease: e.lease, Execution: cloneExecution(e.Execution), Now: now}
+	t.Execution.Input, t.Execution.Output = nil, nil // tasks carry neither (store.WorkflowTask)
 	if n := len(e.history); n > 0 {
 		t.LastSeq = e.history[n-1].Seq
 	}
@@ -1024,6 +1025,8 @@ func (s *Store) Watch(ctx context.Context, wake func(store.WorkKind, string)) er
 	s.nextW++
 	s.watchers[id] = wake
 	s.mu.Unlock()
+	wake(store.WorkflowWork, "") // listening: every queue (store.Watcher)
+	wake(store.ActivityWork, "")
 	<-ctx.Done()
 	s.mu.Lock()
 	delete(s.watchers, id)

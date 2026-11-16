@@ -131,7 +131,7 @@ func TestTimedPollsFindingWorkDoNotBackOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = w.Stop(context.Background()) })
-	for i := range 8 {
+	for i := range 16 {
 		id := "i" + strconv.Itoa(i)
 		at := time.Now()
 		create(t, st, id, "noop", "")
@@ -193,5 +193,54 @@ func TestDueTimesDoNotCauseEmptyClaims(t *testing.T) {
 	// rounds to just before its store time is visible.
 	if n := st.n.Load() - before; n > sleeps+3 {
 		t.Fatalf("%d claims for %d timers", n, sleeps)
+	}
+}
+
+// T8.2 review: the executor reuses its completion; once it is back in the
+// cache another task of the execution (claimed by another poller
+// goroutine) may run it, so the driver must be done with the completion
+// first. Signal storms make that hand-over frequent (run with -race).
+func TestCompletionNotReadAfterCachePut(t *testing.T) {
+	st := mem.New(nil)
+	reg := newRegistry()
+	const signals = 300
+	reg.addWorkflow("storm", func(ctx coro.Context, _ []byte) ([]byte, error) {
+		ch := executor.FromContext(ctx).SignalChannel("s")
+		for range signals {
+			if _, ok := ch.Receive(ctx); !ok {
+				return nil, errors.New("signal channel closed")
+			}
+		}
+		return nil, nil
+	})
+	w, err := worker.New(st, reg, reg, worker.Options{
+		Owner: "w1", Queues: []string{q}, LeaseTTL: 5 * time.Second,
+		PollMax: 20 * time.Millisecond, MaxWorkflowTasks: 16, Eager: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Stop(context.Background()) })
+	var wg sync.WaitGroup
+	for i := range 16 {
+		id := "storm" + strconv.Itoa(i)
+		create(t, st, id, "storm", "")
+		wg.Go(func() {
+			for range signals {
+				if err := st.Signal(context.Background(), id, "s", nil); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	for i := range 16 {
+		if e := waitEnd(t, st, "storm"+strconv.Itoa(i)); e.Status != store.StatusCompleted {
+			t.Fatalf("storm%d: %s %s", i, e.Status, e.Err)
+		}
 	}
 }

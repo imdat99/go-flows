@@ -48,6 +48,15 @@ func BenchmarkActivityRun(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = w.Stop(ctx) })
+	// Warm up (the plan's target is for a warm engine): the pool opens its
+	// connections (a SCRAM handshake costs ~500 allocations), and each
+	// prepares the statements.
+	for i := range 3 {
+		if _, _, err := st.CreateExecution(ctx, store.NewExecution{InstanceID: "warm" + strconv.Itoa(i), Workflow: "chain", Version: 1, Queue: q, Input: []byte("1")}); err != nil {
+			b.Fatal(err)
+		}
+		<-st.ended
+	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := range b.N {

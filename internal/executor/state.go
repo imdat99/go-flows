@@ -62,6 +62,8 @@ type State struct {
 	// ones issued since must all be matched by recorded events by the next
 	// one (checkTaskBoundary).
 	checkedTo int
+	// resultBlock is the rest of the block newResultCall takes from.
+	resultBlock []resultCall
 	// canceling holds the commands canceled since the last TaskStarted
 	// that were committed already: their cancel must be matched by the next
 	// one too (checkTaskBoundary).
@@ -257,7 +259,7 @@ func FromContext(ctx coro.Context) *State {
 }
 
 func newState(e *Executor) *State {
-	st := &State{ex: e, signals: make(map[string]*coro.Channel[[]byte])}
+	st := &State{ex: e, signals: make(map[string]*coro.Channel[[]byte]), calls: make([]call, 0, 16)} // most executions issue a few calls: grow once
 	root, cancel := coro.WithCancelCause(coro.WithValue(e.sched.Root(), stateKey{}, st))
 	st.root, st.cancel = root, func() { cancel(ErrCanceled) }
 	return st
@@ -342,6 +344,18 @@ func (st *State) signal(name string) *coro.Channel[[]byte] {
 // order.
 func (st *State) SignalChannel(name string) *coro.Channel[[]byte] { return st.signal(name) }
 
+// newResultCall returns a zero resultCall from the execution's current
+// block (calls are allocated eight at a time; they live as long as the
+// execution's state).
+func (st *State) newResultCall() *resultCall {
+	if len(st.resultBlock) == 0 {
+		st.resultBlock = make([]resultCall, 8)
+	}
+	c := &st.resultBlock[0]
+	st.resultBlock = st.resultBlock[1:]
+	return c
+}
+
 func (st *State) issue(c call) {
 	st.nextID++
 	c.command().ID = st.nextID
@@ -351,7 +365,8 @@ func (st *State) issue(c call) {
 // ScheduleActivity issues an activity; the future resolves with its result,
 // or with ErrCanceled when ctx is canceled first.
 func (st *State) ScheduleActivity(ctx coro.Context, name, queue string, input []byte) *coro.Future[Result] {
-	c := &resultCall{st: st, cmd: command.Command{Kind: command.Activity, Name: name, Queue: queue, Payload: input, ArgHash: history.HashArgs(input)}}
+	c := st.newResultCall()
+	c.st, c.cmd = st, command.Command{Kind: command.Activity, Name: name, Queue: queue, Payload: input, ArgHash: history.HashArgs(input)}
 	st.issue(c)
 	coro.Watch(ctx, c)
 	return &c.f
@@ -361,10 +376,11 @@ func (st *State) ScheduleActivity(ctx coro.Context, name, queue string, input []
 // outcome, or with ErrCanceled when ctx is canceled first (the child is
 // asked to cancel).
 func (st *State) StartChild(ctx coro.Context, instanceID, workflow string, version int32, queue string, input []byte) *coro.Future[Result] {
-	c := &resultCall{st: st, cmd: command.Command{
+	c := st.newResultCall()
+	c.st, c.cmd = st, command.Command{
 		Kind: command.Child, Name: workflow, Version: version, Ref: instanceID, Queue: queue,
 		Payload: input, ArgHash: history.HashArgs(input),
-	}}
+	}
 	st.issue(c)
 	coro.Watch(ctx, c)
 	return &c.f

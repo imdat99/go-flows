@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"net"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -27,8 +29,11 @@ import (
 //     reported when preparing, into one pooled buffer (arrays included, in
 //     Postgres' binary array format);
 //   - results come back in binary and are decoded by hand;
-//   - a pgconn.Batch (one Sync: one implicit transaction, one round trip)
-//     is reused from a pool.
+//   - the messages (Bind and Execute per statement, one Sync: one implicit
+//     transaction, one round trip) are encoded into a pooled buffer and
+//     written to the connection; results are read message by message;
+//   - the context is watched once per context (a cancel request and a
+//     connection deadline when it ends), not by pgconn per call.
 //
 // The fast path needs prepared statements, so it is used only when the pool
 // runs in QueryExecModeCacheStatement (the default; other modes are how
@@ -92,43 +97,51 @@ type args struct {
 	err  error
 }
 
-// fastBatch builds a pgconn.Batch of prepared statements with binary
-// parameters. Reused through fastBatchPool.
+// fastBatch builds a pipeline of prepared statements with binary
+// parameters, written straight to the connection: Bind and Execute per
+// statement, one Sync (one implicit transaction, one round trip). Its
+// buffers are reused through fastBatchPool (pgconn.Batch could not be:
+// it allocated its message buffer, descriptions and formats per batch).
 type fastBatch struct {
 	conn  *pgx.Conn
-	ctx   context.Context
-	batch pgconn.Batch
-	buf   []byte     // parameter bytes of every statement
-	spans [][2]int32 // offsets of each value in buf, -1 start for NULL
+	ctx   context.Context //nolint:containedctx // the batch's lifetime is one call
+	wbuf  []byte          // the encoded messages
+	bind  pgproto3.Bind   // reused for every statement
+	buf   []byte          // parameter bytes of the current statement
+	spans [][2]int32      // offsets of each value in buf, -1 start for NULL
 	vals  [][]byte
 	fmts  []int16 // all 1 (binary)
 	res   []int16 // result formats: all binary
 	a     args
 	stmts int
+	elems [16][][]byte // decodePendingArrays' element views, reused
+
+	store   *Store // whose context watches (watch) the batch uses
+	oneShot bool   // watch the context for this call only (exec)
 }
 
-var fastBatchPool = sync.Pool{New: func() any {
-	return &fastBatch{res: []int16{1}}
-}}
+var fastBatchPool = sync.Pool{New: func() any { return newFastBatch() }}
+
+func newFastBatch() *fastBatch { return &fastBatch{res: []int16{1}} }
 
 const maxPooledBuf = 64 << 10
 
-func getFastBatch(ctx context.Context, conn *pgx.Conn) *fastBatch {
+func (s *Store) getFastBatch(ctx context.Context, conn *pgx.Conn) *fastBatch {
 	fb, ok := fastBatchPool.Get().(*fastBatch)
 	if !ok { // the pool only holds *fastBatch
-		fb = &fastBatch{res: []int16{1}}
+		fb = newFastBatch()
 	}
-	fb.conn, fb.ctx = conn, ctx
+	fb.conn, fb.ctx, fb.store = conn, ctx, s
 	return fb
 }
 
 func (fb *fastBatch) release() {
-	fb.conn, fb.ctx = nil, nil
-	fb.batch = pgconn.Batch{}
-	if cap(fb.buf) > maxPooledBuf {
+	fb.conn, fb.ctx, fb.store, fb.oneShot = nil, nil, nil, false
+	fb.bind = pgproto3.Bind{}
+	if cap(fb.buf) > maxPooledBuf || cap(fb.wbuf) > maxPooledBuf {
 		return // do not pin a large buffer
 	}
-	fb.buf, fb.spans, fb.a, fb.stmts = fb.buf[:0], fb.spans[:0], args{}, 0
+	fb.wbuf, fb.buf, fb.spans, fb.a, fb.stmts = fb.wbuf[:0], fb.buf[:0], fb.spans[:0], args{}, 0
 	clear(fb.vals)
 	fb.vals = fb.vals[:0]
 	fastBatchPool.Put(fb)
@@ -149,7 +162,15 @@ func (fb *fastBatch) begin(sql string, name string) {
 	fb.spans = fb.spans[:0]
 }
 
-// end appends the statement with its encoded parameters to the batch.
+// The messages without fields, encoded from package values (no allocation).
+var (
+	execMsg pgproto3.Execute
+	syncMsg pgproto3.Sync
+)
+
+// end appends the statement's Bind (with its encoded parameters) and
+// Execute messages to the pipeline. With the cached description, no
+// Describe is needed: results come back in binary, decoded by position.
 func (fb *fastBatch) end(name string) {
 	if fb.a.err != nil {
 		return
@@ -158,8 +179,6 @@ func (fb *fastBatch) end(name string) {
 		fb.a.err = fmt.Errorf("%w: %s: %d parameters encoded, %d expected", errParamType, name, fb.a.n, len(fb.a.oids))
 		return
 	}
-	// Values are views into buf; the batch copies them into its own buffer
-	// when encoding the Bind message, so buf can be reused afterwards.
 	fb.vals = fb.vals[:0]
 	for _, sp := range fb.spans {
 		if sp[0] < 0 {
@@ -171,9 +190,18 @@ func (fb *fastBatch) end(name string) {
 	for len(fb.fmts) < len(fb.vals) {
 		fb.fmts = append(fb.fmts, 1)
 	}
-	// With the cached description, no Describe Portal round of messages
-	// (and no row description to decode) for statements returning rows.
-	fb.batch.ExecStatement(fb.a.sd, fb.vals, fb.fmts[:len(fb.vals)], fb.res)
+	fb.bind = pgproto3.Bind{
+		PreparedStatement: fb.a.sd.Name, ParameterFormatCodes: fb.fmts[:len(fb.vals)],
+		Parameters: fb.vals, ResultFormatCodes: fb.res,
+	}
+	var err error
+	if fb.wbuf, err = fb.bind.Encode(fb.wbuf); err == nil { // copies the values: buf is reused
+		fb.wbuf, err = execMsg.Encode(fb.wbuf)
+	}
+	if err != nil {
+		fb.a.err = err
+		return
+	}
 	fb.buf = fb.buf[:0]
 	fb.stmts++
 }
@@ -406,30 +434,214 @@ func (fb *fastBatch) Times(n int, at func(i int) time.Time) {
 	fb.span(start)
 }
 
-// exec sends the batch and calls read for each statement's result, in
-// order; read gets the result reader of statement i.
-func (fb *fastBatch) exec(read func(i int, rr *pgconn.ResultReader) error) error {
+// exec sends the pipeline and calls row for each result row of statement
+// i, in order (the values are only valid during the call). An error of the
+// server fails the whole pipeline (one implicit transaction).
+//
+// The context is not watched by pgconn (per call, that cost allocations)
+// but by the store, once per context (watch): when it ends (deadline or
+// cancellation), the server is asked to cancel the statement and the
+// connection gets a past deadline. A connection whose exchange was cut
+// short is closed: its protocol state is unknown.
+func (fb *fastBatch) exec(row func(i int, vals [][]byte) error) error {
 	if fb.a.err != nil {
 		return fb.a.err
 	}
-	mrr := fb.conn.PgConn().ExecBatch(fb.ctx, &fb.batch)
-	var readErr error
-	for i := 0; mrr.NextResult(); i++ {
-		rr := mrr.ResultReader()
-		if readErr == nil && read != nil {
-			readErr = read(i, rr)
-		}
-		if _, err := rr.Close(); err != nil && readErr == nil {
-			readErr = err
-		}
+	if err := fb.ctx.Err(); err != nil {
+		return err
 	}
-	if err := mrr.Close(); err != nil {
-		if staleStatement(err) {
-			_ = fb.conn.Close(fb.ctx) // the next connection prepares afresh
+	var err error
+	if fb.wbuf, err = syncMsg.Encode(fb.wbuf); err != nil {
+		return err
+	}
+	pc := fb.conn.PgConn()
+	nc := pc.Conn()
+	var w *ctxWatch
+	var stop func() bool
+	switch {
+	case !fb.oneShot:
+		w = fb.store.watch(fb.ctx)
+	case fb.ctx.Done() != nil:
+		// A context from outside the engine, which may never end: a watch
+		// of this call only, unregistered after it (a shared one would stay).
+		w = &ctxWatch{canceled: make(chan struct{})}
+		stop = context.AfterFunc(fb.ctx, w.fire)
+	}
+	if !w.add(pc) {
+		return fb.ctx.Err() // done meanwhile
+	}
+	err = fb.roundTrip(pc, nc, row) // a context deadline ends it as a cancellation does (watch)
+	fired := stop != nil && !stop() // fire runs or ran: the deadline may be spoiled
+	if w.remove(pc) || fired || err != nil && !isServerError(err) {
+		// Cut short or broken: the exchange may be incomplete. (Completed
+		// before the cancellation fired: the result stands, as with
+		// pgconn, but the connection's deadline is spoiled.)
+		_ = fb.conn.Close(context.WithoutCancel(fb.ctx))
+		if cerr := fb.ctx.Err(); err != nil && cerr != nil {
+			return fmt.Errorf("%w (%w)", cerr, err)
 		}
 		return err
 	}
-	return readErr
+	if staleStatement(err) {
+		_ = fb.conn.Close(fb.ctx) // the next connection prepares afresh
+	}
+	return err
+}
+
+// roundTrip writes the pipeline and reads its results up to ReadyForQuery.
+func (fb *fastBatch) roundTrip(pc *pgconn.PgConn, nc net.Conn, row func(i int, vals [][]byte) error) error {
+	if _, err := nc.Write(fb.wbuf); err != nil {
+		return err
+	}
+	var first error // the first server or row error; reading goes on to the end
+	i := 0
+	for {
+		msg, err := pc.ReceiveMessage(context.Background()) // fb.watch stands in for the watch
+		if err != nil {
+			return err
+		}
+		switch m := msg.(type) {
+		case *pgproto3.DataRow:
+			if first == nil && row != nil {
+				if err := row(i, m.Values); err != nil {
+					first = fmt.Errorf("%w: %w", errDecodeRow, err)
+				}
+			}
+		case *pgproto3.CommandComplete, *pgproto3.EmptyQueryResponse:
+			i++
+		case *pgproto3.ErrorResponse:
+			if first == nil {
+				first = pgconn.ErrorResponseToPgError(m)
+			}
+		case *pgproto3.ReadyForQuery:
+			if first == nil && i != fb.stmts {
+				first = fmt.Errorf("%w: %d results for %d statements", errDecodeRow, i, fb.stmts)
+			}
+			return first
+		case *pgproto3.BindComplete, *pgproto3.NoticeResponse, *pgproto3.ParameterStatus,
+			*pgproto3.NotificationResponse:
+		default:
+			return fmt.Errorf("pg fast path: unexpected %T", msg)
+		}
+	}
+}
+
+// errDecodeRow marks an error found in results read up to ReadyForQuery.
+var errDecodeRow = errors.New("pg fast path: decode result")
+
+// isServerError reports an error after which the exchange completed (the
+// server's, or a result that did not decode): the connection stays usable,
+// as opposed to a network failure.
+func isServerError(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) || errors.Is(err, errDecodeRow)
+}
+
+// ctxWatch cuts short the exchanges running for one context when it is
+// done: each connection in conns gets a past deadline (the exchange
+// returns, the connection is closed) and a cancel request (the server
+// stops its statement: closing the connection alone would let it run on,
+// and commit; pgx's default watch sends none). A Store keeps one
+// per live cancelable context (watch), registered once with
+// context.AfterFunc and reused by all its exchanges: a task makes ~10 of
+// them with one context, and pgconn's watch cost allocations per call.
+type ctxWatch struct {
+	mu    sync.Mutex
+	conns []*pgconn.PgConn
+	done  bool
+	// canceled is closed once the cancel requests were answered, or after
+	// cancelWait: a cut exchange waits for it (remove).
+	canceled chan struct{}
+}
+
+// cancelWait bounds how long the cancel requests delay the return of the
+// exchanges they cut (an unreachable server costs this, once).
+const cancelWait = time.Second
+
+// watch returns the watch of ctx (nil when ctx cannot be canceled).
+func (s *Store) watch(ctx context.Context) *ctxWatch {
+	done := ctx.Done()
+	if done == nil {
+		return nil
+	}
+	if v, ok := s.watches.Load(done); ok {
+		if w, ok := v.(*ctxWatch); ok { // only *ctxWatch is stored
+			return w
+		}
+	}
+	w := &ctxWatch{canceled: make(chan struct{})}
+	if v, loaded := s.watches.LoadOrStore(done, w); loaded {
+		if prev, ok := v.(*ctxWatch); ok {
+			return prev
+		}
+	}
+	context.AfterFunc(ctx, func() {
+		s.watches.Delete(done)
+		w.fire()
+	})
+	return w
+}
+
+// fire cuts the registered exchanges short. They stop waiting at once (they
+// return, their connections are closed), and the server is asked to stop
+// their statements, in parallel, each on its own connection: the exchanges
+// return once the server answered, so a statement canceled in time does
+// not commit after its caller was told it failed; an unreachable server
+// delays them by cancelWait at most, once.
+func (w *ctxWatch) fire() {
+	w.mu.Lock()
+	w.done = true
+	cut := append([]*pgconn.PgConn(nil), w.conns...)
+	w.mu.Unlock()
+	for _, pc := range cut {
+		_ = pc.Conn().SetDeadline(time.Unix(1, 0))
+	}
+	cctx, cancel := context.WithTimeout(context.Background(), cancelWait)
+	var sent sync.WaitGroup
+	for _, pc := range cut {
+		sent.Go(func() { _ = pc.CancelRequest(cctx) })
+	}
+	go func() {
+		sent.Wait()
+		cancel()
+	}()
+	<-cctx.Done() // all answered (cancel), or cancelWait elapsed
+	close(w.canceled)
+}
+
+// add registers an exchange on c; false when the context is done.
+func (w *ctxWatch) add(c *pgconn.PgConn) bool {
+	if w == nil {
+		return true
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.done {
+		return false
+	}
+	w.conns = append(w.conns, c)
+	return true
+}
+
+// remove unregisters the exchange on c, and reports whether it was cut
+// short (its deadline is then in the past).
+func (w *ctxWatch) remove(c *pgconn.PgConn) (cut bool) {
+	if w == nil {
+		return false
+	}
+	w.mu.Lock()
+	for i, x := range w.conns {
+		if x == c {
+			w.conns = append(w.conns[:i], w.conns[i+1:]...)
+			break
+		}
+	}
+	cut = w.done
+	w.mu.Unlock()
+	if cut {
+		<-w.canceled // the server was asked to stop the statement (bounded)
+	}
+	return cut
 }
 
 // staleStatement reports errors after which a prepared statement must not be

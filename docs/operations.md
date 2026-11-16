@@ -54,6 +54,12 @@ defer engine.Stop(shutdownCtx)
   no `ConnConfig.Tracer`. Otherwise the engine falls back to ordinary pgx
   calls: correct, but slower. With a `Hook`, the completions that end an
   execution use an explicit transaction too.
+- **Cancellation.** On the fast path, a call whose context ends is cut short
+  and its connection closed. The server is also sent a cancel request, so the
+  statement stops instead of committing after the caller saw an error. The
+  call returns once that request is answered, after at most 1 s if the
+  database cannot be reached. As with any interrupted call, a commit just
+  before the cancel remains possible; fencing makes the retry safe.
 - **Poolers.** Behind PgBouncer in transaction mode, `LISTEN` receives
   nothing. The engine still works on its own polls (up to `PollMax` of extra
   latency per hand-off). Prefer a direct or session-mode connection for

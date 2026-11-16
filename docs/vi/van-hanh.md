@@ -54,6 +54,12 @@ defer engine.Stop(shutdownCtx)
   pool) và không có `ConnConfig.Tracer`. Nếu không, engine quay về lời gọi
   pgx thông thường: vẫn đúng nhưng chậm hơn. Khi có `Hook`, các completion
   kết thúc execution cũng dùng transaction tường minh.
+- **Huỷ.** Trên đường nhanh, lời gọi có context kết thúc bị cắt ngang và kết
+  nối của nó bị đóng. Server cũng được gửi cancel request, để câu lệnh dừng
+  lại thay vì commit sau khi bên gọi đã nhận lỗi. Lời gọi trả về khi request
+  đó được trả lời, chậm nhất 1 s nếu không tới được database. Như mọi lời gọi
+  bị ngắt, vẫn có thể đã commit ngay trước khi huỷ; fencing giữ cho lần thử
+  lại an toàn.
 - **Pooler.** Đứng sau PgBouncer ở transaction mode thì `LISTEN` không nhận
   được gì. Engine vẫn chạy nhờ poll của chính nó (thêm tới `PollMax` độ trễ
   mỗi lần chuyển giao). Nên cho engine kết nối trực tiếp hoặc qua session

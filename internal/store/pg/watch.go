@@ -28,6 +28,10 @@ func (s *Store) Watch(ctx context.Context, wake func(kind store.WorkKind, queue 
 	if _, err := conn.Exec(ctx, "LISTEN "+workChannel); err != nil {
 		return fmt.Errorf("watch: %w", err)
 	}
+	// Work made ready before LISTEN took effect (a start, a restart after
+	// a failure) notified nobody: poll for it once.
+	wake(store.WorkflowWork, "")
+	wake(store.ActivityWork, "")
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {

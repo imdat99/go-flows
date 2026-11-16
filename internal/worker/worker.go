@@ -175,7 +175,13 @@ type Worker struct {
 
 	wfSlots, actSlots chan struct{} // semaphores
 	wfHint, actHint   chan struct{} // store hints, capacity 1
-	wfDue, actDue     *dueTimes     // local wake-ups for committed delays
+	// eagerJobs hands eager activities to idle runners (runEager);
+	// runnersStop ends the runners once Stop drained the tasks.
+	eagerJobs     chan eagerJob
+	runnersStop   chan struct{}
+	runnersOnce   sync.Once // Stop may run more than once
+	runners       sync.WaitGroup
+	wfDue, actDue *dueTimes // local wake-ups for committed delays
 
 	mu sync.Mutex
 	// pollCancel stops claiming (Stop's first step); taskCancel ends the
@@ -230,14 +236,16 @@ func New(st store.Store, wfs Workflows, acts Activities, opts Options) (*Worker,
 	}
 	return &Worker{
 		st: st, wfs: wfs, acts: acts, opts: opts, log: opts.Logger,
-		cache:    newCache(opts.CacheSize),
-		hb:       newHeartbeat(st, opts.Owner, opts.LeaseTTL, opts.Logger),
-		wfSlots:  make(chan struct{}, opts.MaxWorkflowTasks),
-		actSlots: make(chan struct{}, opts.MaxActivities),
-		wfHint:   make(chan struct{}, 1),
-		actHint:  make(chan struct{}, 1),
-		wfDue:    newDueTimes(dueGrain(opts), 64*opts.PollMax),
-		actDue:   newDueTimes(dueGrain(opts), 64*opts.PollMax),
+		cache:       newCache(opts.CacheSize),
+		hb:          newHeartbeat(st, opts.Owner, opts.LeaseTTL, opts.Logger),
+		wfSlots:     make(chan struct{}, opts.MaxWorkflowTasks),
+		actSlots:    make(chan struct{}, opts.MaxActivities),
+		wfHint:      make(chan struct{}, 1),
+		actHint:     make(chan struct{}, 1),
+		eagerJobs:   make(chan eagerJob),
+		runnersStop: make(chan struct{}),
+		wfDue:       newDueTimes(dueGrain(opts), 64*opts.PollMax),
+		actDue:      newDueTimes(dueGrain(opts), 64*opts.PollMax),
 	}, nil
 }
 
@@ -305,6 +313,8 @@ func (w *Worker) Stop(ctx context.Context) error {
 		<-done // canceled tasks return promptly
 	}
 	taskCancel(errStopping)
+	w.runnersOnce.Do(func() { close(w.runnersStop) }) // the tasks drained: no job is in flight
+	w.runners.Wait()
 	w.beat.Wait()
 	// The cached executions are sticky to this worker: hand them over now,
 	// not when their stickiness expires.
@@ -333,7 +343,7 @@ func (w *Worker) watch(ctx context.Context, wt store.Watcher) {
 	backoff := w.opts.PollMin
 	for ctx.Err() == nil {
 		err := wt.Watch(ctx, func(k store.WorkKind, q string) {
-			if !queues[q] {
+			if q != "" && !queues[q] { // "": every queue
 				return
 			}
 			if k == store.ActivityWork {

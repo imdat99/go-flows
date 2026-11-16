@@ -210,8 +210,8 @@ func safeRun(ctx context.Context, a *Activity, t *store.ActivityTask) (out, comp
 // runPolledActivity runs a task claimed by the activity poller and records
 // its outcome (no workflow resume: the workflow is not held here).
 func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, claimed time.Time) {
-	tctx, untrack := w.hb.track(w.taskCtx(), true, t.Lease, claimed)
-	defer untrack()
+	tctx, tracked := w.hb.track(w.taskCtx(), true, t.Lease, claimed)
+	defer tracked.untrack()
 	a, ok := w.acts.Activity(t.Name, t.Compensate)
 	if !ok {
 		// Another instance may have it: give the task back for a while.
@@ -221,7 +221,7 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 		return
 	}
 	o := w.attempt(tctx, a, t)
-	if _, _, err := w.record(context.WithoutCancel(tctx), t, o, nil); err != nil {
+	if _, _, err := w.record(context.WithoutCancel(tctx), t, o, nil, nil); err != nil {
 		w.log.LogAttrs(ctx, slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
 			slog.String("activity", t.Name), slog.Any("error", err))
 	}
@@ -232,10 +232,10 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 // resume it also resumes that workflow lease and returns the next workflow
 // task. resumeLost reports a resume the store refused: the workflow lease
 // is gone.
-func (w *Worker) record(ctx context.Context, t *store.ActivityTask, o attemptOutcome, resume *store.Lease) (next *store.WorkflowTask, resumeLost bool, err error) {
+func (w *Worker) record(ctx context.Context, t *store.ActivityTask, o attemptOutcome, resume *store.Lease, into *store.WorkflowTask) (next *store.WorkflowTask, resumeLost bool, err error) {
 	delay := 20 * time.Millisecond
 	for attempt := 0; ; attempt++ {
-		next, resumeLost, err = w.recordOnce(ctx, t, o, resume)
+		next, resumeLost, err = w.recordOnce(ctx, t, o, resume, into)
 		if err == nil || attempt == 4 || !sleep(w.taskCtx(), delay) {
 			return next, resumeLost, err
 		}
@@ -243,7 +243,7 @@ func (w *Worker) record(ctx context.Context, t *store.ActivityTask, o attemptOut
 	}
 }
 
-func (w *Worker) recordOnce(ctx context.Context, t *store.ActivityTask, o attemptOutcome, resume *store.Lease) (next *store.WorkflowTask, resumeLost bool, err error) {
+func (w *Worker) recordOnce(ctx context.Context, t *store.ActivityTask, o attemptOutcome, resume *store.Lease, into *store.WorkflowTask) (next *store.WorkflowTask, resumeLost bool, err error) {
 	switch {
 	case o.lost:
 		return nil, false, nil
@@ -260,7 +260,7 @@ func (w *Worker) recordOnce(ctx context.Context, t *store.ActivityTask, o attemp
 	}
 	r := store.ActivityResult{Event: o.ev}
 	if resume != nil {
-		r.Resume, r.ResumeFor = resume, w.opts.LeaseTTL
+		r.Resume, r.ResumeFor, r.Into = resume, w.opts.LeaseTTL, into
 	}
 	next, err = w.st.CompleteActivityTask(ctx, t.Lease, r)
 	if errors.Is(err, store.ErrLeaseLost) {
