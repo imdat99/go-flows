@@ -16,8 +16,11 @@
 // runs in milliseconds, and nothing depends on the wall clock (go-workflows
 // tester issues #494, #481). A workflow that waits for something that can
 // never come fails Run with ErrBlocked, at once. Run reports activities and
-// children the workflow, or any of its descendants, started but did not
-// await (#436).
+// children started but not awaited (#436) by every execution of the
+// workflow's continue-as-new chain and of its descendants' (children that
+// actually started, recursively), whatever ended before Run returns. A
+// descendant still running then (a child detached by continue-as-new) is
+// not checked.
 //
 // Activities run for real unless mocked; their own sleeps take wall time,
 // and virtual time does not move while one runs: an activity takes no
@@ -29,7 +32,9 @@
 // activity from a slow one, and moving time under a running activity would
 // expire its lease and timeouts, making the outcome depend on the wall
 // clock. Mock the activity to return, or model the wait in the workflow (a
-// signal, a child workflow, a timer).
+// signal, a child workflow, a timer). Note that a mock makes the activity's
+// branch win the Select: the branch where the timer wins cannot be tested
+// with flowtest while the other case is an activity.
 //
 // Run, Advance and Settle must be called from the test's goroutine.
 package flowtest
@@ -215,6 +220,7 @@ func (tst *Tester) SignalAfter(d time.Duration, instanceID, name string, payload
 func Run[I, O any](tst *Tester, wf *flows.Workflow[I, O], instanceID string, in I) (O, error) {
 	tst.t.Helper()
 	var zero O
+	before := tst.st.LastID() // what this run creates has a greater id
 	h, err := wf.Start(context.Background(), tst.e, instanceID, in)
 	if err != nil {
 		return zero, err
@@ -226,7 +232,7 @@ func Run[I, O any](tst *Tester, wf *flows.Workflow[I, O], instanceID string, in 
 		return zero, fmt.Errorf("%s: %w", instanceID, err)
 	}
 	if !tst.cfg.allowPending {
-		tst.reportPending(instanceID)
+		tst.reportPending(instanceID, before)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -338,44 +344,53 @@ func (tst *Tester) waitIdle() error {
 	return nil
 }
 
-// reportPending reports, as test errors, the futures that instanceID and
-// its descendants (the children started by the latest execution of each,
-// recursively) ended without awaiting.
-func (tst *Tester) reportPending(instanceID string) {
-	seen := map[string]bool{instanceID: true}
-	for queue := []string{instanceID}; len(queue) > 0; {
-		id := queue[0]
-		queue = queue[1:]
-		pending, children := tst.pendingFutures(id)
+// reportPending reports, as test errors, the futures that the run of
+// instanceID ended without awaiting: in every execution of its
+// continue-as-new chain and of its descendants (the executions created
+// after before whose parent is in the tree: a child that never started,
+// its id in use, is not followed). A descendant still running when the
+// run ends (a child detached by continue-as-new) has not ended: it is not
+// checked.
+func (tst *Tester) reportPending(instanceID string, before int64) {
+	inTree := map[int64]bool{}
+	var order []string               // instances, first execution first
+	pending := map[string][]string{} // by instance
+	// Id order: an execution comes after its parent and after the
+	// earlier executions of its chain.
+	for _, ex := range tst.st.Executions(before) {
+		root := ex.ParentID == 0 && ex.InstanceID == instanceID
+		if !root && !inTree[ex.ParentID] {
+			continue
+		}
+		inTree[ex.ID] = true
+		if _, ok := pending[ex.InstanceID]; !ok {
+			order = append(order, ex.InstanceID)
+			pending[ex.InstanceID] = nil
+		}
+		if !ex.Status.Active() {
+			pending[ex.InstanceID] = append(pending[ex.InstanceID], tst.pendingFutures(ex.ID)...)
+		}
+	}
+	for _, id := range order {
+		p := pending[id]
 		tst.mu.Lock()
 		if d, ok := tst.dropped[id]; ok {
-			pending = append(pending, d)
+			p = append(p, d)
+			delete(tst.dropped, id) // reported once
 		}
 		tst.mu.Unlock()
-		if len(pending) > 0 {
-			tst.t.Errorf("flowtest: %s ended with futures it did not await: %s", id, strings.Join(pending, ", "))
-		}
-		for _, c := range children {
-			if !seen[c] {
-				seen[c] = true
-				queue = append(queue, c)
-			}
+		if len(p) > 0 {
+			tst.t.Errorf("flowtest: %s ended with futures it did not await: %s", id, strings.Join(p, ", "))
 		}
 	}
 }
 
-// pendingFutures lists the activities and children an instance's latest
-// execution started and had no outcome for when it ended, and the instance
-// ids of all the children it started.
-func (tst *Tester) pendingFutures(instanceID string) (pending, children []string) {
-	ctx := context.Background()
-	ex, err := tst.st.GetExecution(ctx, instanceID)
-	if err != nil || ex.Status.Active() {
-		return nil, nil
-	}
-	hist, err := tst.st.LoadHistory(ctx, ex.ID, 0)
+// pendingFutures lists the activities and children an ended execution
+// started and had no outcome for when it ended.
+func (tst *Tester) pendingFutures(executionID int64) []string {
+	hist, err := tst.st.LoadHistory(context.Background(), executionID, 0)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 	open := map[int32]string{}
 	var order []int32
@@ -387,18 +402,18 @@ func (tst *Tester) pendingFutures(instanceID string) (pending, children []string
 		case history.ChildScheduled:
 			open[ev.ScheduleID] = fmt.Sprintf("child %s %q (schedule id %d)", ev.Name, ev.Ref, ev.ScheduleID)
 			order = append(order, ev.ScheduleID)
-			children = append(children, ev.Ref)
 		case history.ActivityCompleted, history.ActivityFailed, history.ChildCompleted, history.ChildFailed:
 			delete(open, ev.ScheduleID)
 		default:
 		}
 	}
+	var pending []string
 	for _, id := range order {
 		if s, ok := open[id]; ok {
 			pending = append(pending, s)
 		}
 	}
-	return pending, children
+	return pending
 }
 
 // EventTypes lists the event types of the history of the latest execution

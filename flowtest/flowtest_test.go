@@ -478,3 +478,58 @@ func TestChildrenPendingFuturesAreReported(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// T10.11 review: every execution of a continue-as-new chain is checked, its
+// own futures and its children's, not only the latest execution.
+var canParent = flows.DefineWorkflow("ft.can-parent", 1, func(c flows.Ctx, in int) (int, error) {
+	if in > 0 {
+		return in, nil
+	}
+	fetch.Start(c, "slow") // never awaited, in a task before the last one
+	if _, err := forgetful.Child(c, "can-forgetful-kid", 0).Get(c); err != nil {
+		return 0, err
+	}
+	return 0, flows.ContinueAsNew(c, 1)
+})
+
+func TestContinueAsNewChainPendingFuturesAreReported(t *testing.T) {
+	inner := &recordingTB{TB: t}
+	tst := flowtest.New(inner)
+	flowtest.OnActivity(tst, fetch, slowFast)
+	if v, err := flowtest.Run(tst, canParent, "can-parent", 0); err != nil || v != 1 {
+		t.Fatalf("%d %v", v, err)
+	}
+	msgs := inner.messages()
+	for _, want := range []string{"can-forgetful-kid ended", "can-parent ended"} {
+		if !strings.Contains(msgs, want) {
+			t.Errorf("%q not reported: %q", want, msgs)
+		}
+	}
+}
+
+// T10.11 review: a child that never started (its id was in use) is not
+// followed: the instance holding the id is not blamed again.
+var reusesAnID = flows.DefineWorkflow("ft.reuses-an-id", 1, func(c flows.Ctx, _ int) (int, error) {
+	if _, err := forgetful.Child(c, "taken", 0).Get(c); !errors.Is(err, flows.ErrInstanceExists) {
+		return 0, fmt.Errorf("want ErrInstanceExists, got %w", err)
+	}
+	return 1, nil
+})
+
+func TestChildThatNeverStartedIsNotFollowed(t *testing.T) {
+	inner := &recordingTB{TB: t}
+	tst := flowtest.New(inner)
+	flowtest.OnActivity(tst, fetch, slowFast)
+	if _, err := flowtest.Run(tst, forgetful, "taken", 0); err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(inner.messages(), "taken ended"); n != 1 {
+		t.Fatalf("taken reported %d times by its own Run: %q", n, inner.messages())
+	}
+	if v, err := flowtest.Run(tst, reusesAnID, "reuses", 0); err != nil || v != 1 {
+		t.Fatalf("%d %v", v, err)
+	}
+	if n := strings.Count(inner.messages(), "taken ended"); n != 1 {
+		t.Fatalf("taken blamed again by another Run: %q", inner.messages())
+	}
+}

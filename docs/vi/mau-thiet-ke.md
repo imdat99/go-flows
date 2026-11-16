@@ -250,10 +250,13 @@ func TestBook(t *testing.T) {
   gian ảo. Workflow ngủ một tuần xong trong vài mili giây.
 - **Workflow bị kẹt.** Workflow không bao giờ kết thúc được thì lỗi
   `flowtest.ErrBlocked`.
-- **Future còn treo.** Activity và child đã bắt đầu mà không được chờ, bởi
-  workflow hoặc bất kỳ hậu duệ nào của nó, sẽ làm test fail, trừ khi bạn
-  truyền `AllowPendingFutures`.
+- **Future còn treo.** Activity và child đã bắt đầu mà không được chờ sẽ
+  làm test fail, trừ khi bạn truyền `AllowPendingFutures`. Mọi execution
+  đều được kiểm tra: các execution trong chuỗi continue-as-new của workflow
+  và của các hậu duệ. Hậu duệ vẫn đang chạy khi `Run` trả về (child tách
+  rời do continue-as-new) thì không được kiểm tra.
 - **Activity không tốn thời gian ảo.** Thời gian ảo đứng yên khi activity
   chạy. Activity chờ lệnh huỷ mà timer của workflow sẽ gửi thì không bao
   giờ thấy timer đó kích hoạt, và `Run` lỗi `flowtest.ErrNeverIdle`: hãy
-  mock activity đó để nó trả về.
+  mock activity đó để nó trả về. Khi đó mock thắng trong `Select`, nên
+  nhánh timer thắng activity không test được bằng `flowtest`.

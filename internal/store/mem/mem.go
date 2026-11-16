@@ -286,6 +286,33 @@ func (s *Store) addPending(e *execution, ev history.Event, visibleAt time.Time) 
 	e.pending = append(e.pending, pending{id: id, ev: ev, visibleAt: visibleAt, seq: id})
 }
 
+// LastID returns the last id the store assigned: what it creates from now
+// on has a greater id (flowtest).
+func (s *Store) LastID() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nextID
+}
+
+// Executions returns the executions kept with an id greater than after,
+// earlier ones of a continue-as-new chain included, in creation (id)
+// order, without their Input and Output (flowtest walks them).
+func (s *Store) Executions(after int64) []store.Execution {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []store.Execution
+	for id, e := range s.executions {
+		if id <= after {
+			continue
+		}
+		x := e.Execution
+		x.Input, x.Output = nil, nil
+		out = append(out, x)
+	}
+	slices.SortFunc(out, func(a, b store.Execution) int { return cmp.Compare(a.ID, b.ID) })
+	return out
+}
+
 // GetExecution implements store.Store.
 func (s *Store) GetExecution(_ context.Context, instanceID string) (store.Execution, error) {
 	s.mu.Lock()
