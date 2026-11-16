@@ -105,3 +105,66 @@ func TestCompensationInMixedDeploy(t *testing.T) {
 		t.Fatalf("compensator ran %d times", n)
 	}
 }
+
+// Review of T10.7: the binary running the final attempt decides whether the
+// activity is compensated. Data kept from an earlier uncertain attempt (run
+// by a binary with the compensator) is not recorded when the final attempt
+// runs where the activity has no compensator: no compensation that no
+// binary can run.
+func TestKeptCompDataNeedsACompensator(t *testing.T) {
+	st := mem.New(nil)
+	wfs := newRegistry()
+	wfs.addWorkflow("saga", func(ctx coro.Context, _ []byte) ([]byte, error) {
+		_, err := executor.FromContext(ctx).ScheduleActivity(ctx, "x", "qa", nil).Get(ctx)
+		if err == nil {
+			err = errors.New("declined")
+		}
+		return nil, err
+	})
+	startOn(t, st, "wf", wfs, compRegistry{wfs, nil}, []string{q}, false)
+
+	// Binary A, with the compensator: its attempt 1 may have had its effect.
+	var ran atomic.Int32
+	withComp := newRegistry()
+	withComp.addActivity("x", &worker.Activity{
+		Retry: worker.RetryPolicy{Attempts: 2, Initial: 3 * time.Second},
+		Run: func(context.Context, *store.ActivityTask) ([]byte, []byte, error) {
+			ran.Add(1)
+			return nil, []byte(`"charge-1"`), worker.ErrUncertain
+		},
+	})
+	comp := &worker.Activity{Run: func(context.Context, *store.ActivityTask) ([]byte, []byte, error) { return nil, nil, nil }}
+	a, err := worker.New(st, withComp, compRegistry{withComp, map[string]*worker.Activity{"x": comp}}, worker.Options{
+		Owner: "a", Queues: []string{"qa"}, LeaseTTL: 5 * time.Second, PollMax: 20 * time.Millisecond, HandBack: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateExecution(context.Background(), store.NewExecution{InstanceID: "kept-nocomp", Workflow: "saga", Version: 1, Queue: q}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for ran.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("attempt 1 did not run")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = a.Stop(ctx) // before its retry is due
+	cancel()
+	if ran.Load() != 1 {
+		t.Skip("binary A ran the retry too: machine too slow for this test")
+	}
+
+	// Binary B knows x without a compensator: its final attempt fails.
+	noComp := newRegistry()
+	noComp.addActivity("x", &worker.Activity{Run: func(context.Context, *store.ActivityTask) ([]byte, []byte, error) {
+		return nil, nil, errors.New("declined")
+	}})
+	startOn(t, st, "b", noComp, compRegistry{noComp, nil}, []string{"qa"}, false)
+	waitStatus(t, st, "kept-nocomp", store.StatusFailed)
+}

@@ -133,17 +133,24 @@ func (w *Worker) finalComp(a *Activity, t *store.ActivityTask, ev *history.Event
 	if ev.Type != history.ActivityCompleted && !ev.Uncertain {
 		return ev.CompData // a certain failure is not compensated
 	}
-	if len(t.CompData) > 0 && a.noComp(ev.CompData) {
+	if !a.noComp(ev.CompData) {
+		return ev.CompData
+	}
+	kept := len(t.CompData) > 0
+	if !kept && (!ev.Uncertain || len(ev.CompData) > 0) {
+		return ev.CompData
+	}
+	// Whether it is compensated is decided here, where it ran: without a
+	// compensator in this binary, no data (no compensation nobody runs).
+	if _, ok := w.acts.Activity(t.Name, true); !ok {
+		return ev.CompData
+	}
+	if kept {
 		// No data of its own: an earlier attempt that may have had its
 		// effect returned some (T10.7), the most recent is kept.
 		return t.CompData
 	}
-	if ev.Uncertain && len(ev.CompData) == 0 {
-		if _, ok := w.acts.Activity(t.Name, true); ok {
-			return nullData
-		}
-	}
-	return ev.CompData
+	return nullData
 }
 
 // attemptOnce runs the activity under runCtx (derived from ctx, possibly by
@@ -158,7 +165,8 @@ func (w *Worker) attemptOnce(ctx, runCtx context.Context, a *Activity, t *store.
 	if t.CancelRequested {
 		// Canceled by the workflow before this attempt: do not run it. An
 		// earlier attempt (a retry is pending) may have had an effect; its
-		// compensator gets the zero value. Before any attempt, certain.
+		// compensator gets the kept data of such an attempt (the zero value
+		// if none). Before any attempt, certain.
 		return attemptOutcome{err: ErrActivityCanceled, ev: history.Event{
 			Type: history.ActivityFailed, Err: ErrActivityCanceled.Error(), ErrKinds: w.opts.Errors.Kinds(ErrActivityCanceled),
 			Permanent: true, Uncertain: t.Uncertain && !t.Compensate,

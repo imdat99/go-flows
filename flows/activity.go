@@ -99,6 +99,14 @@ type Activity[I, O, C any] struct {
 // compensate may be nil: then the compensation data (C) is not stored. With
 // a compensator, the data returned with the output (or with a failure, for
 // an attempt that may have had its effect) is stored and given to it.
+//
+// The compensator gets the data of a single attempt: the last one that may
+// have had its effect and returned data. Returning the zero value of C
+// means "no data": the data of an earlier such attempt is kept (so a C
+// whose zero value is meaningful cannot override it). Effects of several
+// attempts are not undone one by one: key them by the Key, which every
+// attempt shares. An attempt whose lease is lost mid-way (its holder died
+// or was cut off) never records its data.
 // Define activities at package level, in every binary that runs them.
 func DefineActivity[I, O, C any](name string, invoke InvokeFunc[I, O, C], compensate CompensateFunc[C], opts ...ActivityOption) *Activity[I, O, C] {
 	cfg := activityConfig{retry: DefaultRetry, compRetry: DefaultRetry, queue: DefaultQueue}
@@ -122,8 +130,7 @@ func (a *Activity[I, O, C]) invoker(invoke InvokeFunc[I, O, C], withComp bool) *
 	if withComp {
 		// Returning the zero value is returning no data: the data of an
 		// earlier attempt that may have had its effect is kept.
-		var z C
-		zero, _ = comp.encode(z) // nil if it cannot be encoded: only empty data is none
+		zero = zeroEncoding(comp)
 	}
 	return &worker.Activity{
 		Retry: a.cfg.retry, Timeout: a.cfg.timeout, ZeroComp: zero,
@@ -144,7 +151,8 @@ func (a *Activity[I, O, C]) invoker(invoke InvokeFunc[I, O, C], withComp bool) *
 						return nil, nil, err // the activity's own error tells more
 					}
 					// It took effect, but cannot be undone with its data: an
-					// uncertain failure (the compensator gets the zero value).
+					// uncertain failure (the compensator gets the data kept from
+					// an earlier attempt, or the zero value).
 					return nil, nil, Permanent(fmt.Errorf("%w: encode compensation data of %s: %w", worker.ErrUncertain, name, cerr))
 				}
 			}
@@ -160,6 +168,23 @@ func (a *Activity[I, O, C]) invoker(invoke InvokeFunc[I, O, C], withComp bool) *
 			return ob, cb, nil
 		},
 	}
+}
+
+// zeroEncoding is the encoding of the zero C, or nil if it cannot be
+// encoded (an error or a panic in a MarshalJSON): then only empty data is
+// "no data".
+func zeroEncoding[C any](comp codec[C]) (b []byte) {
+	defer func() {
+		if recover() != nil {
+			b = nil
+		}
+	}()
+	var z C
+	b, err := comp.encode(z)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 // compensator runs compensate for a compensation task.
