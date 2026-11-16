@@ -533,3 +533,30 @@ func TestChildThatNeverStartedIsNotFollowed(t *testing.T) {
 		t.Fatalf("taken blamed again by another Run: %q", inner.messages())
 	}
 }
+
+// T10.11 review 2: a root started before Run (Start is idempotent) is
+// checked, its earlier executions and its children too.
+func TestRootStartedBeforeRunIsChecked(t *testing.T) {
+	inner := &recordingTB{TB: t}
+	tst := flowtest.New(inner)
+	flowtest.OnActivity(tst, fetch, slowFast)
+	if _, err := forgetful.Start(context.Background(), tst.Engine(), "pre", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := canParent.Start(context.Background(), tst.Engine(), "pre-chain", 0); err != nil {
+		t.Fatal(err)
+	}
+	tst.Advance(0) // both run (the chain continues as new) before Run
+	if v, err := flowtest.Run(tst, forgetful, "pre", 0); err != nil || v != 1 {
+		t.Fatalf("%d %v", v, err)
+	}
+	if v, err := flowtest.Run(tst, canParent, "pre-chain", 0); err != nil || v != 1 {
+		t.Fatalf("%d %v", v, err)
+	}
+	msgs := inner.messages()
+	for _, want := range []string{"pre ended", "pre-chain ended", "can-forgetful-kid ended"} {
+		if !strings.Contains(msgs, want) {
+			t.Errorf("%q not reported: %q", want, msgs)
+		}
+	}
+}

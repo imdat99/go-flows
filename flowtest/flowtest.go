@@ -16,11 +16,11 @@
 // runs in milliseconds, and nothing depends on the wall clock (go-workflows
 // tester issues #494, #481). A workflow that waits for something that can
 // never come fails Run with ErrBlocked, at once. Run reports activities and
-// children started but not awaited (#436) by every execution of the
-// workflow's continue-as-new chain and of its descendants' (children that
-// actually started, recursively), whatever ended before Run returns. A
-// descendant still running then (a child detached by continue-as-new) is
-// not checked.
+// children started but not awaited (#436) by every ended execution of the
+// workflow's current continue-as-new chain (even one started before Run)
+// and of its descendants' (children that actually started, recursively).
+// A descendant still running when Run returns (a child detached by
+// continue-as-new) is not checked, then or later.
 //
 // Activities run for real unless mocked; their own sleeps take wall time,
 // and virtual time does not move while one runs: an activity takes no
@@ -53,6 +53,7 @@ import (
 	flows "github.com/imdat99/go-flows/flows"
 	"github.com/imdat99/go-flows/internal/bridge"
 	"github.com/imdat99/go-flows/internal/history"
+	"github.com/imdat99/go-flows/internal/store"
 	"github.com/imdat99/go-flows/internal/store/mem"
 	"github.com/imdat99/go-flows/internal/worker"
 )
@@ -220,7 +221,6 @@ func (tst *Tester) SignalAfter(d time.Duration, instanceID, name string, payload
 func Run[I, O any](tst *Tester, wf *flows.Workflow[I, O], instanceID string, in I) (O, error) {
 	tst.t.Helper()
 	var zero O
-	before := tst.st.LastID() // what this run creates has a greater id
 	h, err := wf.Start(context.Background(), tst.e, instanceID, in)
 	if err != nil {
 		return zero, err
@@ -232,8 +232,14 @@ func Run[I, O any](tst *Tester, wf *flows.Workflow[I, O], instanceID string, in 
 		return zero, fmt.Errorf("%s: %w", instanceID, err)
 	}
 	if !tst.cfg.allowPending {
-		tst.reportPending(instanceID, before)
+		tst.reportPending(instanceID)
 	}
+	// What was dropped outside the tree (a descendant ending after an
+	// earlier Run returned, a workflow started without Run) is never
+	// reported: do not keep it.
+	tst.mu.Lock()
+	tst.dropped = nil
+	tst.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return h.Wait(ctx)
@@ -345,21 +351,38 @@ func (tst *Tester) waitIdle() error {
 }
 
 // reportPending reports, as test errors, the futures that the run of
-// instanceID ended without awaiting: in every execution of its
-// continue-as-new chain and of its descendants (the executions created
-// after before whose parent is in the tree: a child that never started,
-// its id in use, is not followed). A descendant still running when the
-// run ends (a child detached by continue-as-new) has not ended: it is not
-// checked.
-func (tst *Tester) reportPending(instanceID string, before int64) {
+// instanceID ended without awaiting: in every execution of its current
+// continue-as-new chain (started before Run or by it) and of its
+// descendants (the executions whose parent is in the tree: a child that
+// never started, its id in use, is not followed). A descendant still
+// running when the run ends (a child detached by continue-as-new) has not
+// ended: it is not checked.
+func (tst *Tester) reportPending(instanceID string) {
+	all := tst.st.Executions()
+	// The chain: the root's latest execution and the continued ones right
+	// before it (an earlier chain ended otherwise).
+	var chain []store.Execution
+	for _, ex := range all {
+		if ex.ParentID == 0 && ex.InstanceID == instanceID {
+			chain = append(chain, ex)
+		}
+	}
+	if len(chain) == 0 {
+		return
+	}
+	i := len(chain) - 1
+	for i > 0 && chain[i-1].Status == store.StatusContinued {
+		i--
+	}
+	first := chain[i].ID
 	inTree := map[int64]bool{}
 	var order []string               // instances, first execution first
 	pending := map[string][]string{} // by instance
 	// Id order: an execution comes after its parent and after the
 	// earlier executions of its chain.
-	for _, ex := range tst.st.Executions(before) {
+	for _, ex := range all {
 		root := ex.ParentID == 0 && ex.InstanceID == instanceID
-		if !root && !inTree[ex.ParentID] {
+		if ex.ID < first || !root && !inTree[ex.ParentID] {
 			continue
 		}
 		inTree[ex.ID] = true
