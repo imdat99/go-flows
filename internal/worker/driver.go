@@ -64,7 +64,14 @@ type driver struct {
 	// With a tracer: the current task's span context (children started by
 	// the task are its children) and the ends of the children's starts.
 	spanCtx   context.Context
-	childEnds []func(error)
+	childEnds []childEnd
+}
+
+// childEnd is the end of the traced start of a child (its index in
+// Completion.Children) or of the continue-as-new (child -1).
+type childEnd struct {
+	end   func(bool, error)
+	child int
 }
 
 // errHandedBack reports a task given back to the store for another
@@ -262,28 +269,37 @@ func (d *driver) startTask(task *store.WorkflowTask) (sctx context.Context, end 
 	return sctx, end
 }
 
-// startChildren starts c's children under the tracer: each gets its trace
-// context from the task's span (Tracer.StartChild).
+// startChildren starts c's children and its continue-as-new under the
+// tracer: each gets its trace context from the task's span
+// (Tracer.StartFrom).
 func (d *driver) startChildren(task *store.WorkflowTask, c *store.Completion) {
 	w := d.w
 	ctx := d.spanCtx
 	if ctx == nil {
 		ctx = d.ctx
 	}
-	for i := range c.Children {
-		var end func(error)
-		w.observe(func() { end = w.opts.Tracer.StartChild(ctx, &task.Execution, &c.Children[i]) })
+	start := func(ne *store.NewExecution, child int) {
+		var end func(bool, error)
+		w.observe(func() { end = w.opts.Tracer.StartFrom(ctx, &task.Execution, ne, child < 0) })
 		if end != nil {
-			d.childEnds = append(d.childEnds, end)
+			d.childEnds = append(d.childEnds, childEnd{end, child})
 		}
+	}
+	for i := range c.Children {
+		start(&c.Children[i], i)
+	}
+	if c.ContinueAsNew != nil {
+		start(c.ContinueAsNew, -1)
 	}
 }
 
-// endChildren ends the children's starts with the completion's outcome.
-func (d *driver) endChildren(err error) {
-	for i, end := range d.childEnds {
-		d.w.observe(func() { end(err) })
-		d.childEnds[i] = nil
+// endChildren ends the starts with the completion's outcome (a child whose
+// id was in use created nothing: Taken).
+func (d *driver) endChildren(c *store.Completion, err error) {
+	for i, ce := range d.childEnds {
+		created := err == nil && (ce.child < 0 || !c.Children[ce.child].Taken)
+		d.w.observe(func() { ce.end(created, err) })
+		d.childEnds[i] = childEnd{}
 	}
 	d.childEnds = d.childEnds[:0]
 }
@@ -322,7 +338,7 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		c.StickyFor = w.opts.StickyFor
 	}
 	nextTimer := d.stickyTimer(c)
-	if w.opts.Tracer != nil && len(c.Children) > 0 {
+	if w.opts.Tracer != nil && (len(c.Children) > 0 || c.ContinueAsNew != nil) {
 		d.startChildren(task, c)
 	}
 	sent := time.Now()
@@ -332,7 +348,7 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 	// cancels it).
 	leases, err := w.st.CompleteWorkflowTask(w.taskCtx(), d.lease, c)
 	if len(d.childEnds) > 0 {
-		d.endChildren(err)
+		d.endChildren(c, err)
 	}
 	if err != nil {
 		c.Resume = nil // a resume buffer: not c's to keep

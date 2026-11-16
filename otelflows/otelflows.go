@@ -13,13 +13,28 @@
 // Traces follow executions. Workflow.Start emits a short span
 // "flows.start <workflow>", a child of the span in the caller's context (a
 // new root without one); its span context (trace id, span id, flags: 26
-// bytes, the trace state is not kept) is stored with the execution and
-// comes back with every claim, so every workflow task and activity attempt
-// of the execution, in any process and however long after, is a child of
-// that start span. A child workflow's start span is a child of the task
-// that started it; continue-as-new keeps the trace. The sampling decision
-// is the one taken at the start (the flags stored): a ParentBased sampler
-// keeps or drops a whole execution with it.
+// bytes) is stored with the execution and comes back with every claim, so
+// every workflow task and activity attempt of the execution, in any process
+// and however long after, is a child of that start span. A child
+// workflow's start span is a child of the task that started it. The
+// sampling decision is the one taken at the start (the flags stored): a
+// ParentBased sampler keeps or drops a whole execution with it.
+//
+// The trace state is not kept: vendor entries, and OpenTelemetry's
+// consistent-probability threshold (ot=th), are lost after the start
+// span. Samplers that rely on them see a remote parent without them.
+//
+// A trace lasts as long as its execution: an execution that runs for days
+// (timers, signals) makes a trace that long, which some backends cap or
+// tail samplers time out on. Continue-as-new starts a new trace: its start
+// span is a new root (flows.continued), linked to the start span of the
+// execution it continues, so a workflow looping through continue-as-new
+// makes one bounded trace per execution.
+//
+// A start that creates nothing (the instance id was in use) ends with
+// flows.outcome "existing": a second Workflow.Start is not an error (no
+// trace is stored; the execution keeps its own), a child whose id is taken
+// is (it fails with ErrInstanceExists).
 //
 // An attempt or task whose lease was lost (another engine runs it again)
 // ends with an error status and flows.outcome "lease_lost"; the attempt
@@ -46,6 +61,7 @@ const (
 	AttrInstanceID   = attribute.Key("flows.instance_id")
 	AttrExecutionID  = attribute.Key("flows.execution_id")
 	AttrParent       = attribute.Key("flows.parent_instance_id")
+	AttrContinued    = attribute.Key("flows.continued")
 	AttrWorkflow     = attribute.Key("flows.workflow")
 	AttrVersion      = attribute.Key("flows.workflow_version")
 	AttrActivity     = attribute.Key("flows.activity")
@@ -66,17 +82,31 @@ func NewTracer(tp trace.TracerProvider) flows.Tracer {
 
 type tracer struct{ t trace.Tracer }
 
-func (t tracer) StartWorkflow(ctx context.Context, w flows.StartInfo) ([]byte, func(error)) {
+func (t tracer) StartWorkflow(ctx context.Context, w flows.StartInfo) ([]byte, func(bool, error)) {
 	attrs := []attribute.KeyValue{
 		AttrInstanceID.String(w.InstanceID), AttrWorkflow.String(w.Workflow), AttrVersion.Int(w.Version),
 	}
 	if w.Parent != "" {
 		attrs = append(attrs, AttrParent.String(w.Parent))
 	}
-	_, span := t.t.Start(ctx, "flows.start "+w.Workflow, trace.WithAttributes(attrs...))
-	return encode(span.SpanContext()), func(err error) {
-		if err != nil {
+	opts := []trace.SpanStartOption{trace.WithAttributes(attrs...)}
+	if w.Continued {
+		// A new trace per execution, linked to the one it continues.
+		opts = append(opts, trace.WithNewRoot(), trace.WithAttributes(AttrContinued.Bool(true)))
+		if prev := decode(w.Previous); prev.IsValid() {
+			opts = append(opts, trace.WithLinks(trace.Link{SpanContext: prev}))
+		}
+	}
+	_, span := t.t.Start(ctx, "flows.start "+w.Workflow, opts...)
+	return encode(span.SpanContext()), func(created bool, err error) {
+		switch {
+		case err != nil:
 			fail(span, err)
+		case !created:
+			span.SetAttributes(AttrOutcome.String("existing"))
+			if w.Parent != "" { // the child fails with ErrInstanceExists
+				span.SetStatus(codes.Error, "child instance id already in use")
+			}
 		}
 		span.End()
 	}

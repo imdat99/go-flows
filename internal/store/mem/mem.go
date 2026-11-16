@@ -695,8 +695,10 @@ func (s *Store) createActivities(e *execution, owner string, acts []store.NewAct
 }
 
 func (s *Store) createChildren(e *execution, children []store.NewExecution, now time.Time) {
-	for _, ch := range children {
-		if _, used := s.latest[ch.InstanceID]; used {
+	for i, ch := range children {
+		_, used := s.latest[ch.InstanceID]
+		children[i].Taken = used
+		if used {
 			s.addPending(e, history.Event{
 				Type: history.ChildFailed, ScheduleID: ch.ParentSched, Ref: ch.InstanceID,
 				Err: "child instance id already in use", ErrKinds: store.KindInstanceExists, Permanent: true,
@@ -734,7 +736,6 @@ func (s *Store) end(e *execution, c *store.Completion, now time.Time) {
 	if c.ContinueAsNew != nil {
 		next := *c.ContinueAsNew
 		next.InstanceID, next.ParentID, next.ParentSched = e.InstanceID, e.ParentID, e.ParentSched
-		next.Trace = e.Trace // the trace goes on (create copies it)
 		n := s.create(next, now)
 		for _, ev := range c.Carry {
 			s.addPending(n, history.Event{Type: ev.Type, Name: ev.Name, Payload: clone(ev.Payload)}, now)

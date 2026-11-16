@@ -137,9 +137,11 @@ type Tracer interface {
 	// completion refused, a park's reason). The returned context is the
 	// task's (StartChild).
 	StartTask(ctx context.Context, e *store.Execution) (context.Context, func(status store.Status, err error))
-	// StartChild starts child ne of parent under ctx (the context of the
-	// task starting it) and sets ne.Trace; end follows its storing.
-	StartChild(ctx context.Context, parent *store.Execution, ne *store.NewExecution) func(err error)
+	// StartFrom starts ne, a child of from or (continued) its
+	// continue-as-new, under ctx (the context of the task starting it) and
+	// sets ne.Trace; end follows its storing (created: false when the
+	// child's id was in use).
+	StartFrom(ctx context.Context, from *store.Execution, ne *store.NewExecution, continued bool) func(created bool, err error)
 }
 
 // Observer receives measurements (see Options.Observer).

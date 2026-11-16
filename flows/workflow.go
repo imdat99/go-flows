@@ -106,8 +106,8 @@ func (w *Workflow[I, O]) Start(ctx context.Context, e *Engine, instanceID string
 	}
 	ne := store.NewExecution{InstanceID: instanceID, Workflow: w.name, Version: w.version, Queue: w.queue, Input: b}
 	end := e.startTraced(ctx, &ne)
-	_, _, err = e.st.CreateExecution(ctx, ne)
-	end(err)
+	_, created, err := e.st.CreateExecution(ctx, ne)
+	end(created, err)
 	if err != nil {
 		return nil, err
 	}

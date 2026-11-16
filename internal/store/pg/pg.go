@@ -1091,7 +1091,8 @@ const insertChild = `
 	)
 	INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, ref, err, err_kinds, permanent)
 	SELECT $5, now(), ` + typeChildFailed + `, $6, $1, 'child instance id already in use', '` + store.KindInstanceExists + `', true
-	WHERE NOT EXISTS (SELECT 1 FROM ins)`
+	WHERE NOT EXISTS (SELECT 1 FROM ins)
+	RETURNING schedule_id` // a row only when the id was taken (store.NewExecution.Taken)
 
 const cancelChildren = `
 	WITH t AS (
@@ -1163,10 +1164,10 @@ const (
 		WHERE id = $1`
 	continueAsNew = `
 		WITH old AS (
-			SELECT instance_id, parent_id, parent_sched, trace FROM flows.execution WHERE id = $1
+			SELECT instance_id, parent_id, parent_sched FROM flows.execution WHERE id = $1
 		), ins AS (
 			INSERT INTO flows.execution (instance_id, workflow, version, queue, status, parent_id, parent_sched, input, ready_at, trace)
-			SELECT old.instance_id, $2, $3, $4, 'running', old.parent_id, old.parent_sched, $5, now(), old.trace FROM old
+			SELECT old.instance_id, $2, $3, $4, 'running', old.parent_id, old.parent_sched, $5, now(), $6 FROM old
 			RETURNING id
 		)
 		INSERT INTO flows.pending_event (execution_id, visible_at, type, name, version, queue, payload)
@@ -1328,7 +1329,7 @@ func (s *Store) completeWithPgx(ctx context.Context, l store.Lease, c *store.Com
 		br := sb.SendBatch(ctx, b)
 		defer br.Close()
 		var err error
-		if claimed, err = readCompletion(br, sh); err != nil {
+		if claimed, err = readCompletion(br, sh, c.Children); err != nil {
 			return err
 		}
 		if info != nil {
@@ -1380,6 +1381,7 @@ type completionShape struct {
 	parentFirst bool // lockParent queued before the fence
 	statements  int  // queued statements after the fence
 	activityAt  int  // index of the activity insert among them, -1 if none
+	childAt     int  // index of the first child insert, then one per child
 }
 
 // queueCompletion queues the statements of c after the fence, counting
@@ -1421,6 +1423,7 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		sh.activityAt = sh.statements
 		queue(insertActivities, l.ID, scheds, comps, names, queues, inputs, claims, l.Owner, uncertain)
 	}
+	sh.childAt = sh.statements
 	for _, ch := range c.Children {
 		queue(insertChild, ch.InstanceID, ch.Workflow, ch.Version, ch.Queue, l.ID, ch.ParentSched, ch.Input, ch.Trace)
 	}
@@ -1444,7 +1447,7 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 	queue(endExecution, l.ID, lastSeq, string(c.Status), c.Output, c.Err, c.ErrKinds)
 	if c.ContinueAsNew != nil {
 		n := c.ContinueAsNew
-		queue(continueAsNew, l.ID, n.Workflow, n.Version, n.Queue, n.Input)
+		queue(continueAsNew, l.ID, n.Workflow, n.Version, n.Queue, n.Input, n.Trace)
 		if len(c.Carry) > 0 {
 			types := make([]int16, len(c.Carry))
 			names, payloads := make([]string, len(c.Carry)), make([][]byte, len(c.Carry))
@@ -1477,7 +1480,8 @@ type actKey struct {
 
 // readCompletion reads the batch results: the fence, then each queued
 // statement. It returns the ids of the eagerly claimed activity tasks.
-func readCompletion(br pgx.BatchResults, sh completionShape) (map[actKey]int64, error) {
+// A child insert returns a row when its id was taken: children[k].Taken.
+func readCompletion(br pgx.BatchResults, sh completionShape, children []store.NewExecution) (map[actKey]int64, error) {
 	if sh.parentFirst {
 		if _, err := br.Exec(); err != nil {
 			return nil, err
@@ -1489,6 +1493,18 @@ func readCompletion(br pgx.BatchResults, sh completionShape) (map[actKey]int64, 
 	}
 	var claimed map[actKey]int64
 	for i := range sh.statements {
+		if k := i - sh.childAt; k >= 0 && k < len(children) {
+			rows, err := br.Query()
+			if err != nil {
+				return nil, err
+			}
+			children[k].Taken = rows.Next()
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		if i != sh.activityAt {
 			if _, err := br.Exec(); err != nil {
 				return nil, err

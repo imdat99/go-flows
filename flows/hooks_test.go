@@ -222,11 +222,11 @@ func (f *fakeTracer) StartWorkflowTask(ctx context.Context, w WorkflowTaskInfo) 
 	}
 }
 
-func (f *fakeTracer) StartWorkflow(context.Context, StartInfo) ([]byte, func(error)) {
+func (f *fakeTracer) StartWorkflow(context.Context, StartInfo) ([]byte, func(bool, error)) {
 	if f.boom {
 		panic("tracer bug")
 	}
-	return []byte("t"), func(error) {
+	return []byte("t"), func(bool, error) {
 		if f.boom {
 			panic("tracer bug")
 		}
@@ -332,7 +332,7 @@ func (b *balanceTracer) StartWorkflowTask(ctx context.Context, w WorkflowTaskInf
 	}
 }
 
-func (b *balanceTracer) StartWorkflow(context.Context, StartInfo) ([]byte, func(error)) {
+func (b *balanceTracer) StartWorkflow(context.Context, StartInfo) ([]byte, func(bool, error)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.starts++
@@ -340,7 +340,7 @@ func (b *balanceTracer) StartWorkflow(context.Context, StartInfo) ([]byte, func(
 		b.ends++ // no end will come
 		return nil, nil
 	}
-	return nil, func(error) {
+	return nil, func(bool, error) {
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		b.ends++

@@ -2,6 +2,7 @@ package flows
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -96,19 +97,23 @@ func (o observer) Ended(e store.EndInfo) { o.o.RunEnded(runInfo(e)) }
 // StartWorkflow, from the caller's context (Workflow.Start) or from the
 // starting workflow task's (a child), returns it as opaque bytes, stored
 // with the execution and handed back to every task and attempt of it, in
-// any process (WorkflowTaskInfo.Trace, ActivityInfo.Trace); continue-as-new
-// keeps it. The engine never interprets them. An attempt or task whose
+// any process (WorkflowTaskInfo.Trace, ActivityInfo.Trace). Continue-as-new
+// starts the next execution anew (StartInfo.Previous): a workflow looping
+// through continue-as-new makes one trace per execution, not one trace
+// that never ends. The engine never interprets the bytes. An attempt or task whose
 // lease was lost (another engine runs it again) ends with an error
 // matching ErrLeaseLost.
 type Tracer interface {
 	// StartWorkflow starts an execution: by Workflow.Start (ctx is the
 	// caller's) or by a workflow starting a child (ctx is the context
-	// StartWorkflowTask returned for the task starting it). It returns the
-	// trace context to store with the execution (nil: none; over
-	// MaxTraceContext bytes it is dropped) and end, called once the start
-	// is stored (nil) or failed. Starting an instance id that exists
-	// stores nothing: the existing execution keeps its trace context.
-	StartWorkflow(ctx context.Context, w StartInfo) (trace []byte, end func(err error))
+	// StartWorkflowTask returned for the task starting it, or continuing
+	// as new). It returns the trace context to store with the execution
+	// (nil: none; over MaxTraceContext bytes it is dropped) and end, called
+	// once the start is stored: created is false when the instance id was
+	// in use and nothing was created (a second Start is not an error; a
+	// child then fails with ErrInstanceExists), err is set when the start
+	// failed. The existing execution keeps its own trace context.
+	StartWorkflow(ctx context.Context, w StartInfo) (trace []byte, end func(created bool, err error))
 	// StartActivity starts an attempt of an activity or compensator. The
 	// returned context is the attempt's: spans the activity makes are its
 	// children. It must derive from ctx (context.WithValue), or the
@@ -137,6 +142,12 @@ type StartInfo struct {
 	// Parent is the instance id of the workflow starting it as a child,
 	// "" for Workflow.Start.
 	Parent string
+	// Previous, for continue-as-new, is the trace context of the execution
+	// it continues (nil when that one had none). Continue-as-new is not a
+	// child: its execution is a new start, which may link to the previous.
+	Previous []byte
+	// Continued reports a continue-as-new (Previous may still be nil).
+	Continued bool
 }
 
 // ActivityInfo describes an activity attempt.
@@ -193,10 +204,14 @@ func (t tracer) StartTask(ctx context.Context, e *store.Execution) (context.Cont
 	return tctx, end
 }
 
-func (t tracer) StartChild(ctx context.Context, parent *store.Execution, ne *store.NewExecution) func(error) {
-	tr, end := t.t.StartWorkflow(ctx, StartInfo{
-		InstanceID: ne.InstanceID, Workflow: ne.Workflow, Version: int(ne.Version), Parent: parent.InstanceID,
-	})
+func (t tracer) StartFrom(ctx context.Context, from *store.Execution, ne *store.NewExecution, continued bool) func(bool, error) {
+	info := StartInfo{InstanceID: ne.InstanceID, Workflow: ne.Workflow, Version: int(ne.Version)}
+	if continued {
+		info.InstanceID, info.Previous, info.Continued = from.InstanceID, from.Trace, true // the store keeps the id
+	} else {
+		info.Parent = from.InstanceID
+	}
+	tr, end := t.t.StartWorkflow(ctx, info)
 	ne.Trace = keptTrace(tr)
 	return end
 }
@@ -211,24 +226,34 @@ func keptTrace(tr []byte) []byte {
 
 // startTraced starts ne under the engine's tracer (if any): its trace
 // context goes into ne, end (never nil) follows the start. The tracer's
-// panics are recovered: the start goes on untraced.
-func (e *Engine) startTraced(ctx context.Context, ne *store.NewExecution) (end func(error)) {
-	end = func(error) {}
+// panics are recovered and logged: the start goes on untraced.
+func (e *Engine) startTraced(ctx context.Context, ne *store.NewExecution) (end func(bool, error)) {
+	end = func(bool, error) {}
 	if e.tracer == nil {
 		return end
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			ne.Trace, end = nil, func(error) {}
+			e.tracerPanic(r)
+			ne.Trace, end = nil, func(bool, error) {}
 		}
 	}()
 	tr, tend := e.tracer.StartWorkflow(ctx, StartInfo{InstanceID: ne.InstanceID, Workflow: ne.Workflow, Version: int(ne.Version)})
 	ne.Trace = keptTrace(tr)
 	if tend != nil {
-		end = func(err error) {
-			defer func() { _ = recover() }() // a broken tracer must not fail Start
-			tend(err)
+		end = func(created bool, err error) {
+			defer func() { // a broken tracer must not fail Start
+				if r := recover(); r != nil {
+					e.tracerPanic(r)
+				}
+			}()
+			tend(created, err)
 		}
 	}
 	return end
+}
+
+// tracerPanic logs a panic of the tracer, as the worker does.
+func (e *Engine) tracerPanic(r any) {
+	e.log.LogAttrs(context.Background(), slog.LevelError, "flows: panic in tracer", slog.Any("panic", r))
 }

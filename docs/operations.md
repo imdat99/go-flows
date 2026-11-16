@@ -143,9 +143,24 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // ended over 30 days ag
     execution (column `trace`, migration 00016) and returned by the claims,
     so every workflow task and activity attempt, in any process, is a child
     of it. A child workflow's start span is a child of the parent's task
-    that started it; continue-as-new keeps the trace.
+    that started it.
+  - A trace lasts as long as its execution. An execution that waits for
+    days (timers, signals) makes a trace that long: some backends cap trace
+    duration or size, and tail samplers give up waiting for its end.
+  - Continue-as-new starts a new trace: the next execution's start span is
+    a new root (`flows.continued=true`) with a span link to the previous
+    execution's start span. A workflow that loops through continue-as-new
+    makes one bounded trace per execution, chained by links, never one
+    trace without end.
+  - A start that creates nothing ends with `flows.outcome=existing`: a
+    second `Workflow.Start` of an instance id (not an error; nothing is
+    stored, the execution keeps its own trace), or a child whose instance
+    id is taken (error status; the child fails with `ErrInstanceExists`).
   - Sampling is decided once, at the start, by your sampler; the decision
-    stored with the execution holds for all its spans (`ParentBased`).
+    stored with the execution holds for all its spans (`ParentBased`). The
+    trace state is not stored: vendor entries and OpenTelemetry's
+    consistent-probability threshold (`ot=th`) do not reach the later
+    spans.
   - An attempt or task whose lease was lost ends with an error status and
     `flows.outcome=lease_lost`; the attempt that replaces it is in the same
     trace. Spans carry `flows.instance_id` and `flows.execution_id`.

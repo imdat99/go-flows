@@ -2,6 +2,7 @@ package otelflows_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -28,6 +29,22 @@ var (
 			return "", err
 		}
 		return traceKid.Child(c, id+"-kid", "k").Get(c)
+	})
+	traceTaken = flows.DefineWorkflow("otel.trace-taken", 1, func(c flows.Ctx, id string) (string, error) {
+		_, err := traceKid.Child(c, id, "t").Get(c)
+		if errors.Is(err, flows.ErrInstanceExists) {
+			return "taken", nil
+		}
+		return "", err
+	})
+	traceLoop = flows.DefineWorkflow("otel.trace-loop", 1, func(c flows.Ctx, n int) (int, error) {
+		if _, err := traceStep.Run(c, "l"); err != nil {
+			return 0, err
+		}
+		if n < 1 {
+			return 0, flows.ContinueAsNew(c, n+1)
+		}
+		return n, nil
 	})
 )
 
@@ -168,7 +185,7 @@ func TestLostLeaseAttemptInSameTrace(t *testing.T) {
 	tr := otelflows.NewTracer(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)))
 	ctx := context.Background()
 	stored, end := tr.StartWorkflow(ctx, flows.StartInfo{InstanceID: "i", Workflow: "wf", Version: 1})
-	end(nil)
+	end(true, nil)
 	if len(stored) == 0 || len(stored) > flows.MaxTraceContext {
 		t.Fatalf("trace context of %d bytes", len(stored))
 	}
@@ -207,4 +224,86 @@ func TestLostLeaseAttemptInSameTrace(t *testing.T) {
 func attr2(s sdktrace.ReadOnlySpan) int64 {
 	v, _ := attr(s, otelflows.AttrAttempt)
 	return v.AsInt64()
+}
+
+// T10.10 review: a start that creates nothing is marked: a second Start
+// (flows.outcome existing, not an error) and a child whose instance id is
+// taken (existing, error status).
+func TestStartsThatCreateNothing(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	tst := run(context.Background(), t, tp, "dup")
+	if _, err := traceParent.Start(context.Background(), tst.Engine(), "dup", "dup"); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := flowtest.Run(tst, traceTaken, "taker", "dup"); err != nil || out != "taken" {
+		t.Fatalf("%q %v", out, err)
+	}
+	starts := spansOf(rec, "dup", "flows.start")
+	if len(starts) != 3 {
+		t.Fatalf("%d start spans of dup", len(starts))
+	}
+	for i, s := range starts {
+		outcome, _ := attr(s, otelflows.AttrOutcome)
+		_, child := attr(s, otelflows.AttrParent)
+		switch {
+		case i == 0:
+			if outcome.AsString() != "" || s.Status().Code == codes.Error {
+				t.Fatalf("first start: outcome %q status %v", outcome.AsString(), s.Status())
+			}
+		case child: // the taken child
+			if outcome.AsString() != "existing" || s.Status().Code != codes.Error {
+				t.Fatalf("taken child start: outcome %q status %v", outcome.AsString(), s.Status())
+			}
+		default: // the second Start
+			if outcome.AsString() != "existing" || s.Status().Code == codes.Error {
+				t.Fatalf("second start: outcome %q status %v", outcome.AsString(), s.Status())
+			}
+		}
+	}
+}
+
+// T10.10 review: continue-as-new starts a new trace, linked to the start
+// span of the execution it continues; each execution's spans are in its
+// own trace.
+func TestContinueAsNewStartsALinkedTrace(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	ctx, caller := tp.Tracer("app").Start(context.Background(), "http.request")
+	tst := flowtest.New(t, flowtest.WithOptions(flows.Options{Tracer: otelflows.NewTracer(tp)}))
+	h, err := traceLoop.Start(ctx, tst.Engine(), "loop", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tst.Settle()
+	wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := h.Wait(wctx); err != nil || out != 1 {
+		t.Fatalf("%d %v", out, err)
+	}
+	caller.End()
+	starts := spansOf(rec, "loop", "flows.start")
+	if len(starts) != 2 {
+		t.Fatalf("%d start spans", len(starts))
+	}
+	first, next := starts[0], starts[1]
+	if first.SpanContext().TraceID() != caller.SpanContext().TraceID() {
+		t.Fatal("the first execution is not in the caller's trace")
+	}
+	if next.Parent().IsValid() || next.SpanContext().TraceID() == first.SpanContext().TraceID() {
+		t.Fatal("continue-as-new did not start a new trace")
+	}
+	if v, _ := attr(next, otelflows.AttrContinued); !v.AsBool() {
+		t.Fatal("continued start not marked")
+	}
+	if l := next.Links(); len(l) != 1 || l[0].SpanContext.TraceID() != first.SpanContext().TraceID() || l[0].SpanContext.SpanID() != first.SpanContext().SpanID() {
+		t.Fatalf("links %+v", l)
+	}
+	// Each execution's tasks and attempts are under its own start span.
+	for _, s := range append(spansOf(rec, "loop", "flows.workflow_task"), spansOf(rec, "loop", "flows.activity")...) {
+		p := s.Parent().SpanID()
+		if p != first.SpanContext().SpanID() && p != next.SpanContext().SpanID() {
+			t.Fatalf("%q under neither start span", s.Name())
+		}
+	}
 }

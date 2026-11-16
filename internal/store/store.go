@@ -154,6 +154,10 @@ type NewExecution struct {
 	ParentID    int64
 	ParentSched int32
 	Trace       []byte // see Execution.Trace (at most MaxTrace bytes)
+	// Taken is set by CompleteWorkflowTask on a child (Completion.Children)
+	// whose instance id was in use: nothing was created, the parent gets
+	// ChildFailed. Output only: reset by every completion.
+	Taken bool
 }
 
 // Lease identifies the ownership of a claimed task, which every write made

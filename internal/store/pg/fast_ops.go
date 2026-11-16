@@ -168,8 +168,10 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 			fb.Bools(n, func(i int) bool { return acts[i].Uncertain })
 		})
 	}
+	childAt := fb.stmts
 	for i := range c.Children {
 		ch := &c.Children[i]
+		ch.Taken = false // set below from its row (retry may run this twice)
 		fb.stmt(insertChild, nInsertChild, func() {
 			fb.Str(ch.InstanceID)
 			fb.Str(ch.Workflow)
@@ -219,6 +221,10 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 	resumeAt, prevID := fb.resumeAfter(l, c, ending)
 	leases := eagerLeaseSlots(c, l.Owner)
 	err = fb.exec(func(i int, v [][]byte) error {
+		if k := i - childAt; k >= 0 && k < len(c.Children) {
+			c.Children[k].Taken = true // its only row: the id was in use
+			return nil
+		}
 		if i == activityAt {
 			if len(v[3]) == 0 { // owner_id empty: not claimed eagerly
 				return nil
@@ -337,6 +343,7 @@ func (s *Store) endFast(fb *fastBatch, l store.Lease, c *store.Completion, endin
 			fb.Int(int64(n.Version))
 			fb.Str(n.Queue)
 			fb.Bytes(n.Input)
+			fb.Bytes(n.Trace)
 		})
 		if n := len(c.Carry); n > 0 {
 			fb.stmt(carrySignals, nCarrySignals, func() {

@@ -20,7 +20,10 @@ must take care of.
   `Workflow.Start` (and when a workflow starts a child), stored with the
   execution and carried to every workflow task and activity attempt;
   `flows.ErrLeaseLost`; `ExecutionID` and `Trace` on `ActivityInfo` and
-  `WorkflowTaskInfo`; otelflows marks lost leases `flows.outcome=lease_lost`.
+  `WorkflowTaskInfo`; otelflows marks lost leases `flows.outcome=lease_lost`
+  and starts that create nothing `flows.outcome=existing`. A trace lasts as
+  long as its execution; continue-as-new starts a new trace linked to the
+  previous one. The trace state (including `ot=th`) is not kept.
 
 ### Changed
 
@@ -40,8 +43,9 @@ must take care of.
   returning the zero value returns no data, and the earlier data is kept.
   Previously a timeout followed by a declined attempt compensated with the
   zero value (T10.7).
-- `flows.Tracer` (breaking for custom tracers): new method `StartWorkflow`,
-  and `StartWorkflowTask` returns the task's context too (T10.10).
+- `flows.Tracer` (breaking for custom tracers): new method `StartWorkflow`
+  (its end gets whether the start created the execution), and
+  `StartWorkflowTask` returns the task's context too (T10.10).
 
 ### Migrations
 

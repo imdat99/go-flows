@@ -150,6 +150,7 @@ func Run(t *testing.T, h Harness) {
 		{"GW13_ActivityCancelReachesItsWorker", testActivityCancel},
 		{"GW13_CancelBeforeRetry", testCancelBeforeRetry},
 		{"TraceContext", testTraceContext},
+		{"TraceOnCompensation", testTraceOnCompensation},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

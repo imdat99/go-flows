@@ -1,8 +1,10 @@
 package flows
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,13 +16,19 @@ import (
 
 // spanLog is a Tracer recording what each start, task and attempt got:
 // a start returns "start:<instance><<the caller's span>" as the trace
-// context; a task's context carries "task:<instance>".
+// context ("cont:<instance><<the previous trace context>" for
+// continue-as-new); a task's context carries "task:<instance>".
 type spanLog struct {
 	mu       sync.Mutex
-	starts   map[string]string // instance id -> trace context returned
-	ends     map[string]error  // instance id -> the start's end
+	starts   []startRec
 	attempts []loggedSpan
 	tasks    []loggedSpan
+}
+
+type startRec struct {
+	instance, trace, prev string
+	ended, created        bool
+	err                   error
 }
 
 type loggedSpan struct {
@@ -33,24 +41,37 @@ type loggedSpan struct {
 
 type spanKey struct{}
 
-func newSpanLog() *spanLog {
-	return &spanLog{starts: map[string]string{}, ends: map[string]error{}}
-}
+func newSpanLog() *spanLog { return &spanLog{} }
 
-func (l *spanLog) StartWorkflow(ctx context.Context, w StartInfo) ([]byte, func(error)) {
+func (l *spanLog) StartWorkflow(ctx context.Context, w StartInfo) ([]byte, func(bool, error)) {
 	caller, _ := ctx.Value(spanKey{}).(string)
 	tr := "start:" + w.InstanceID + "<" + caller
+	if w.Previous != nil {
+		tr = "cont:" + w.InstanceID + "<" + string(w.Previous)
+	}
 	if w.InstanceID == "trace-huge" {
 		tr = strings.Repeat("x", 1000)
 	}
 	l.mu.Lock()
-	l.starts[w.InstanceID] = tr
+	k := len(l.starts)
+	l.starts = append(l.starts, startRec{instance: w.InstanceID, trace: tr, prev: string(w.Previous)})
 	l.mu.Unlock()
-	return []byte(tr), func(err error) {
+	return []byte(tr), func(created bool, err error) {
 		l.mu.Lock()
 		defer l.mu.Unlock()
-		l.ends[w.InstanceID] = err
+		l.starts[k].ended, l.starts[k].created, l.starts[k].err = true, created, err
 	}
+}
+
+// startsOf returns the starts of instance id.
+func (l *spanLog) startsOf(id string) []startRec {
+	var out []startRec
+	for _, r := range l.starts {
+		if r.instance == id {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func (l *spanLog) StartActivity(ctx context.Context, a ActivityInfo) (context.Context, func(error)) {
@@ -114,13 +135,21 @@ var (
 		}
 		return "", ContinueAsNew(c, n+1)
 	})
+	traceTaken = DefineWorkflow("trace.taken", 1, func(c Ctx, id string) (string, error) {
+		_, err := traceKid.Child(c, id, "t").Get(c)
+		if errors.Is(err, ErrInstanceExists) {
+			return "taken", nil
+		}
+		return "", err
+	})
 )
 
 // T10.10: the trace context the tracer returns at Start (from the
 // caller's context) is stored with the execution and handed to every task
-// and attempt, across continue-as-new; a child's start gets the starting
-// task's context, and the child's own trace context goes to its tasks and
-// attempts. A trace context over store.MaxTrace bytes is dropped.
+// and attempt; a child's start gets the starting task's context, and the
+// child's own trace context goes to its tasks and attempts. Continue-as-new
+// starts anew, given the previous trace context. A trace context over
+// store.MaxTrace bytes is dropped.
 func TestTracerCarriesTraceContext(t *testing.T) {
 	l := newSpanLog()
 	e := tracedLogEngine(t, l, mem.New(nil))
@@ -131,42 +160,95 @@ func TestTracerCarriesTraceContext(t *testing.T) {
 	if _, err := traceKid.Run(caller, e, "trace-huge", "h"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool {
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		return len(l.ends) == 3
-	})
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	first, cont := "start:trace-tree<caller", "cont:trace-tree<start:trace-tree<caller"
+	tree := l.startsOf("trace-tree")
+	if len(tree) != 2 || tree[0].trace != first || tree[1].trace != cont || tree[1].prev != first {
+		t.Fatalf("trace-tree starts %+v", tree)
+	}
 	want := map[string]string{
-		"trace-tree": "start:trace-tree<caller",
 		"trace-kid":  "start:trace-kid<task:trace-tree",
 		"trace-huge": "",
 	}
-	for id, tr := range want {
-		if id != "trace-huge" && l.starts[id] != tr {
-			t.Fatalf("start of %s returned %q, want %q", id, l.starts[id], tr)
-		}
-		if err, ok := l.ends[id]; !ok || err != nil {
-			t.Fatalf("start of %s ended %v %v", id, ok, err)
+	for _, r := range l.starts {
+		if !r.ended || !r.created || r.err != nil {
+			t.Fatalf("start %+v", r)
 		}
 	}
-	executions := map[int64]bool{}
+	checkTreeSpans(t, l, want, first, cont)
+}
+
+// checkTreeSpans checks the trace context each span of TestTracerCarries-
+// TraceContext got: want per instance, first or cont per execution of
+// trace-tree (l is locked).
+func checkTreeSpans(t *testing.T, l *spanLog, want map[string]string, first, cont string) {
+	t.Helper()
+	traces := map[int64]string{} // trace-tree execution -> trace context
 	seen := map[string]int{}
 	for _, s := range append(append([]loggedSpan{}, l.tasks...), l.attempts...) {
-		if s.trace != want[s.instance] {
-			t.Fatalf("%s span of %s got trace %q, want %q", map[bool]string{true: "attempt", false: "task"}[s.attempt > 0], s.instance, s.trace, want[s.instance])
-		}
-		if s.instance == "trace-tree" {
-			executions[s.execution] = true
-		}
 		seen[s.instance]++
+		if s.instance == "trace-tree" {
+			if tr, ok := traces[s.execution]; ok && tr != s.trace {
+				t.Fatalf("execution %d spans with traces %q and %q", s.execution, tr, s.trace)
+			}
+			traces[s.execution] = s.trace
+			continue
+		}
+		if s.trace != want[s.instance] {
+			t.Fatalf("span of %s got trace %q, want %q", s.instance, s.trace, want[s.instance])
+		}
 	}
-	if len(executions) != 2 {
-		t.Fatalf("trace-tree executions %v: want 2 (continue-as-new)", executions)
+	if len(traces) != 2 {
+		t.Fatalf("trace-tree executions %v: want 2 (continue-as-new)", traces)
+	}
+	for id, tr := range traces {
+		if tr != first && tr != cont || traces[id] == traces[otherKey(traces, id)] {
+			t.Fatalf("trace-tree executions' traces %v", traces)
+		}
 	}
 	if seen["trace-kid"] < 2 || seen["trace-huge"] < 2 {
 		t.Fatalf("spans per instance %v", seen)
+	}
+}
+
+func otherKey(m map[int64]string, k int64) int64 {
+	for x := range m {
+		if x != k {
+			return x
+		}
+	}
+	return k
+}
+
+// T10.10 review: a start that creates nothing tells the tracer so: a
+// second Start of an instance id (no new trace context is stored), and a
+// child whose instance id is in use.
+func TestTracerStartsThatCreateNothing(t *testing.T) {
+	l := newSpanLog()
+	e := tracedLogEngine(t, l, mem.New(nil))
+	if _, err := traceKid.Run(waitCtx(t), e, "dup", "d"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := traceKid.Start(context.WithValue(bg, spanKey{}, "again"), e, "dup", "d"); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := traceTaken.Run(waitCtx(t), e, "taker", "dup"); err != nil || out != "taken" {
+		t.Fatalf("%q %v", out, err)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	dup := l.startsOf("dup")
+	if len(dup) != 3 {
+		t.Fatalf("starts of dup %+v", dup)
+	}
+	for i, r := range dup {
+		if !r.ended || r.created != (i == 0) || r.err != nil {
+			t.Fatalf("start %d of dup %+v", i, r)
+		}
+	}
+	if ex, _ := e.st.GetExecution(bg, "dup"); string(ex.Trace) != dup[0].trace {
+		t.Fatalf("the existing execution's trace became %q", ex.Trace)
 	}
 }
 
@@ -240,4 +322,51 @@ func TestTracerLostLease(t *testing.T) {
 			t.Fatalf("task of execution %d, trace %q", task.execution, task.trace)
 		}
 	}
+}
+
+// panicStarts is a tracer whose StartWorkflow panics.
+type panicStarts struct{ spanLog }
+
+func (*panicStarts) StartWorkflow(context.Context, StartInfo) ([]byte, func(bool, error)) {
+	panic("tracer bug")
+}
+
+// T10.10 review: a panic of the tracer at Start is logged (Options.Logger)
+// and the start goes on untraced.
+func TestTracerPanicAtStartIsLogged(t *testing.T) {
+	var buf syncBuffer
+	e, err := newEngine(mem.New(nil), Options{
+		InstanceID: "trace-panic", PollMax: 20 * time.Millisecond, Tracer: &panicStarts{},
+		Logger: slog.New(slog.NewTextHandler(&buf, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := traceKid.Start(bg, e, "panicky", "p"); err != nil {
+		t.Fatal(err)
+	}
+	if ex, _ := e.st.GetExecution(bg, "panicky"); ex.Trace != nil {
+		t.Fatalf("trace %q", ex.Trace)
+	}
+	if s := buf.String(); !strings.Contains(s, "panic in tracer") || !strings.Contains(s, "level=ERROR") {
+		t.Fatalf("log %q", s)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for concurrent writes.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }

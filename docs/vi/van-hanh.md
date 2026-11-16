@@ -141,11 +141,24 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // kết thúc hơn 30 n
     (không có thì là gốc mới). Span context của nó (26 byte) được lưu cùng
     execution (cột `trace`, migration 00016) và trả về khi claim, nên mọi
     workflow task và activity attempt, ở bất kỳ process nào, đều là con của
-    nó. Span start của child workflow là con của task cha đã tạo nó;
-    continue-as-new giữ nguyên trace.
+    nó. Span start của child workflow là con của task cha đã tạo nó.
+  - Trace kéo dài bằng execution của nó. Execution chờ nhiều ngày (timer,
+    signal) tạo ra trace dài ngần ấy: một số backend giới hạn thời lượng
+    hoặc kích thước trace, và tail sampler bỏ cuộc khi chờ trace kết thúc.
+  - Continue-as-new bắt đầu trace mới: span start của execution kế tiếp là
+    gốc mới (`flows.continued=true`) có span link tới span start của
+    execution trước. Workflow lặp bằng continue-as-new tạo mỗi execution
+    một trace có giới hạn, nối với nhau bằng link, không bao giờ là một
+    trace không có điểm kết thúc.
+  - Lần start không tạo gì kết thúc với `flows.outcome=existing`:
+    `Workflow.Start` lần hai cho một instance id (không phải lỗi; không lưu
+    gì, execution giữ trace của nó), hoặc child có instance id đã bị dùng
+    (status lỗi; child thất bại với `ErrInstanceExists`).
   - Việc lấy mẫu được quyết định một lần, lúc start, bởi sampler của bạn;
     quyết định lưu cùng execution áp dụng cho mọi span của nó
-    (`ParentBased`).
+    (`ParentBased`). Trace state không được lưu: các entry của vendor và
+    ngưỡng consistent-probability của OpenTelemetry (`ot=th`) không tới
+    được các span sau.
   - Attempt hoặc task mất lease kết thúc với status lỗi và
     `flows.outcome=lease_lost`; attempt thay thế nằm trong cùng trace. Span
     có `flows.instance_id` và `flows.execution_id`.

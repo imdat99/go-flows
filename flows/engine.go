@@ -98,6 +98,7 @@ type Engine struct {
 	w      *worker.Worker
 	obs    Observer
 	tracer Tracer
+	log    *slog.Logger // never nil
 }
 
 // New returns a stopped engine on pool. Run Migrate first.
@@ -164,7 +165,11 @@ func newEngineWith(st store.Store, acts worker.Activities, opts Options) (*Engin
 	if err != nil {
 		return nil, fmt.Errorf("flows: %w", err)
 	}
-	return &Engine{st: st, w: w, obs: opts.Observer, tracer: opts.Tracer}, nil
+	log := opts.Logger
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	return &Engine{st: st, w: w, obs: opts.Observer, tracer: opts.Tracer, log: log}, nil
 }
 
 // Start starts running tasks. Without Start, an engine still starts
