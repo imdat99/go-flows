@@ -34,9 +34,10 @@ import (
 
 // Child process protocol, passed through the environment.
 const (
-	envMode  = "FLOWS_CHAOS_CHILD" // hang | pause | many | comp-hang | lock-hang
+	envMode  = "FLOWS_CHAOS_CHILD" // hang | pause | many | comp-hang | lock-hang | wf-pause | wf-short | tree
 	envDSN   = "FLOWS_CHAOS_DSN"
 	envRuns  = "FLOWS_CHAOS_RUNS"
+	envTTL   = "FLOWS_CHAOS_TTL" // the child's LeaseTTL (default leaseTTL)
 	leaseTTL = time.Second
 )
 
@@ -55,6 +56,10 @@ var hangMode string
 // writes).
 var gate atomic.Pointer[chan struct{}]
 
+// slowSteps, when set in the parent, slows every attempt of the order's
+// steps (test C: no single racer can take all the work).
+var slowSteps atomic.Int64
+
 // effect is the module side of an activity: it records every attempt, and
 // applies the effect once per key (the module's processed_requests).
 func effect(ctx context.Context, name string, k flows.Key) error {
@@ -72,6 +77,9 @@ func defineStep(name string, stall bool) *flows.Activity[int, int, struct{}] {
 	return flows.DefineActivity(name, func(ctx context.Context, k flows.Key, v int) (int, struct{}, error) {
 		if err := effect(ctx, name, k); err != nil {
 			return 0, struct{}{}, err
+		}
+		if d := time.Duration(slowSteps.Load()); d > 0 {
+			time.Sleep(d)
 		}
 		if stall && hangMode != "" {
 			if _, err := db.Load().Exec(ctx, `INSERT INTO chaos_marker (key) VALUES ($1)`, string(k)); err != nil {
@@ -165,10 +173,23 @@ func child(mode string) int {
 		return 2
 	}
 	db.Store(pool)
-	eng, err := flows.New(pool, flows.Options{
-		InstanceID: "child", LeaseTTL: leaseTTL, PollMax: 50 * time.Millisecond, Logger: quietLogger(os.Stderr),
+	ttl := leaseTTL
+	if v := os.Getenv(envTTL); v != "" {
+		if ttl, err = time.ParseDuration(v); err != nil {
+			fmt.Println("RESULT: ttl:", err)
+			return 2
+		}
+	}
+	opts := flows.Options{
+		InstanceID: "child", LeaseTTL: ttl, PollMax: 50 * time.Millisecond, Logger: quietLogger(os.Stderr),
 		Observer: printAttempts{},
-	})
+	}
+	if mode == "wf-pause" || mode == "wf-short" || mode == "tree" {
+		// Workflow code waits on the test (wf-*): never handed back as stuck.
+		opts.StuckTimeout = 5 * time.Minute
+		opts.Tracer = printTasks{}
+	}
+	eng, err := flows.New(pool, opts)
 	if err != nil {
 		fmt.Println("RESULT: engine:", err)
 		return 2
@@ -177,22 +198,30 @@ func child(mode string) int {
 		fmt.Println("RESULT: start:", err)
 		return 2
 	}
-	if mode == "lock-hang" {
+	switch mode {
+	case "lock-hang":
 		_, err := locked.Start(ctx, eng, "locked-0", 0)
 		if err == nil {
 			select {} // killed while holding the lock
 		}
 		fmt.Printf("RESULT: %v\n", err)
-		return 0
-	}
-	if mode == "comp-hang" {
+	case "comp-hang":
 		h, err := failing.Start(ctx, eng, "failing-0", 1)
 		if err == nil {
 			_, err = h.Wait(ctx) // never returns: killed while compensating
 		}
 		fmt.Printf("RESULT: %v\n", err)
-		return 0
+	case "wf-pause", "wf-short":
+		childFenced(ctx, eng)
+	case "tree":
+		childTrees(ctx, eng)
+	default:
+		childOrders(ctx, eng)
 	}
+	return 0
+}
+
+func childOrders(ctx context.Context, eng *flows.Engine) {
 	n, _ := strconv.Atoi(os.Getenv(envRuns))
 	var errs []error
 	var handles []*flows.Handle[string]
@@ -214,7 +243,6 @@ func child(mode string) int {
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	_ = eng.Stop(sctx)
-	return 0
 }
 
 // printAttempts prints the attempts the child is about to record (the
@@ -228,7 +256,7 @@ func (printAttempts) ActivityAttempt(a flows.ActivityAttempt) {
 func (printAttempts) RunEnded(flows.RunInfo) {}
 
 func quietLogger(w io.Writer) *slog.Logger {
-	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelError}))
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelWarn}))
 }
 
 func setup(t *testing.T) *pgxpool.Pool {
@@ -241,10 +269,16 @@ func setup(t *testing.T) *pgxpool.Pool {
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE chaos_attempt (key text NOT NULL, step text NOT NULL, pid int NOT NULL);
 		CREATE TABLE chaos_effect (key text PRIMARY KEY, step text NOT NULL);
-		CREATE TABLE chaos_marker (key text PRIMARY KEY);`); err != nil {
+		CREATE TABLE chaos_marker (key text PRIMARY KEY);
+		CREATE TABLE chaos_go (key text PRIMARY KEY);`); err != nil {
 		t.Fatal(err)
 	}
 	db.Store(pool)
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpState(t, pool)
+		}
+	})
 	return pool
 }
 
@@ -267,14 +301,15 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-func spawn(t *testing.T, pool *pgxpool.Pool, mode string, runs int) (*exec.Cmd, *syncBuffer) {
+func spawn(t *testing.T, pool *pgxpool.Pool, mode string, runs int, env ...string) (*exec.Cmd, *syncBuffer) {
 	t.Helper()
 	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^$")
 	cmd.Env = append(os.Environ(),
 		envMode+"="+mode, envDSN+"="+testdb.DSN(pool), envRuns+"="+strconv.Itoa(runs))
+	cmd.Env = append(cmd.Env, env...)
 	var out syncBuffer
 	cmd.Stdout = &out
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = &out                                                  // its logs too: printed when the test fails
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL} // never outlive the test
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -282,6 +317,9 @@ func spawn(t *testing.T, pool *pgxpool.Pool, mode string, runs int) (*exec.Cmd, 
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
+		if t.Failed() {
+			t.Logf("child %s (pid %d, mode %s) output:\n%s", strings.Join(env, " "), cmd.Process.Pid, mode, out.String())
+		}
 	})
 	return cmd, &out
 }
@@ -308,9 +346,18 @@ func count(t *testing.T, pool *pgxpool.Pool, query string, args ...any) int {
 
 func startEngine(t *testing.T, pool *pgxpool.Pool, id string) *flows.Engine {
 	t.Helper()
-	eng, err := flows.New(pool, flows.Options{
-		InstanceID: id, LeaseTTL: leaseTTL, PollMax: 50 * time.Millisecond, Logger: quietLogger(t.Output()),
-	})
+	return startEngineWith(t, pool, flows.Options{InstanceID: id})
+}
+
+// startEngineWith starts an engine with the suite's lease and polling,
+// and opts' other fields.
+func startEngineWith(t *testing.T, pool *pgxpool.Pool, opts flows.Options) *flows.Engine {
+	t.Helper()
+	if opts.LeaseTTL == 0 {
+		opts.LeaseTTL = leaseTTL
+	}
+	opts.PollMax, opts.Logger = 50*time.Millisecond, quietLogger(t.Output())
+	eng, err := flows.New(pool, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +486,10 @@ func TestFrozenInstanceIsFencedOff(t *testing.T) {
 }
 
 // C: three instances race to recover the executions of a killed one; each
-// activity takes effect once and each execution completes once.
+// activity takes effect once and each execution completes once. Each racer
+// is bounded (two workflow tasks, two activities at a time) and the steps
+// are slowed, so that no racer can take all the work; the racers' counts
+// prove that more than one took part.
 func TestThreeInstancesRaceRecovery(t *testing.T) {
 	const runs = 30
 	pool := setup(t)
@@ -452,19 +502,46 @@ func TestThreeInstancesRaceRecovery(t *testing.T) {
 	}
 	_ = cmd.Wait()
 
+	slowSteps.Store(int64(30 * time.Millisecond))
+	t.Cleanup(func() { slowSteps.Store(0) })
 	engines := make([]*flows.Engine, 3)
+	stats := make([]*racerStats, 3)
 	for i := range engines {
 		p, err := pgxpool.New(context.Background(), testdb.DSN(pool))
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(p.Close)
-		engines[i] = startEngine(t, p, "racer-"+strconv.Itoa(i))
+		stats[i] = &racerStats{name: "racer-" + strconv.Itoa(i)}
+		engines[i] = startEngineWith(t, p, flows.Options{
+			InstanceID: stats[i].name, MaxWorkflowTasks: 2, MaxActivities: 2,
+			Observer: stats[i], Tracer: stats[i],
+		})
 	}
 	for i := range runs {
 		waitDone(t, engines[i%3], "order-"+strconv.Itoa(i))
 	}
 	assertOnce(t, pool, runs)
+	var attempted, ended, attempts, ends int64
+	for _, s := range stats {
+		t.Log(s)
+		a, e := s.attempts.Load(), s.ended.Load()
+		attempts, ends = attempts+a, ends+e
+		if a > 0 {
+			attempted++
+		}
+		if e > 0 {
+			ended++
+		}
+	}
+	// Every recovered attempt (reserve, charge, confirm) and every end was
+	// counted by some racer.
+	if attempts < 3*runs || ends != runs {
+		t.Fatalf("racers counted %d completed attempts (want >= %d) and %d ends (want %d)", attempts, 3*runs, ends, runs)
+	}
+	if attempted < 2 || ended < 2 {
+		t.Fatalf("only %d racers completed attempts and %d ended executions: the race had one racer", attempted, ended)
+	}
 }
 
 // D: an instance is killed while a compensator runs; another resumes the
