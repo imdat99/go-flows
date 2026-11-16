@@ -94,6 +94,7 @@ func Run(t *testing.T, h Harness) {
 		{"ParkedExecutionCannotKeepItsLease", testParkedCannotKeep},
 		{"RenewLeases", testRenewLeases},
 		{"GW4_PurgeEnded", testPurgeEnded},
+		{"GW4_PurgeKeepsActiveExecutions", testPurgeKeepsActiveExecutions},
 		{"KeptLeaseHolderDies", testKeptLeaseHolderDies},
 		{"GW3_TerminalWithNilConsumed", testTerminalWithNilConsumed},
 		{"WatchHints", testWatch},

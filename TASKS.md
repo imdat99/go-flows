@@ -346,7 +346,19 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
     - **Còn mở:**
       - delay do worker khác commit, hand-back, và việc ngoài horizon vẫn có thể trễ tối đa PollMax;
       - gate trên runner CI dùng chung có thể dao động (headroom khoảng 7%).
-- [ ] **T8.3** Tài liệu song ngữ: concepts, guarantees, operations, patterns.
+- [x] **T8.3** Tài liệu song ngữ: concepts, guarantees, operations, patterns.
+    - **File:** `README.md` (EN) và `docs/vi/README.md`; `docs/{concepts,guarantees,operations,patterns}.md` và bản tiếng Việt `docs/vi/{khai-niem,bao-dam,van-hanh,mau-thiet-ke}.md`.
+    - **Kiểm tra:**
+      - các snippet đã compile với API thật trong một package tạm;
+      - link tương đối đều trỏ đúng;
+      - test `make test` đạt.
+    - **Thêm test** `GW4_PurgeKeepsActiveExecutions` (conformance, mem + pg): execution đang `compensating` hoặc `needs_attention` không bị `PurgeEnded` xoá. Nghi có lỗi nhưng kiểm tra thì không có, vì chỉ kết thúc thật mới đặt `ended_at`; test giữ lại để canh.
+    - **Review:**
+      - Lần 1 không đạt. H1: tài liệu nói workflow bị huỷ có thể kết thúc `compensated`, nhưng thực tế luôn là `canceled` khi trả `ErrCanceled`. Cùng lần đó có 4 mục medium: park do non-determinism, `Terminate` không compensate, hook theo từng engine, thiếu trạng thái `continued`; và 8 mục low.
+      - Lần 2 đạt; 3 ghi chú low đã sửa.
+    - **Chuyển sang T8.4:**
+      - park do non-determinism không có cách mở lại (chỉ có `Terminate`), mà doc của `Handle.Wait` lại nói "can still resume once fixed";
+      - workflow quay vòng không nhường thì bị trả lại mãi, mỗi lần để lại một goroutine quay (CPU tăng).
 - [ ] **T8.4** Review tổng thể toàn repo bằng subagent (đọc lạnh), sửa các phát hiện.
 
 ## File và hàm tái sử dụng

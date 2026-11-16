@@ -1,0 +1,163 @@
+# Vận hành
+
+[English](../operations.md)
+
+## Cài đặt
+
+```go
+pool, err := pgxpool.New(ctx, dsn)
+err = flows.Migrate(ctx, pool) // process nào cũng gọi được; advisory lock xếp hàng chúng
+engine, err := flows.New(pool, flows.Options{
+	Logger: slog.Default(),
+	// Hook, Observer, Tracer: xem bên dưới.
+})
+err = engine.Start(ctx)
+defer engine.Stop(shutdownCtx)
+```
+
+- **Migration.** `Migrate` tạo schema `flows` và áp dụng các migration goose
+  nhúng sẵn, chỉ đi tới. Mỗi thay đổi là một file mới.
+- **Process chỉ làm client.** Engine không được start vẫn bắt đầu workflow,
+  gửi signal, huỷ, terminate và chờ kết quả được. Một process API có thể
+  dùng engine như vậy mà không chạy task.
+- **Queue.** `Options.Queues` chọn các queue mà engine chạy (mặc định
+  `"default"`). Định tuyến activity bằng `WithQueue` và workflow bằng
+  `WithWorkflowQueue`, ví dụ để dồn activity chậm vào các process riêng.
+  Activity có queue mà không engine nào chạy sẽ chờ mãi: workflow của nó
+  không fail.
+- **Instance id của engine.** `Options.InstanceID` đặt tên engine trong
+  lease và phải là duy nhất cho mỗi process. Giá trị mặc định (hostname cộng
+  hậu tố ngẫu nhiên) thoả điều đó.
+- **Hook ở mọi nơi.** Đặt cùng một `Options.Hook` cho mọi engine, kể cả
+  engine chỉ làm client: engine chạy hook của chính nó cho các lần kết thúc
+  mà nó ghi, ví dụ một lệnh `Terminate` nó thực hiện.
+- **Đăng ký.** Định nghĩa workflow và activity ở cấp package, trong mọi
+  binary chạy chúng. Engine chỉ chạy các version workflow và activity mà
+  binary của nó định nghĩa. Những cái khác được trả lại sau một khoảng chờ,
+  để engine có chúng nhận.
+
+## Kết nối
+
+- **LISTEN.** Mỗi engine đã start lấy **một kết nối** khỏi pool trong suốt
+  vòng đời của nó, để `LISTEN`. Kết nối này rời khỏi pool (không còn tính
+  vào `MaxConns`), nên mỗi engine dùng thêm một kết nối server ngoài pool:
+  hãy tính nó vào `max_connections` của Postgres.
+- **Task.** Task chỉ mượn kết nối trong lúc nói chuyện với store. Tối đa
+  `MaxWorkflowTasks + MaxActivities` task chạy cùng lúc (mặc định 64 mỗi
+  loại), nhưng phần lớn thời gian của chúng nằm trong activity của bạn,
+  không phải trong database.
+- **Kích thước pool.** `MaxConns` mặc định của pgxpool là
+  `max(4, NumCPU)`. Hãy tăng khi nhiều activity hoàn tất cùng lúc, hoặc khi
+  activity của bạn dùng chung pool.
+- **Đường nhanh.** Các câu lệnh nóng dùng pgconn trực tiếp, prepare một lần
+  cho mỗi kết nối. Việc này cần `QueryExecModeCacheStatement` (mặc định của
+  pool) và không có `ConnConfig.Tracer`. Nếu không, engine quay về lời gọi
+  pgx thông thường: vẫn đúng nhưng chậm hơn. Khi có `Hook`, các completion
+  kết thúc execution cũng dùng transaction tường minh.
+- **Pooler.** Đứng sau PgBouncer ở transaction mode thì `LISTEN` không nhận
+  được gì. Engine vẫn chạy nhờ poll của chính nó (thêm tới `PollMax` độ trễ
+  mỗi lần chuyển giao). Nên cho engine kết nối trực tiếp hoặc qua session
+  mode. Cũng chạy `Migrate` qua kết nối trực tiếp (nó giữ advisory lock trên
+  một kết nối trong khi goose dùng các kết nối khác: pool cần
+  `MaxConns >= 3`).
+
+## Tinh chỉnh
+
+| Tuỳ chọn | Mặc định | Tác dụng |
+| --- | --- | --- |
+| `LeaseTTL` | 30s | Engine đã chết giữ việc của nó bao lâu. Lease được gia hạn mỗi một phần ba thời gian này. Ngắn hơn: khôi phục nhanh hơn, gia hạn nhiều hơn. |
+| `MaxWorkflowTasks`, `MaxActivities` | 64, 64 | Mức đồng thời của mỗi engine. |
+| `PollMax` | 1s | Khoảng poll dài nhất khi rảnh. Notification và thời điểm đến hạn cục bộ đánh thức poller sớm hơn. |
+| `StickyFor`, `CacheSize` | 10s, 1000 | Giữ execution đã replay trong bộ nhớ, cùng với task kế tiếp của nó trên engine này. `CacheSize: -1` tắt cache (task nào cũng replay). |
+| `DisableEager` | false | Chạy mọi activity qua queue thay vì chạy ngay trong engine đã lên lịch nó. |
+| `EagerWindow` | 200ms | Execution chờ các activity eager của nó bao lâu trước khi cho signal và timer vào. |
+
+Chi phí đo được và nguyên nhân nằm trong [benchmarks.md](../benchmarks.md).
+
+## Dừng và deploy
+
+- **`Stop(ctx)` dừng có trật tự.** Nó ngừng nhận việc, chờ các task đang
+  chạy cho tới khi `ctx` kết thúc, rồi huỷ phần còn lại. Lease của chúng được
+  nhả hoặc để hết hạn, và engine khác chạy tiếp. Các execution đang sticky
+  được nhả ngay, nên engine kế tiếp không phải chờ `StickyFor`.
+- **Deploy cuốn chiếu là an toàn:**
+  - execution có version mà binary mới không có sẽ được giao cho engine cũ;
+  - activity chạy ít nhất một lần qua lúc chuyển đổi;
+  - compensation chạy tiếp trên engine nào có compensator theo tên.
+- **Sửa code workflow.** Tăng version và giữ định nghĩa cũ cho tới khi các
+  execution của nó kết thúc. Để tìm chúng:
+
+  ```sql
+  SELECT workflow, version, status, count(*)
+  FROM flows.execution
+  WHERE status IN ('running', 'compensating', 'needs_attention')
+  GROUP BY 1, 2, 3;
+  ```
+
+## Retention
+
+Execution đã kết thúc cùng history của nó được giữ lại cho tới khi bị xoá.
+Engine không có retention chạy nền: hãy gọi `PurgeEnded` từ một job định kỳ
+trên một process.
+
+```go
+n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // kết thúc hơn 30 ngày trước, tối đa 1000 mỗi lần gọi
+```
+
+- **Cái bị xoá.** Việc xoá lan sang history, pending event, activity task và
+  lock.
+- **Cái được giữ.** Child của một cha còn hoạt động (đang chạy, đang
+  compensate hoặc bị park) được giữ lại, vì cha có thể hoàn tác chúng.
+- **Id.** Instance id đã bị xoá có thể dùng để start lại. Trước khi bị xoá,
+  `Workflow.Start` với id đó trả về execution cũ.
+- **Bảng `idem`.** Xoá bằng `idem.Purge`, với độ tuổi lớn hơn hẳn khoảng
+  thời gian retry và compensation dài nhất của bạn.
+
+## Giám sát
+
+- **Metric và trace:** `otelflows.NewObserver` và `otelflows.NewTracer`.
+  - `flows.activity.attempts` và `flows.activity.duration` gắn nhãn theo
+    activity, outcome (`completed`, `failed`, `retrying`) và compensation.
+  - `flows.runs.ended` gắn nhãn theo workflow và status.
+  - Span là span gốc, nối với nhau bằng `flows.instance_id`.
+- **Cảnh báo:**
+  - có execution ở `needs_attention`;
+  - số execution `compensating` tăng dần;
+  - tỉ lệ `retrying` tăng ở một activity.
+- **Log:** truyền `Options.Logger`. Qua `slog`, engine ghi log mức warning
+  cho các lần nhận việc, ghi kết quả hoặc gia hạn thất bại. Ở mức error,
+  nó ghi các lần park do non-determinism, panic, compensation task thất bại,
+  và workflow task bị trả lại.
+
+Các truy vấn hữu ích:
+
+```sql
+-- Execution bị park và lý do.
+SELECT instance_id, workflow, version, err, err_kinds, created_at
+FROM flows.execution WHERE status = 'needs_attention';
+
+-- Việc đã đến hạn mà chưa ai nhận (nên luôn gần 0).
+SELECT queue, count(*) FROM flows.execution
+WHERE status IN ('running', 'compensating') AND ready_at <= now()
+  AND (locked_until IS NULL OR locked_until < now())
+  AND (not_before IS NULL OR not_before <= now())   -- đang bị trả lại một lúc
+  AND (sticky_until IS NULL OR sticky_until < now()) -- dành riêng cho một engine
+GROUP BY queue;
+
+-- Activity đang chờ, theo queue.
+SELECT queue, count(*) FROM flows.activity_task GROUP BY queue;
+```
+
+Schema là nội bộ và có thể đổi giữa các version. Hãy dùng nó để quan sát, và
+ghi qua API của engine.
+
+## Xử lý sự cố
+
+| Triệu chứng | Nguyên nhân | Cách xử lý |
+| --- | --- | --- |
+| `needs_attention`, `err_kinds` có `compensation_failed` | Một compensator bỏ cuộc sau khi hết retry. | Sửa nguyên nhân (dữ liệu, hệ thống phía sau), rồi gọi `engine.RetryCompensation(ctx, id)`. Compensator thất bại chạy lại, rồi tới các compensator còn lại. |
+| `needs_attention` do non-determinism (`err_kinds` có `non_deterministic`; lỗi của `Handle.Wait` khớp `ErrNonDeterministic`) | Code đã deploy không còn khớp với history, thường do sửa workflow mà không tăng version. | Khôi phục code cũ dưới version cũ để không còn execution nào bị park thêm. Execution đã park không mở lại được: `Terminate` nó (không có compensation nào chạy, nên hoàn tác thủ công các hiệu ứng đã xong nếu cần) rồi bắt đầu instance mới. |
+| Execution ở mãi `compensating` | Nó chờ một activity phớt lờ context, chạy trên queue không engine nào phục vụ, hoặc retry rất lâu. | Xem `flows.activity_task` của execution đó. `Terminate` kết thúc nó mà không hoàn tác. |
+| Execution ở mãi `running` mà không có gì đang chạy | Nó chờ signal, timer hoặc child, đúng như thiết kế. | Gửi signal, hoặc `Cancel` nó: workflow được dọn dẹp và hoàn tác. |
+| Việc chạy tiếp chậm sau crash | Lease của engine đã chết còn hiệu lực tới hết `LeaseTTL`. | Giảm `LeaseTTL` nếu thời gian khôi phục quan trọng hơn lưu lượng gia hạn. |
+| Workflow lỗi `ErrLockLost` | Lock của nó hết hạn khi nó ngủ hoặc chờ lâu hơn `ttl` của lock, và execution khác đã lấy. | Chọn `ttl` lớn hơn các khoảng chờ dự kiến (chờ trong queue, retry delay, sleep). |

@@ -465,6 +465,32 @@ func testContinueAsNewLeavesChildren(t *testing.T, h Harness) {
 	}
 }
 
+// An execution that compensates or is parked is still active (its workflow
+// function returned, but it is not over): purging it would lose its
+// compensation, or the record of what needs attention.
+func testPurgeKeepsActiveExecutions(t *testing.T, h Harness) {
+	s := h.New(t)
+	for _, id := range []string{"parked", "compensating"} {
+		mustCreate(t, s, id)
+	}
+	for _, tk := range claim(t, s, owner, h.TTL) {
+		st := store.StatusNeedsAttention
+		if tk.Execution.InstanceID == "compensating" {
+			st = store.StatusCompensating
+		}
+		started(t, s, tk, &store.Completion{Status: st, Err: "x"})
+	}
+	h.Advance(t, s, h.TTL)
+	if n, err := s.PurgeEnded(ctx, 0, 10); err != nil || n != 0 {
+		t.Fatalf("purged %d active executions: %v", n, err)
+	}
+	for _, id := range []string{"parked", "compensating"} {
+		if _, err := s.GetExecution(ctx, id); err != nil {
+			t.Fatalf("%s purged: %v", id, err)
+		}
+	}
+}
+
 // Review of T6.3 (M1): a child of an active parent is kept from purge (its
 // parent may still have it compensated).
 func testPurgeKeepsChildrenOfActiveParents(t *testing.T, h Harness) {
