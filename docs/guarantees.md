@@ -102,7 +102,9 @@ advisory lock and applies the embedded goose migrations once (GW-7).
   meanwhile.
 - **Latency bounds under failure.**
   - A crashed engine's work resumes when its leases expire (`LeaseTTL`,
-    default 30 s), at the next poll (`PollMax`, default 1 s).
+    default 30 s), at the next poll (`PollMax`, default 1 s, and at most a
+    third of `LeaseTTL`: idle engines poll at least that often, since
+    nothing announces a lease running out).
   - Work that arrives without a notification (for example behind a
     transaction-mode pooler) can be found up to `PollMax` late. Delayed work
     is claimed when it falls due: each claim also asks the store when the

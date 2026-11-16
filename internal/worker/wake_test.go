@@ -77,7 +77,7 @@ func TestDelayedWorkIsNotPollMaxLate(t *testing.T) {
 			})
 			// PollMin = PollMax: every timed poll is pollMax apart.
 			w, err := worker.New(st, reg, reg, worker.Options{
-				Owner: "w1", Queues: []string{q}, Eager: true, LeaseTTL: 5 * time.Second,
+				Owner: "w1", Queues: []string{q}, Eager: true, LeaseTTL: 10 * time.Second, // PollMax <= LeaseTTL/3
 				PollMin: pollMax, PollMax: pollMax,
 			})
 			if err != nil {
@@ -121,7 +121,7 @@ func TestTimedPollsFindingWorkDoNotBackOff(t *testing.T) {
 	reg := newRegistry()
 	reg.addWorkflow("noop", func(coro.Context, []byte) ([]byte, error) { return nil, nil })
 	w, err := worker.New(st, reg, reg, worker.Options{
-		Owner: "w1", Queues: []string{q}, LeaseTTL: 5 * time.Second,
+		Owner: "w1", Queues: []string{q}, LeaseTTL: 10 * time.Second, // PollMax <= LeaseTTL/3
 		PollMin: 10 * time.Millisecond, PollMax: 3 * time.Second,
 	})
 	if err != nil {
@@ -176,7 +176,7 @@ func TestDueTimesDoNotCauseEmptyClaims(t *testing.T) {
 		return nil, nil
 	})
 	w, err := worker.New(st, reg, reg, worker.Options{
-		Owner: "w1", Queues: []string{q}, LeaseTTL: 5 * time.Second,
+		Owner: "w1", Queues: []string{q}, LeaseTTL: 10 * time.Second, // PollMax <= LeaseTTL/3
 		PollMin: 2 * time.Second, PollMax: 2 * time.Second,
 	})
 	if err != nil {

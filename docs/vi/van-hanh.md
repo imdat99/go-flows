@@ -80,7 +80,7 @@ defer engine.Stop(shutdownCtx)
 | --- | --- | --- |
 | `LeaseTTL` | 30s | Engine đã chết giữ việc của nó bao lâu. Lease được gia hạn mỗi một phần ba thời gian này. Ngắn hơn: khôi phục nhanh hơn, gia hạn nhiều hơn. |
 | `MaxWorkflowTasks`, `MaxActivities` | 64, 64 | Mức đồng thời của mỗi engine. |
-| `PollMax` | 1s | Khoảng poll dài nhất khi rảnh. Notification và thời điểm đến hạn cục bộ đánh thức poller sớm hơn. |
+| `PollMax` | 1s | Khoảng poll dài nhất khi rảnh, tối đa `LeaseTTL`/3 (khôi phục việc của engine đã crash). Notification và thời điểm đến hạn đánh thức poller sớm hơn. |
 | `StickyFor`, `CacheSize`, `CacheBytes` | 10s, 1000, 256 MiB | Giữ execution đã replay trong bộ nhớ, cùng với task kế tiếp của nó trên engine này. `CacheSize: -1` tắt cache (task nào cũng replay). `CacheBytes` giới hạn bộ nhớ ước tính của cache (vài KiB cho mỗi execution và mỗi coroutine còn sống, cộng payload đã mã hoá trong lịch sử của nó); vượt giới hạn nào thì evict execution dùng lâu nhất trước. `CacheBytes: -1` chỉ giới hạn theo số lượng. |
 | `DisableEager` | false | Chạy mọi activity qua queue thay vì chạy ngay trong engine đã lên lịch nó. |
 | `ListenDSN` | (pool) | Connection string cho kết nối `LISTEN` của engine (một kết nối), cho pool đứng sau PgBouncer ở transaction mode. |

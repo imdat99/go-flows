@@ -46,7 +46,7 @@ func TestDelayedWorkOfAnotherWorkerIsOnTime(t *testing.T) {
 	register := func(isB bool) *registry { return delayedRegistry(isB, delay, gate, mark) }
 	newWorker := func(owner string, reg *registry, pollMin, pollMax time.Duration) *worker.Worker {
 		w, err := worker.New(st, reg, reg, worker.Options{
-			Owner: owner, Queues: []string{q}, Eager: true, LeaseTTL: 5 * time.Second,
+			Owner: owner, Queues: []string{q}, Eager: true, LeaseTTL: 10 * time.Second, // PollMax <= LeaseTTL/3
 			PollMin: pollMin, PollMax: pollMax,
 		})
 		if err != nil {
@@ -159,7 +159,7 @@ func TestRunningActivitiesAreNotDue(t *testing.T) {
 	time.Sleep(500 * time.Millisecond) // B runs all five (heartbeats every ~330 ms)
 	st := &countActClaims{Store: pg.New(pool)}
 	a, err := worker.New(st, reg, reg, worker.Options{
-		Owner: "a", Queues: []string{q}, LeaseTTL: 5 * time.Second,
+		Owner: "a", Queues: []string{q}, LeaseTTL: 10 * time.Second, // PollMax <= LeaseTTL/3
 		PollMin: 3 * time.Second, PollMax: 3 * time.Second,
 	})
 	if err != nil {
@@ -324,7 +324,7 @@ func TestKeptExecutionsAreNotDue(t *testing.T) {
 		return released && next < 100*time.Millisecond
 	}
 	a, err := worker.New(st, reg, reg, worker.Options{
-		Owner: "a", Queues: []string{q}, LeaseTTL: 5 * time.Second,
+		Owner: "a", Queues: []string{q}, LeaseTTL: 10 * time.Second, // PollMax <= LeaseTTL/3
 		PollMin: 3 * time.Second, PollMax: 3 * time.Second, Logger: testLogger(t, "a"),
 	})
 	if err != nil {

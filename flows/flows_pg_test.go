@@ -449,7 +449,7 @@ func TestListenDSN(t *testing.T) {
 		Host: net.JoinHostPort(cc.Host, strconv.Itoa(int(cc.Port))), Path: "/" + cc.Database,
 		RawQuery: "application_name=flows-listen-test&sslmode=disable",
 	}).String()
-	e, err := flows.New(pool, flows.Options{InstanceID: "listen", ListenDSN: dsn, PollMax: time.Minute})
+	e, err := flows.New(pool, flows.Options{InstanceID: "listen", ListenDSN: dsn, PollMax: time.Minute, LeaseTTL: 3 * time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}

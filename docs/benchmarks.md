@@ -115,7 +115,11 @@ polls then, so a backed-off poller does not run it up to `PollMax` late
   idle engines claim once and learn the due time. A timer committed by a
   running engine is not announced: the execution is sticky to that engine,
   which knows the due time. Only recovery after a lost lease is still found
-  by a timed poll, so up to `PollMax` late. A timer of an execution sticky
+  by a timed poll (T10.1): nothing announces a lease running out, and while
+  it was renewed no claim could report it, so `PollMax` is capped at a third
+  of `LeaseTTL` (the renewal interval). An idle engine thus polls at least
+  that often, and a crashed engine's work resumes within about 4/3
+  `LeaseTTL` (`TestCrashedEngineWorkIsRecoveredWithinLeaseTTL`). A timer of an execution sticky
   to another engine may wake idle engines once, for an empty claim; kept
   leases (eager execution) are not due times. The `ready_at` lookup reads
   at most 64 index rows per queue: a queue with more kept executions due

@@ -102,7 +102,8 @@ như thể đã giữ lock suốt.
 - **Giới hạn độ trễ khi có sự cố.**
   - Việc của engine đã crash chạy tiếp khi lease của nó hết hạn
     (`LeaseTTL`, mặc định 30 s), ở lần poll kế tiếp (`PollMax`, mặc định
-    1 s).
+    1 s, và tối đa một phần ba `LeaseTTL`: engine rảnh poll ít nhất chừng
+    ấy, vì không có gì báo lease hết hạn).
   - Việc đến mà không có notification (ví dụ sau một pooler ở transaction
     mode) có thể bị tìm thấy muộn tới `PollMax`. Việc có delay được nhận
     đúng lúc đến hạn: mỗi lần claim cũng hỏi store khi nào việc kế tiếp của

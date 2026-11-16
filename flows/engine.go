@@ -50,8 +50,9 @@ type Options struct {
 	// of every payload, compensation data and error in the history
 	// replayed so far (encoded sizes, not the decoded values' heap size).
 	CacheBytes int64
-	// PollMax bounds the idle polling interval (default 1s; Postgres
-	// notifications wake pollers earlier).
+	// PollMax bounds the idle polling interval (default 1s, at most
+	// LeaseTTL/3 so that a crashed engine's work resumes within about
+	// LeaseTTL; Postgres notifications wake pollers earlier).
 	PollMax time.Duration
 	// EagerWindow is how long an execution waits for its eager activities
 	// before letting signals and timers in (default 200ms).

@@ -82,7 +82,8 @@ type Options struct {
 	// MaxWorkflowTasks and MaxActivities bound concurrency.
 	MaxWorkflowTasks int
 	MaxActivities    int
-	// PollMin and PollMax bound the idle polling backoff.
+	// PollMin and PollMax bound the idle polling backoff. PollMax is at
+	// most LeaseTTL/3 (recovery of a crashed engine's leases, T10.1).
 	PollMin, PollMax time.Duration
 	// HandBack delays the next claim of an execution this worker cannot
 	// run (unknown workflow version, executor stuck).
@@ -164,6 +165,13 @@ func (o *Options) defaults() {
 	if o.PollMax <= 0 {
 		o.PollMax = time.Second
 	}
+	// Recovery (T10.1): nothing announces the leases of a crashed engine
+	// running out, and while its leases were renewed no claim could report
+	// them due. Idle pollers poll at least as often as leases are renewed,
+	// so the work of a crashed engine with the same LeaseTTL resumes within
+	// about 4/3 of it, whatever PollMax.
+	o.PollMax = min(o.PollMax, max(o.LeaseTTL/3, time.Millisecond))
+	o.PollMin = min(o.PollMin, o.PollMax)
 	if o.HandBack <= 0 {
 		o.HandBack = 5 * time.Second
 	}
