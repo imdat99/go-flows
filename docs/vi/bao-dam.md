@@ -98,9 +98,13 @@ như thể đã giữ lock suốt.
   - Việc của engine đã crash chạy tiếp khi lease của nó hết hạn
     (`LeaseTTL`, mặc định 30 s), ở lần poll kế tiếp (`PollMax`, mặc định
     1 s).
-  - Việc có delay do engine khác commit có thể bị tìm thấy muộn tới
-    `PollMax`. Việc đến mà không có notification cũng vậy, ví dụ sau một
-    pooler ở transaction mode.
+  - Việc đến mà không có notification (ví dụ sau một pooler ở transaction
+    mode) có thể bị tìm thấy muộn tới `PollMax`. Việc có delay được nhận
+    đúng lúc đến hạn: mỗi lần claim cũng hỏi store khi nào việc kế tiếp của
+    các queue đến hạn; hand-back, retry delay và các execution mà một engine
+    nhả ra khi `Stop` đều được báo cho các engine khác. Timer ở lại với
+    engine đã commit nó khi engine đó còn chạy; nếu engine đó crash, việc
+    của nó chờ khôi phục như trên.
 - **Tính tất định của code bạn sửa.** Đổi chuỗi lời gọi của một version
   workflow đã deploy sẽ park các execution đang chạy của nó. Hãy deploy thay
   đổi thành version mới.

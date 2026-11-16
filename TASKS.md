@@ -446,10 +446,29 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
 
 Các mục được rút ra từ phần "Còn mở" của T8.x, xếp theo thứ tự làm. Mỗi task đi theo đúng quy trình: test trước, cài đặt, test (race, lint, bench nếu chạm đường nóng), review độc lập, rồi mới tick và commit.
 
-- [ ] **T9.1** ⚡ Poll theo thời điểm đến hạn. Poller hỏi store thời điểm sớm nhất mà việc của các queue trở nên claim được:
-    - `min(ready_at)` của execution và `min(visible_at)` của activity task, gộp vào câu claim để không tốn thêm round trip;
-    - poller ngủ tới đúng thời điểm đó.
-    Việc do engine khác commit, hand-back và việc ngoài horizon không còn trễ tới `PollMax`. Test: timer do engine B commit được engine A (đang rảnh, `PollMax` lớn) chạy đúng hạn.
+- [x] **T9.1** ⚡ Poll theo thời điểm đến hạn: poller biết thời điểm sớm nhất mà việc của các queue trở nên claim được.
+    - **Store:**
+      - interface tuỳ chọn `store.DueClaimer` (`ClaimWorkflowTasksDue`/`ClaimActivityTasksDue`): claim trả kèm thời gian còn lại tới lần đến hạn kế tiếp, tính theo giờ của store;
+      - pg chạy câu due trong cùng round trip với claim (pipeline ở fast path, batch ở đường pgx);
+      - migration `00009` thêm 2 index một phần: `not_before` (hand-back) và `activity_task_delayed_idx` (task không có lease);
+      - câu `ready_at` đọc tối đa 64 dòng mỗi queue và bỏ các execution đang có lease (lease giữ lại là việc của owner; lease hết hạn là việc của khôi phục). Không index `locked_until`, vì cột này đổi ở mọi lần gia hạn lease nên mỗi lần gia hạn sẽ không còn là HOT update.
+    - **Báo cho engine khác:** hand-back có delay, retry delay, và các execution được nhả lúc `Stop` (`Unstick`) đều gửi notification. Timer do engine đang chạy commit thì không: execution đó sticky với chính engine ấy, vốn đã biết thời điểm đến hạn. Thử báo cho mọi timer thì engine commit tự claim rỗng thêm mỗi timer.
+    - **Worker:** đưa thời điểm đến hạn của store vào `dueTimes`. Chỉ hỏi sau một lần claim không đầy.
+    - **Test:**
+      - `TestDelayedWorkOfAnotherWorkerIsOnTime`: A rảnh trước khi engine khác commit timer, retry và hand-back. Đỏ khoảng 1.8 s so với giới hạn 1.5 s.
+      - `TestRunningActivitiesAreNotDue`: đỏ 7 claim, xanh ≤ 3.
+      - `TestKeptExecutionsAreNotDue`: đỏ 8/8 claim báo due, xanh 0.
+      - Conformance `DueClaims` (mem và pg).
+      - `TestDueStatementsReadFewRows`: đỏ 20015 dòng khi thiếu index.
+    - **Bench:** ActivityRun 76 alloc (trước 75), các rule đều đạt.
+    - **Review:**
+      - Lần 1 không đạt: engine đã rảnh từ trước vẫn trễ `PollMax` vì commit việc có delay không gửi notification; hạn lease của activity đang chạy bị tính là đến hạn; câu due bị lập kế hoạch lại mỗi lần và vẫn chạy khi claim đầy.
+      - Lần 2 không đạt: hạn của lease giữ lại (eager) bị tính là đến hạn, số claim tăng 60%.
+      - Lần 3 đạt.
+    - **Còn mở (thấp):**
+      - việc của engine đã crash chờ lần poll theo giờ (`PollMax`);
+      - queue có hơn 64 execution giữ lease đến hạn trước timer đầu tiên thì quay về poll theo giờ;
+      - timer của execution sticky với engine khác có thể làm engine rảnh claim rỗng một lần.
 - [ ] **T9.2** Child được tạo trong đúng task mà cha kết thúc: không bỏ âm thầm nữa. Completion kết thúc mà còn child đang được tạo thì bị từ chối (`ErrInvalidCompletion`) như với activity, hoặc báo lỗi rõ cho workflow. Test ở mức engine.
 - [ ] **T9.3** Đếm stuck trong DB. Execution lưu `last_seq` của lần kẹt gần nhất (migration mới). Lần kẹt thứ hai ở cùng `last_seq`, trên bất kỳ engine nào, sẽ park. Test với 2 engine.
 - [ ] **T9.4** Giữ lock khi activity đang chờ queue hoặc chờ retry:

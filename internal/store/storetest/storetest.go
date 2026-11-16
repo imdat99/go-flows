@@ -90,6 +90,7 @@ func Run(t *testing.T, h Harness) {
 		{"ActivityQueuesAndLimit", testActivityQueuesAndLimit},
 		{"DefensiveCopies", testDefensiveCopies},
 		{"ClaimsWithRepeatedQueues", testClaimsWithRepeatedQueues},
+		{"DueClaims", testDueClaims},
 		{"TimesComeFromTheStoreClock", testStoreClock},
 		{"GW3_SignalsRacingTerminalCompletion", testSignalsRacingTerminal},
 		{"ParkedExecutionCannotKeepItsLease", testParkedCannotKeep},

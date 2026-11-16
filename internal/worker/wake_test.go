@@ -156,6 +156,11 @@ func (c *countClaims) ClaimWorkflowTasks(ctx context.Context, owner string, queu
 	return c.Store.ClaimWorkflowTasks(ctx, owner, queues, n, ttl)
 }
 
+func (c *countClaims) ClaimWorkflowTasksDue(ctx context.Context, owner string, queues []string, n int, ttl time.Duration) ([]store.WorkflowTask, time.Duration, error) {
+	c.n.Add(1)
+	return c.Store.ClaimWorkflowTasksDue(ctx, owner, queues, n, ttl)
+}
+
 // A due time cuts a long sleep short without claiming before it is due:
 // a workflow sleeping k times costs about one claim per wake-up.
 func TestDueTimesDoNotCauseEmptyClaims(t *testing.T) {

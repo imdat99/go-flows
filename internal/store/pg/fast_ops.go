@@ -40,6 +40,8 @@ var (
 	nClaimWorkflow   = stmtName(claimWorkflow)
 	nInsertExecution = stmtName(insertExecution)
 	nClaimActivities = stmtName(claimActivities)
+	nNextWorkflowDue = stmtName(nextWorkflowDue)
+	nNextActivityDue = stmtName(nextActivityDue)
 )
 
 // stmt starts and ends one statement of a fast batch.
@@ -505,10 +507,10 @@ func decodePending(v [][]byte) (store.PendingEvent, error) {
 
 // claimFast is ClaimWorkflowTasks on the fast path: claimWorkflow, its
 // pending event arrays decoded by hand (pgx planned a scan per array).
-func (s *Store) claimFast(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.WorkflowTask, error) {
+func (s *Store) claimFast(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration, due bool) ([]store.WorkflowTask, time.Duration, error) {
 	pc, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer pc.Release()
 	fb := s.getFastBatch(ctx, pc.Conn())
@@ -519,8 +521,17 @@ func (s *Store) claimFast(ctx context.Context, owner string, queues []string, li
 		fb.Int(int64(limit))
 		fb.Int(micros(ttl))
 	})
+	if due {
+		fb.stmt(nextWorkflowDue, nNextWorkflowDue, func() {
+			fb.Strs(len(queues), func(i int) string { return queues[i] })
+		})
+	}
 	var tasks []store.WorkflowTask
-	err = fb.exec(func(_ int, v [][]byte) error {
+	var next time.Duration
+	err = fb.exec(func(i int, v [][]byte) error {
+		if i == 1 {
+			return decodeDue(v, &next)
+		}
 		if len(v) != 17+claimedArrays {
 			return fmt.Errorf("%w: %d claim columns", errBadValue, len(v))
 		}
@@ -536,7 +547,7 @@ func (s *Store) claimFast(ctx context.Context, owner string, queues []string, li
 		tasks = append(tasks, t)
 		return nil
 	})
-	return tasks, err
+	return tasks, next, err
 }
 
 // claimedArrays is the number of pending event arrays of a claimed
@@ -649,10 +660,10 @@ func intern(b []byte) string {
 
 // claimActivitiesFast is ClaimActivityTasks on the fast path (pollers
 // claim often, mostly nothing: this keeps an empty claim cheap).
-func (s *Store) claimActivitiesFast(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.ActivityTask, error) {
+func (s *Store) claimActivitiesFast(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration, due bool) ([]store.ActivityTask, time.Duration, error) {
 	pc, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer pc.Release()
 	fb := s.getFastBatch(ctx, pc.Conn())
@@ -663,8 +674,17 @@ func (s *Store) claimActivitiesFast(ctx context.Context, owner string, queues []
 		fb.Int(int64(limit))
 		fb.Int(micros(ttl))
 	})
+	if due {
+		fb.stmt(nextActivityDue, nNextActivityDue, func() {
+			fb.Strs(len(queues), func(i int) string { return queues[i] })
+		})
+	}
 	var out []store.ActivityTask
-	err = fb.exec(func(_ int, v [][]byte) error {
+	var next time.Duration
+	err = fb.exec(func(i int, v [][]byte) error {
+		if i == 1 {
+			return decodeDue(v, &next)
+		}
 		if len(v) != 12 {
 			return fmt.Errorf("%w: %d activity task columns", errBadValue, len(v))
 		}
@@ -687,5 +707,18 @@ func (s *Store) claimActivitiesFast(ctx context.Context, owner string, queues []
 		out = append(out, t)
 		return nil
 	})
-	return out, err
+	return out, next, err
+}
+
+// decodeDue decodes a next*Due row (microseconds; NULL: none, 0).
+func decodeDue(v [][]byte, next *time.Duration) error {
+	if len(v) != 1 {
+		return fmt.Errorf("%w: %d due columns", errBadValue, len(v))
+	}
+	if v[0] == nil {
+		return nil
+	}
+	us, err := decodeInt(v[0])
+	*next = time.Duration(us) * time.Microsecond
+	return err
 }

@@ -574,6 +574,16 @@ const (
 	ActivityWork
 )
 
+// DueClaimer is implemented by stores that report, with a claim, when the
+// next work of the queues becomes claimable (a future readiness: a timer, a
+// retry delay, a hand-back), in the store's time: a poller sleeps until
+// then instead of finding it at its next timed poll (T9.1). next <= 0: none
+// known (the timed polls still cover expired leases).
+type DueClaimer interface {
+	ClaimWorkflowTasksDue(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) (tasks []WorkflowTask, next time.Duration, err error)
+	ClaimActivityTasksDue(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) (tasks []ActivityTask, next time.Duration, err error)
+}
+
 // Watcher is implemented by stores that can push hints that work is ready
 // (Postgres LISTEN/NOTIFY), so pollers can sleep longer between polls.
 type Watcher interface {

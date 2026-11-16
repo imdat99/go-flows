@@ -585,3 +585,74 @@ func testPurgeKeepsChildrenOfActiveParents(t *testing.T, h Harness) {
 		t.Fatalf("child of an active parent purged: %v", err)
 	}
 }
+
+// T9.1: a DueClaimer reports when the next work of the queues becomes
+// claimable: a timer, a retry delay, a hand-back; nothing when none.
+func testDueClaims(t *testing.T, h Harness) {
+	s := h.New(t)
+	dc, ok := s.(store.DueClaimer)
+	if !ok {
+		t.Skip("store does not implement store.DueClaimer")
+	}
+	near := func(what string, got, want time.Duration) {
+		t.Helper()
+		if got <= 0 || got > want+want/2+50*time.Millisecond {
+			t.Fatalf("%s: next in %v, want about %v", what, got, want)
+		}
+	}
+	if _, next, err := dc.ClaimWorkflowTasksDue(ctx, owner, []string{queue}, 10, h.TTL); err != nil || next != 0 {
+		t.Fatalf("empty store: %v %v", next, err)
+	}
+	d := h.TTL // a delay the harness's clock can wait for
+	// A timer.
+	mustCreate(t, s, "timer")
+	task := claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{Timers: []history.Event{{ScheduleID: 1, At: task.Now.Add(d)}}})
+	tasks, next, err := dc.ClaimWorkflowTasksDue(ctx, owner, []string{queue, "other"}, 10, h.TTL)
+	if err != nil || len(tasks) != 0 {
+		t.Fatalf("claimed %v %v", tasks, err)
+	}
+	near("timer", next, d)
+	// A hand-back, sooner.
+	mustCreate(t, s, "handed")
+	task = claimOne(t, s, owner, h.TTL)
+	if err := s.ReleaseWorkflowTask(ctx, task.Lease, d/2); err != nil {
+		t.Fatal(err)
+	}
+	_, next, err = dc.ClaimWorkflowTasksDue(ctx, owner, []string{queue}, 10, h.TTL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	near("hand-back", next, d/2)
+	// Another queue's work is not reported.
+	if _, next, err := dc.ClaimWorkflowTasksDue(ctx, owner, []string{"other"}, 10, h.TTL); err != nil || next != 0 {
+		t.Fatalf("other queue: %v %v", next, err)
+	}
+	// An activity retry delay.
+	mustCreate(t, s, "retry")
+	task = claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{Activities: []store.NewActivityTask{{ScheduleID: 1, Name: "a", Queue: queue}}})
+	acts, _, err := dc.ClaimActivityTasksDue(ctx, owner, []string{queue}, 10, h.TTL)
+	if err != nil || len(acts) != 1 {
+		t.Fatalf("activity claim: %v %v", acts, err)
+	}
+	if err := s.RetryActivityTask(ctx, acts[0].Lease, d/4, false); err != nil {
+		t.Fatal(err)
+	}
+	_, next, err = dc.ClaimActivityTasksDue(ctx, owner, []string{queue}, 10, h.TTL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	near("retry delay", next, d/4)
+	// A running (leased) activity task is not due: its visible_at is its
+	// lease expiry, recovery's business.
+	mustCreate(t, s, "running")
+	task = claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{Activities: []store.NewActivityTask{{ScheduleID: 1, Name: "a", Queue: "leased"}}})
+	if acts, _, err := dc.ClaimActivityTasksDue(ctx, owner, []string{"leased"}, 10, h.TTL); err != nil || len(acts) != 1 {
+		t.Fatalf("claim leased: %v %v", acts, err)
+	}
+	if _, next, err := dc.ClaimActivityTasksDue(ctx, owner, []string{"leased"}, 10, h.TTL); err != nil || next != 0 {
+		t.Fatalf("a running task reported due in %v (%v)", next, err)
+	}
+}

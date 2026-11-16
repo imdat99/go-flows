@@ -144,3 +144,62 @@ func TestGW8_ClaimsReadOnlyWhatTheyClaim(t *testing.T) {
 		}
 	}
 }
+
+// T9.1: the statements telling pollers when the next work falls due read a
+// bounded number of rows per queue from their indexes, however many
+// executions wait (rows the scans returned and rows their filters removed
+// both count): a row or so, and at most 64 index rows for the ready_at
+// lookup (it skips leased executions after the index).
+func TestDueStatementsReadFewRows(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		// Half ready later (timers), half handed back for a while.
+		`INSERT INTO flows.execution (instance_id, workflow, version, queue, status, ready_at, not_before)
+		 SELECT 'i' || g, 'w', 1, 'q', 'running',
+		        CASE WHEN g % 2 = 0 THEN now() + interval '1 hour' ELSE now() - interval '1 second' END,
+		        CASE WHEN g % 2 = 1 THEN now() + interval '1 minute' END
+		 FROM generate_series(1, 20000) g`,
+		`INSERT INTO flows.activity_task (execution_id, instance_id, schedule_id, name, queue, visible_at)
+		 SELECT id, instance_id, 1, 'a', 'q', now() + interval '1 hour' FROM flows.execution`,
+		`ANALYZE`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	numRe := regexp.MustCompile(`(?:actual time=[0-9.]+\.\.[0-9.]+ rows=|Rows Removed by Filter: )([0-9]+)`)
+	for _, c := range []struct{ name, sql string }{
+		{"next workflow due", nextWorkflowDue},
+		{"next activity due", nextActivityDue},
+	} {
+		rows, err := pool.Query(ctx, "EXPLAIN (ANALYZE) "+c.sql, []string{"q"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var plan strings.Builder
+		read := 0
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				t.Fatal(err)
+			}
+			plan.WriteString(line + "\n")
+			for _, m := range numRe.FindAllStringSubmatch(line, -1) {
+				v, _ := strconv.Atoi(m[1])
+				read += v
+			}
+		}
+		rows.Close()
+		if read > 300 {
+			t.Errorf("%s reads %d rows:\n%s", c.name, read, plan.String())
+		}
+		var us *int64
+		if err := pool.QueryRow(ctx, c.sql, []string{"q"}).Scan(&us); err != nil || us == nil || *us <= 0 {
+			t.Errorf("%s: %v %v", c.name, us, err)
+		}
+	}
+}

@@ -414,26 +414,105 @@ const pendingColumnsP = `p.type, p.schedule_id, p.attempt, p.name, p.version, p.
 
 // ClaimWorkflowTasks implements store.Store.
 func (s *Store) ClaimWorkflowTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.WorkflowTask, error) {
+	tasks, _, err := s.claimWorkflowTasks(ctx, owner, queues, limit, ttl, false)
+	return tasks, err
+}
+
+// ClaimWorkflowTasksDue implements store.DueClaimer: the claim and
+// nextWorkflowDue in one round trip.
+func (s *Store) ClaimWorkflowTasksDue(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.WorkflowTask, time.Duration, error) {
+	return s.claimWorkflowTasks(ctx, owner, queues, limit, ttl, true)
+}
+
+func (s *Store) claimWorkflowTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration, due bool) ([]store.WorkflowTask, time.Duration, error) {
 	var tasks []store.WorkflowTask
+	var next time.Duration
 	err := retry(ctx, func() error {
-		tasks = tasks[:0]
+		tasks, next = tasks[:0], 0
 		if s.fast {
 			var err error
-			tasks, err = s.claimFast(ctx, owner, queues, limit, ttl)
+			tasks, next, err = s.claimFast(ctx, owner, queues, limit, ttl, due)
 			return err
 		}
-		rows, err := s.pool.Query(ctx, claimWorkflow, queues, owner, limit, micros(ttl))
+		if !due {
+			rows, err := s.pool.Query(ctx, claimWorkflow, queues, owner, limit, micros(ttl))
+			if err != nil {
+				return err
+			}
+			tasks, err = readClaimed(rows, owner)
+			return err
+		}
+		b := &pgx.Batch{}
+		b.Queue(claimWorkflow, queues, owner, limit, micros(ttl))
+		b.Queue(nextWorkflowDue, queues)
+		br := s.pool.SendBatch(ctx, b)
+		defer br.Close()
+		rows, err := br.Query()
 		if err != nil {
 			return err
 		}
-		tasks, err = readClaimed(rows, owner)
-		return err
+		if tasks, err = readClaimed(rows, owner); err != nil {
+			return err
+		}
+		if next, err = readDue(br); err != nil {
+			return err
+		}
+		return br.Close()
 	})
 	if err != nil {
-		return nil, fmt.Errorf("claim workflow tasks: %w", err)
+		return nil, 0, fmt.Errorf("claim workflow tasks: %w", err)
 	}
-	return tasks, nil
+	return tasks, next, nil
 }
+
+// readDue reads a next*Due result (microseconds; NULL: none).
+func readDue(br pgx.BatchResults) (time.Duration, error) {
+	var us *int64
+	if err := br.QueryRow().Scan(&us); err != nil || us == nil {
+		return 0, err
+	}
+	return time.Duration(*us) * time.Microsecond, nil
+}
+
+// nextWorkflowDue is, in microseconds from now, the earliest future time
+// at which an active execution of the queues $1 becomes ready (ready_at: a
+// timer, a retry, an event delivered for later) or is no longer held back
+// (not_before: a hand-back); NULL when none. Index lookups per queue
+// (execution_ready_idx, execution_not_before_idx). Leases that expire are
+// not covered: recovery waits for a timed poll.
+const nextWorkflowDue = `
+	SELECT (extract(epoch FROM min(least(r.t, n.t)) - now()) * 1000000)::bigint
+	FROM unnest($1::text[]) AS q(name)
+	LEFT JOIN LATERAL (
+		-- Leased executions are left out: a kept lease's ready_at is its
+		-- expiry (recovery's, not a due time). Filtering them through the
+		-- index would need locked_until in it, making every lease renewal
+		-- a non-HOT update: the first 64 rows are read instead (a queue
+		-- with more kept executions due before its first timer falls back
+		-- to the timed poll).
+		SELECT min(x.ready_at) FROM (
+			SELECT ready_at, locked_until FROM flows.execution
+			WHERE queue = q.name AND status IN ('running', 'compensating') AND ready_at > now()
+			ORDER BY ready_at LIMIT 64
+		) AS x WHERE x.locked_until IS NULL
+	) AS r(t) ON true
+	LEFT JOIN LATERAL (
+		SELECT not_before FROM flows.execution
+		WHERE queue = q.name AND not_before IS NOT NULL AND status IN ('running', 'compensating')
+		  AND not_before > now()
+		ORDER BY not_before LIMIT 1
+	) AS n(t) ON true`
+
+// nextActivityDue is nextWorkflowDue for activity tasks: the earliest
+// future visible_at of the unleased tasks of the queues $1 (retry delays;
+// a running task's visible_at is its lease expiry, which is recovery's).
+const nextActivityDue = `
+	SELECT (extract(epoch FROM min(d.t) - now()) * 1000000)::bigint
+	FROM unnest($1::text[]) AS q(name), LATERAL (
+		SELECT visible_at FROM flows.activity_task
+		WHERE queue = q.name AND locked_until IS NULL AND visible_at > now()
+		ORDER BY visible_at LIMIT 1
+	) AS d(t)`
 
 // claimedEvents receives the pending event arrays of a claimed execution
 // (pendingAggs: id, then eventColumns).
@@ -600,7 +679,7 @@ const releaseWorkflow = `
 	    ready_at = (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
 	    not_before = CASE WHEN $2::bigint > 0 THEN now() + $2::bigint * interval '1 microsecond' END
 	WHERE id = $1
-	RETURNING CASE WHEN $2::bigint = 0 AND ready_at <= now() THEN ` + notifyW + "queue)" + ` END`
+	RETURNING CASE WHEN ready_at IS NOT NULL THEN ` + notifyW + "queue)" + ` END -- held back: announced too (T9.1)`
 
 // resumeExtend extends a kept lease, but only when less than half of ttl
 // is left: in the eager loop the lease was just set by the completion, and
@@ -1260,34 +1339,63 @@ const claimActivities = `
 
 // ClaimActivityTasks implements store.Store.
 func (s *Store) ClaimActivityTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.ActivityTask, error) {
+	out, _, err := s.claimActivityTasks(ctx, owner, queues, limit, ttl, false)
+	return out, err
+}
+
+// ClaimActivityTasksDue implements store.DueClaimer.
+func (s *Store) ClaimActivityTasksDue(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.ActivityTask, time.Duration, error) {
+	return s.claimActivityTasks(ctx, owner, queues, limit, ttl, true)
+}
+
+func (s *Store) claimActivityTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration, due bool) ([]store.ActivityTask, time.Duration, error) {
 	var out []store.ActivityTask
+	var next time.Duration
 	err := retry(ctx, func() error {
-		out = out[:0]
+		out, next = out[:0], 0
 		if s.fast {
 			var err error
-			out, err = s.claimActivitiesFast(ctx, owner, queues, limit, ttl)
+			out, next, err = s.claimActivitiesFast(ctx, owner, queues, limit, ttl, due)
 			return err
 		}
-		rows, err := s.pool.Query(ctx, claimActivities, queues, owner, limit, micros(ttl))
+		// The claim and, when asked, nextActivityDue in one batch (one
+		// implicit transaction, one round trip), as the fast path does.
+		b := &pgx.Batch{}
+		b.Queue(claimActivities, queues, owner, limit, micros(ttl))
+		if due {
+			b.Queue(nextActivityDue, queues)
+		}
+		br := s.pool.SendBatch(ctx, b)
+		defer br.Close()
+		rows, err := br.Query()
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
 		for rows.Next() {
 			var t store.ActivityTask
 			if err := rows.Scan(&t.Lease.ID, &t.Lease.Version, &t.ExecutionID, &t.InstanceID, &t.ScheduleID,
 				&t.Name, &t.Queue, &t.Input, &t.Compensate, &t.Attempt, &t.CancelRequested, &t.Uncertain); err != nil {
+				rows.Close()
 				return err
 			}
 			t.Lease.Owner = owner
 			out = append(out, t)
 		}
-		return rows.Err()
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if due {
+			if next, err = readDue(br); err != nil {
+				return err
+			}
+		}
+		return br.Close()
 	})
 	if err != nil {
-		return nil, fmt.Errorf("claim activity tasks: %w", err)
+		return nil, 0, fmt.Errorf("claim activity tasks: %w", err)
 	}
-	return out, nil
+	return out, next, nil
 }
 
 // ExtendActivityTask implements store.Store.
@@ -1313,7 +1421,7 @@ func (s *Store) RetryActivityTask(ctx context.Context, l store.Lease, delay time
 		SET owner_id = '', locked_until = NULL, visible_at = now() + $4::bigint * interval '1 microsecond',
 		    uncertain = uncertain OR ($5 AND NOT compensate)
 		WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''
-		RETURNING CASE WHEN $4::bigint <= 0 THEN `+notifyA+`queue) END`,
+		RETURNING `+notifyA+`queue) -- a retry delay is announced too (T9.1)`,
 		l.ID, l.Owner, l.Version, micros(delay), uncertain)
 	if err != nil {
 		return fmt.Errorf("retry activity task: %w", err)
@@ -1442,6 +1550,12 @@ const workChannel = "flows_work"
 
 // notifyW and notifyA start a pg_notify of a workflow or activity hint;
 // the caller appends the queue expression and the closing parenthesis.
+// Work made ready later for other engines is announced too: a hand-back, a
+// retry delay, and the executions an engine stops holding (Unstick, at
+// Stop: their timers). The claim an idle engine makes on the hint tells it
+// when the work falls due (store.DueClaimer, T9.1). A timer committed by a
+// running engine is not: the execution is sticky to it, which knows the
+// due time (its worker's own due times).
 const (
 	notifyW = "pg_notify('" + workChannel + "', 'w' || "
 	notifyA = "pg_notify('" + workChannel + "', 'a' || "

@@ -97,9 +97,13 @@ advisory lock and applies the embedded goose migrations once (GW-7).
 - **Latency bounds under failure.**
   - A crashed engine's work resumes when its leases expire (`LeaseTTL`,
     default 30 s), at the next poll (`PollMax`, default 1 s).
-  - Delayed work that another engine committed can be found up to `PollMax`
-    late. So can work that arrives without notifications, for example
-    behind a transaction-mode pooler.
+  - Work that arrives without a notification (for example behind a
+    transaction-mode pooler) can be found up to `PollMax` late. Delayed work
+    is claimed when it falls due: each claim also asks the store when the
+    next work of its queues does, and hand-backs, retry delays and the
+    executions an engine releases at `Stop` are announced to the others. A
+    timer stays with the engine that committed it while that engine runs;
+    if it crashes, its work waits for the recovery above.
 - **Determinism of code you change.** Changing a deployed workflow version's
   sequence of calls parks its running executions. Deploy changes as a new
   version.

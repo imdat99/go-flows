@@ -105,10 +105,21 @@ polls then, so a backed-off poller does not run it up to `PollMax` late
   (LISTEN down) is not found at `PollMax` intervals either. A watcher that
   starts (or restarts) listening wakes every queue once: work made ready
   before it listened got no hint.
-- **Still found by a timed poll**, so at most `PollMax` late: delays beyond
-  the horizon, delayed work committed by another worker, hand-backs (work
-  this worker cannot run, or gave back after a store error), and recovery
-  after a lost lease.
+- **The store's due times (T9.1).** Each claim also returns, in the same
+  round trip, when the next work of the queues becomes claimable: a future
+  `ready_at` (timers, retries), a `not_before` (hand-backs), an activity
+  task's future `visible_at` (retry delays), whichever engine committed it.
+  These are index lookups, a row or so per queue
+  (`TestDueStatementsReadFewRows`). Hand-backs, retry delays and the
+  executions an engine releases at `Stop` are announced (a notification), so
+  idle engines claim once and learn the due time. A timer committed by a
+  running engine is not announced: the execution is sticky to that engine,
+  which knows the due time. Only recovery after a lost lease is still found
+  by a timed poll, so up to `PollMax` late. A timer of an execution sticky
+  to another engine may wake idle engines once, for an empty claim; kept
+  leases (eager execution) are not due times. The `ready_at` lookup reads
+  at most 64 index rows per queue: a queue with more kept executions due
+  before its first timer falls back to the timed poll.
 
 Runs that take 0.5 to 1.7 s instead of ~0.15 s appear now and then on the
 development machine. A trace of store calls showed every statement of

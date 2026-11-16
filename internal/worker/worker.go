@@ -496,20 +496,43 @@ func (w *Worker) poll(ctx context.Context, slots, hint chan struct{}, due *dueTi
 }
 
 func (w *Worker) pollWorkflows(ctx context.Context) {
+	dc, _ := w.st.(store.DueClaimer)
+	// A full claim ignores due times (storeDue), so the claim after one
+	// does not ask: if that one comes back partial, the due times are
+	// learned at the next claim, PollMin later at most.
+	wantDue := true
 	w.poll(ctx, w.wfSlots, w.wfHint, w.wfDue, func(n int) (int, error) {
 		at := time.Now()
-		tasks, err := w.st.ClaimWorkflowTasks(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
+		var tasks []store.WorkflowTask
+		var next time.Duration
+		var err error
+		if dc != nil && wantDue {
+			tasks, next, err = dc.ClaimWorkflowTasksDue(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
+		} else {
+			tasks, err = w.st.ClaimWorkflowTasks(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
+		}
 		for i := range tasks {
 			w.runTask(wfJob{pollCtx: ctx, task: tasks[i], at: at})
 		}
+		storeDue(w.wfDue, next, len(tasks), n, err)
+		wantDue = len(tasks) < n
 		return len(tasks), err
 	})
 }
 
 func (w *Worker) pollActivities(ctx context.Context) {
+	dc, _ := w.st.(store.DueClaimer)
+	wantDue := true // as in pollWorkflows
 	w.poll(ctx, w.actSlots, w.actHint, w.actDue, func(n int) (int, error) {
 		at := time.Now()
-		tasks, err := w.st.ClaimActivityTasks(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
+		var tasks []store.ActivityTask
+		var next time.Duration
+		var err error
+		if dc != nil && wantDue {
+			tasks, next, err = dc.ClaimActivityTasksDue(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
+		} else {
+			tasks, err = w.st.ClaimActivityTasks(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
+		}
 		for i := range tasks {
 			t := tasks[i]
 			w.tasks.Go(func() {
@@ -517,6 +540,8 @@ func (w *Worker) pollActivities(ctx context.Context) {
 				w.runPolledActivity(ctx, &t, at)
 			})
 		}
+		storeDue(w.actDue, next, len(tasks), n, err)
+		wantDue = len(tasks) < n
 		return len(tasks), err
 	})
 }
@@ -606,4 +631,14 @@ func (w *Worker) task1(job *wfJob) {
 	defer release(w.wfSlots, 1)
 	w.runWorkflowTask(job.pollCtx, &job.task, job.at)
 	*job = wfJob{} // the runner keeps no reference while idle
+}
+
+// storeDue adds the time at which, per the store (store.DueClaimer), the
+// next work of the queues becomes claimable, after a claim that left slots
+// free: delayed work committed by other workers is then claimed when due,
+// not up to PollMax late (T9.1).
+func storeDue(due *dueTimes, next time.Duration, claimed, n int, err error) {
+	if err == nil && next > 0 && claimed < n {
+		due.add(time.Now().Add(next)) // measured after the claim: never early
+	}
 }

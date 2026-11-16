@@ -264,9 +264,15 @@ func (s *Store) ReopenParked(ctx context.Context, instanceID string) error {
 // Unstick implements store.Store.
 func (s *Store) Unstick(ctx context.Context, owner string) error {
 	err := retry(ctx, func() error {
+		// Their queues are notified: the others learn when their work
+		// (timers this owner knew of) falls due (T9.1).
 		_, err := s.pool.Exec(ctx, `
-			UPDATE flows.execution SET sticky_owner = '', sticky_until = NULL
-			WHERE sticky_owner = $1 AND sticky_until > now()`, owner)
+			WITH u AS (
+				UPDATE flows.execution SET sticky_owner = '', sticky_until = NULL
+				WHERE sticky_owner = $1 AND sticky_until > now()
+				RETURNING queue
+			)
+			SELECT `+notifyW+`queue) FROM (SELECT DISTINCT queue FROM u) AS d`, owner)
 		return err
 	})
 	if err != nil {

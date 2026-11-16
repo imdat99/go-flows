@@ -641,7 +641,7 @@ func (s *Store) ReleaseWorkflowTask(_ context.Context, l store.Lease, delay time
 	e.lockedUntil, e.lease.Owner = time.Time{}, ""
 	e.stickyOwner, e.stickyUntil = "", time.Time{}
 	e.notBefore = now.Add(delay)
-	if delay <= 0 && len(e.visiblePending(now)) > 0 {
+	if len(e.pending) > 0 { // now or after the delay: announced (T9.1)
 		s.hint(store.WorkflowWork, e.Queue)
 	}
 	return nil
@@ -761,9 +761,7 @@ func (s *Store) RetryActivityTask(_ context.Context, l store.Lease, delay time.D
 	}
 	t.Lease.Owner, t.lockedUntil, t.visibleAt = "", time.Time{}, now.Add(delay)
 	t.Uncertain = t.Uncertain || uncertain && !t.Compensate
-	if delay <= 0 {
-		s.hint(store.ActivityWork, t.Queue)
-	}
+	s.hint(store.ActivityWork, t.Queue) // a delayed retry is announced too (T9.1)
 	return nil
 }
 
@@ -837,6 +835,7 @@ func (s *Store) Unstick(_ context.Context, owner string) error {
 	for _, e := range s.executions {
 		if e.stickyOwner == owner && e.stickyUntil.After(now) {
 			e.stickyOwner, e.stickyUntil = "", time.Time{}
+			s.hint(store.WorkflowWork, e.Queue) // as Postgres: the others learn its due time (T9.1)
 		}
 	}
 	return nil
@@ -1070,4 +1069,64 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 	e.lockedUntil, e.stickyOwner, e.stickyUntil = time.Time{}, "", time.Time{}
 	s.end(e, &store.Completion{Status: store.StatusTerminated, Err: reason}, now)
 	return nil
+}
+
+// ClaimWorkflowTasksDue implements store.DueClaimer.
+func (s *Store) ClaimWorkflowTasksDue(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.WorkflowTask, time.Duration, error) {
+	tasks, err := s.ClaimWorkflowTasks(ctx, owner, queues, limit, ttl)
+	if err != nil {
+		return nil, 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.clock.Now()
+	var next time.Time
+	earlier := func(t time.Time) {
+		if t.After(now) && (next.IsZero() || t.Before(next)) {
+			next = t
+		}
+	}
+	for _, e := range s.executions {
+		if !claimable(e.Status) || !contains(queues, e.Queue) {
+			continue
+		}
+		earlier(e.notBefore)
+		// As Postgres' ready_at: the earliest pending event, if none is
+		// visible now (then the execution is ready, not due later), of an
+		// execution without a lease (a kept lease is its owner's).
+		if at, ok := e.readyAt(now); e.lockedUntil.IsZero() && (!ok || at.After(now)) {
+			for _, p := range e.pending {
+				earlier(p.visibleAt)
+			}
+		}
+	}
+	return tasks, until(next, now), nil
+}
+
+// ClaimActivityTasksDue implements store.DueClaimer.
+func (s *Store) ClaimActivityTasksDue(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.ActivityTask, time.Duration, error) {
+	tasks, err := s.ClaimActivityTasks(ctx, owner, queues, limit, ttl)
+	if err != nil {
+		return nil, 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.clock.Now()
+	var next time.Time
+	for _, t := range s.tasks {
+		// Unleased tasks waiting for a retry delay (a leased task's
+		// expiry is recovery's, as in Postgres).
+		if contains(queues, t.Queue) && t.Lease.Owner == "" && t.visibleAt.After(now) && (next.IsZero() || t.visibleAt.Before(next)) {
+			next = t.visibleAt
+		}
+	}
+	return tasks, until(next, now), nil
+}
+
+// until is the duration from now to next (0: none).
+func until(next, now time.Time) time.Duration {
+	if next.IsZero() {
+		return 0
+	}
+	return next.Sub(now)
 }
