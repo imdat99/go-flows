@@ -560,3 +560,67 @@ func TestRootStartedBeforeRunIsChecked(t *testing.T) {
 		}
 	}
 }
+
+// T10.11 review 3: each ended execution is reported exactly once, at the
+// first Run whose tree contains it.
+
+// A Run does not lose the dropped-at-the-end report of another root,
+// started before it, that is Run later.
+func TestDroppedReportKeptForALaterRun(t *testing.T) {
+	inner := &recordingTB{TB: t}
+	tst := flowtest.New(inner)
+	flowtest.OnActivity(tst, fetch, slowFast)
+	for _, id := range []string{"px", "py"} {
+		if _, err := dropsAtTheEnd.Start(context.Background(), tst.Engine(), id, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tst.Advance(0)
+	for _, id := range []string{"px", "py"} {
+		if v, err := flowtest.Run(tst, dropsAtTheEnd, id, 0); err != nil || v != 1 {
+			t.Fatalf("%s: %d %v", id, v, err)
+		}
+	}
+	msgs := inner.messages()
+	for _, want := range []string{"px ended", "py ended"} {
+		if n := strings.Count(msgs, want); n != 1 {
+			t.Errorf("%q reported %d times: %q", want, n, msgs)
+		}
+	}
+}
+
+// Run twice on the same instance reports it once.
+func TestRunTwiceReportsOnce(t *testing.T) {
+	inner := &recordingTB{TB: t}
+	tst := flowtest.New(inner)
+	flowtest.OnActivity(tst, fetch, slowFast)
+	for range 2 {
+		if v, err := flowtest.Run(tst, forgetful, "twice", 0); err != nil || v != 1 {
+			t.Fatalf("%d %v", v, err)
+		}
+	}
+	if n := strings.Count(inner.messages(), "twice ended"); n != 1 {
+		t.Fatalf("reported %d times: %q", n, inner.messages())
+	}
+}
+
+// Run on the instance id of a child checks that child.
+func TestRunOnAChildChecksIt(t *testing.T) {
+	inner := &recordingTB{TB: t}
+	tst := flowtest.New(inner)
+	flowtest.OnActivity(tst, fetch, slowFast)
+	if _, err := parentOfForgetful.Start(context.Background(), tst.Engine(), "pof", 0); err != nil {
+		t.Fatal(err)
+	}
+	tst.Advance(0)
+	if v, err := flowtest.Run(tst, forgetful, "forgetful-kid", 0); err != nil || v != 1 {
+		t.Fatalf("%d %v", v, err)
+	}
+	msgs := inner.messages()
+	if !strings.Contains(msgs, "forgetful-kid ended") {
+		t.Fatalf("the child was not checked: %q", msgs)
+	}
+	if strings.Contains(msgs, "drops-kid") {
+		t.Fatalf("a sibling outside the tree was checked: %q", msgs)
+	}
+}

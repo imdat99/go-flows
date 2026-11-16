@@ -147,7 +147,7 @@ func TestDroppedHookPanicIsRecovered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.SetDroppedHook(func(string, int, int) { panic("hook") })
+	w.SetDroppedHook(func(string, int64, int, int) { panic("hook") })
 	if err := w.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}

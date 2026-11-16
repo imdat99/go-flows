@@ -205,7 +205,7 @@ type Worker struct {
 	wfJobs chan wfJob
 	// droppedHook, if set (SetDroppedHook), is told what an ending workflow
 	// did not start (flowtest).
-	droppedHook func(instanceID string, activities, children int)
+	droppedHook func(instanceID string, executionID int64, activities, children int)
 	// exOpts are the options of every executor (built once: its method
 	// values would be allocated per execution).
 	exOpts    executor.Options
@@ -235,11 +235,11 @@ type Worker struct {
 	started  bool
 }
 
-// SetDroppedHook sets a function told, when a workflow ends, of the
-// activities and children it started in its last task without awaiting
-// them, which were not started (they are also logged). Its panics are
-// recovered and logged. Call before Start.
-func (w *Worker) SetDroppedHook(f func(instanceID string, activities, children int)) {
+// SetDroppedHook sets a function told, when an execution of a workflow
+// ends, of the activities and children it started in its last task without
+// awaiting them, which were not started (they are also logged). Its panics
+// are recovered and logged. Call before Start.
+func (w *Worker) SetDroppedHook(f func(instanceID string, executionID int64, activities, children int)) {
 	w.droppedHook = f
 }
 

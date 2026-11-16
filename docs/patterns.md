@@ -251,11 +251,14 @@ func TestBook(t *testing.T) {
 - **Blocked workflows.** A workflow that can never end fails with
   `flowtest.ErrBlocked`.
 - **Pending futures.** Activities and children started and never awaited
-  fail the test, unless you pass `AllowPendingFutures`. Every ended
-  execution is checked: those of the workflow's current continue-as-new
-  chain (even if you started it before `Run`) and those of its
-  descendants. A descendant still running when `Run` returns (a child
-  detached by continue-as-new) is not checked, then or later.
+  fail the test, unless you pass `AllowPendingFutures`. The rule: each
+  ended execution is reported exactly once, at the first `Run` whose tree
+  contains it. The tree of `Run(id)` is every execution of instance `id`
+  (whatever its parent, all executions of its continue-as-new chains, even
+  started before `Run`) plus every execution whose parent is in the tree.
+  Only ended executions are checked: one still running when `Run` returns
+  (a child detached by continue-as-new) waits for a later `Run` whose tree
+  contains it, if any.
 - **Activities take no virtual time.** Virtual time does not move while an
   activity runs. An activity that waits for the cancel a workflow timer
   would send never sees that timer fire, and `Run` fails with
