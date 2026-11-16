@@ -224,11 +224,32 @@ func (e *LockHeldError) Unwrap() error { return ErrLockHeld }
 // Lock asks for the business lock key for ttl (see store.Completion.Locks):
 // nil once held, a *LockHeldError when another execution holds it. Not
 // cancelable: the store answers in the checkpoint that records it.
-func (st *State) Lock(ctx coro.Context, key string, ttl time.Duration) error {
+//
+// With wait > 0 the request waits (store.LockRequest.Wait, T9.8): a timer
+// of wait named store.LockWaitTimer(key) is issued with it (one
+// checkpoint: the store queues a refused request together with its timer,
+// and a waiter whose timer is gone, canceled, has no turn). Granted, the
+// timer is canceled; refused, Lock returns the *LockHeldError once the
+// timer fired (early when the store wakes the waiter whose turn it is), or
+// ctx's error when ctx ends first.
+func (st *State) Lock(ctx coro.Context, key string, ttl, wait time.Duration) error {
 	p := strconv.AppendInt(nil, ttl.Microseconds(), 10)
-	c := &lockCall{cmd: command.Command{Kind: command.Lock, Name: key, Payload: p, ArgHash: history.HashArgs(p)}}
+	c := &lockCall{cmd: command.Command{Kind: command.Lock, Name: key, Payload: p, ArgHash: history.HashArgs(p), Wait: wait}}
 	st.issue(c)
+	if wait <= 0 {
+		_, err := c.f.Get(ctx)
+		return err
+	}
+	tctx, cancel := coro.WithCancel(ctx)
+	defer cancel() // the timer, unless it fired
+	timer := st.NewTimer(tctx, wait, store.LockWaitTimer(key))
 	_, err := c.f.Get(ctx)
+	if err == nil || !errors.Is(err, ErrLockHeld) {
+		return err
+	}
+	if _, terr := timer.Get(ctx); terr != nil {
+		return terr
+	}
 	return err
 }
 

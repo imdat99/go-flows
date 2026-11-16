@@ -31,7 +31,7 @@ func TestLockAnswerComesWithTheCompletion(t *testing.T) {
 	reg := newRegistry()
 	reg.addWorkflow("locks", func(ctx coro.Context, _ []byte) ([]byte, error) {
 		for _, k := range []string{"a", "b", "c"} {
-			if err := executor.FromContext(ctx).Lock(ctx, k, time.Minute); err != nil {
+			if err := executor.FromContext(ctx).Lock(ctx, k, time.Minute, 0); err != nil {
 				return nil, err
 			}
 		}

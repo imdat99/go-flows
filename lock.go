@@ -1,6 +1,7 @@
 package flows
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -32,10 +33,19 @@ type LockOption func(*lockConfig)
 
 type lockConfig struct{ wait RetryPolicy }
 
-// LockWait makes Lock wait for a busy lock instead of failing: the workflow
-// sleeps (a durable timer, at least 10ms) and asks again after each delay
-// of p, until p is exhausted. Each attempt adds a few events to the
-// history: for very long waits, prefer a policy with growing delays.
+// LockWait makes Lock wait for a busy lock instead of failing: the request
+// is queued, and the workflow sleeps (a durable timer, at least 10ms) and
+// asks again after each delay of p, until p is exhausted. Waiters are
+// served in the order they asked: when the holder releases the lock (it
+// ends), the first waiter still waiting (not parked) is woken at once (its
+// timer fires), and for one ttl the free lock is its only (others asking
+// are refused, even those already waiting for the release). A waiter that
+// leaves without it (its context canceled, its policy run out, ended) or a
+// lock lapsing wakes nobody: the next waiter asks at its own next attempt,
+// and the free lock is anyone's meanwhile (a lapsed lock nobody took is
+// still released, waking the first waiter, when its holder ends). Each
+// attempt adds a few events to the history (a timer, canceled when the
+// lock is granted): for very long waits, prefer growing delays.
 func LockWait(p RetryPolicy) LockOption { return func(c *lockConfig) { c.wait = p } }
 
 // Lock takes the business lock key for the rest of the execution: it is
@@ -55,7 +65,8 @@ func LockWait(p RetryPolicy) LockOption { return func(c *lockConfig) { c.wait = 
 // compensating execution that loses a lock still completes its
 // compensation.
 //
-// Locks are polled, not queued: waiters are not served in order. Two
+// Waiters with LockWait are served in the order they asked (see
+// LockWait); a Lock without it is refused while a waiter's turn lasts. Two
 // executions taking two locks in opposite orders with LockWait each lose
 // the first lock once they wait longer than its ttl. Take locks in a fixed
 // order.
@@ -75,11 +86,14 @@ func Lock(c Ctx, key string, ttl time.Duration, opts ...LockOption) error {
 		o(&cfg)
 	}
 	for attempt := int32(1); ; attempt++ {
-		err := st.Lock(c.c, key, ttl)
-		if err == nil || int(attempt) >= cfg.wait.Attempts {
-			return err
+		// Queued unless it is the last attempt: waiters are served in order
+		// (T9.8), and a release wakes the next one's timer at once.
+		var delay time.Duration
+		if int(attempt) < cfg.wait.Attempts {
+			delay = max(cfg.wait.Delay(attempt+1), minLockWait)
 		}
-		if err := Sleep(c, max(cfg.wait.Delay(attempt+1), minLockWait)); err != nil {
+		err := st.Lock(c.c, key, ttl, delay) // waits out delay when refused
+		if err == nil || delay == 0 || !errors.Is(err, ErrLockHeld) {
 			return err
 		}
 	}

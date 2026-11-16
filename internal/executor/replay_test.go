@@ -260,10 +260,10 @@ func TestMayCompensate(t *testing.T) {
 func TestLockReplay(t *testing.T) {
 	wf := executor.Workflow{Name: "wf", Version: 1, Run: func(ctx coro.Context, _ []byte) ([]byte, error) {
 		st := executor.FromContext(ctx)
-		if err := st.Lock(ctx, "a", time.Second); err != nil {
+		if err := st.Lock(ctx, "a", time.Second, 0); err != nil {
 			return nil, err
 		}
-		err := st.Lock(ctx, "b", time.Second)
+		err := st.Lock(ctx, "b", time.Second, 0)
 		var held *executor.LockHeldError
 		if !errors.As(err, &held) || held.Holder != "other" || !errors.Is(err, executor.ErrLockHeld) {
 			return nil, errors.New("unexpected answer")

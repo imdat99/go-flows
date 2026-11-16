@@ -123,6 +123,10 @@ type Command struct {
 	Payload []byte    // encoded input (or the side effect value)
 	ArgHash uint64    // history.HashArgs(Payload) for activities and children
 	At      time.Time // timer deadline: task start (database time) + duration
+	// Wait, for a lock, queues the request with its next attempt in Wait
+	// (store.LockRequest.Wait); 0 does not wait. Not recorded: replay
+	// never sends a request again.
+	Wait time.Duration
 }
 
 func (c *Command) transition(to State) error {

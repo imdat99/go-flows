@@ -425,7 +425,10 @@ func sideTables(c *store.Completion, ev *history.Event, cmd *command.Command) {
 		c.CanceledActivities = append(c.CanceledActivities, cmd.ID)
 	case history.LockRequested:
 		us, _ := strconv.ParseInt(string(ev.Payload), 10, 64) // written by State.Lock
-		c.Locks = append(c.Locks, store.LockRequest{ScheduleID: cmd.ID, Key: cmd.Name, TTL: time.Duration(us) * time.Microsecond})
+		c.Locks = append(c.Locks, store.LockRequest{
+			ScheduleID: cmd.ID, Key: cmd.Name, TTL: time.Duration(us) * time.Microsecond,
+			Wait: cmd.Wait > 0, WaitRetry: cmd.Wait,
+		})
 	}
 }
 

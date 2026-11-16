@@ -3,11 +3,14 @@ package flows
 import (
 	"context"
 	"errors"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/imdat99/go-flows/internal/store/mem"
+	"github.com/imdat99/go-flows/internal/testdb"
 )
 
 type lockIn struct {
@@ -279,3 +282,175 @@ func TestEagerKeepsToItsQueues(t *testing.T) {
 		t.Fatalf("ran %d times on an engine without its queue", n)
 	}
 }
+
+type fifoIn struct {
+	ID   string `json:"id"`
+	Hold bool   `json:"hold"`
+}
+
+var (
+	fifoMu    sync.Mutex
+	fifoOrder []string
+	fifoTake  = DefineActivity("test.lock.fifo.take", func(_ context.Context, _ Key, id string) (int, int, error) {
+		fifoMu.Lock()
+		fifoOrder = append(fifoOrder, id)
+		fifoMu.Unlock()
+		return 0, 0, nil
+	}, nil)
+	// fifoWF takes "fifo" waiting with hour-long delays: only a wake on
+	// release gets it the lock within the test.
+	fifoWF = DefineWorkflow("test.lock.fifo", 1, func(c Ctx, in fifoIn) (int, error) {
+		if err := Lock(c, "fifo", time.Minute, LockWait(RetryPolicy{Attempts: 10, Initial: time.Hour})); err != nil {
+			return 0, err
+		}
+		if _, err := fifoTake.Run(c, in.ID); err != nil {
+			return 0, err
+		}
+		if in.Hold {
+			if _, err := Await[int](c, "go", time.Hour); err != nil {
+				return 0, err
+			}
+		}
+		return 0, nil
+	})
+)
+
+// T9.8: waiters get the lock in the order they asked, as soon as it is
+// released (not at their next attempt, an hour later), on both stores.
+func TestLockWaitersAreServedInOrder(t *testing.T) {
+	t.Run("mem", func(t *testing.T) { testLockWaitersInOrder(t, testEngine(t)) })
+	t.Run("pg", func(t *testing.T) {
+		pool := testdb.New(t)
+		if err := Migrate(bg, pool); err != nil {
+			t.Fatal(err)
+		}
+		e, err := New(pool, Options{InstanceID: "fifo", PollMax: 50 * time.Millisecond, LeaseTTL: 2 * time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Start(bg); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+			defer cancel()
+			_ = e.Stop(ctx)
+		})
+		testLockWaitersInOrder(t, e)
+	})
+}
+
+func testLockWaitersInOrder(t *testing.T, e *Engine) {
+	t.Helper()
+	fifoMu.Lock()
+	fifoOrder = nil
+	fifoMu.Unlock()
+	if _, err := fifoWF.Start(bg, e, "fifo-0", fifoIn{ID: "fifo-0", Hold: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return historyHas(e, "fifo-0", "LockAcquired") })
+	var hs []*Handle[int]
+	for _, id := range []string{"fifo-1", "fifo-2", "fifo-3", "fifo-4"} {
+		h, err := fifoWF.Start(bg, e, id, fifoIn{ID: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		hs = append(hs, h)
+		waitFor(t, func() bool { return historyHas(e, id, "TimerScheduled") }) // queued, sleeping
+	}
+	if err := e.Signal(bg, "fifo-0", "go", 1); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range hs {
+		if _, err := h.Wait(waitCtx(t)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fifoMu.Lock()
+	defer fifoMu.Unlock()
+	if want := []string{"fifo-0", "fifo-1", "fifo-2", "fifo-3", "fifo-4"}; !slices.Equal(fifoOrder, want) {
+		t.Fatalf("order %v, want %v", fifoOrder, want)
+	}
+}
+
+type cancelWaitIn struct {
+	Mode string `json:"mode"`
+}
+
+// From the T9.8 review: a waiter that stops waiting (its context canceled)
+// must not keep a free lock from others for its whole retry delay.
+var cancelWaitWF = DefineWorkflow("test.lock.cancel-wait", 1, func(c Ctx, in cancelWaitIn) (int, error) {
+	switch in.Mode {
+	case "hold":
+		if err := Lock(c, "cw", time.Minute); err != nil {
+			return 0, err
+		}
+		_, err := Await[int](c, "go", time.Hour)
+		return 0, err
+	case "giveup":
+		lc, cancel := WithCancel(c)
+		Go(lc, func(lc Ctx) {
+			_ = Lock(lc, "cw", time.Minute, LockWait(RetryPolicy{Attempts: 10, Initial: time.Hour}))
+		})
+		if err := Sleep(c, 200*time.Millisecond); err != nil {
+			return 0, err
+		}
+		cancel() // gives up waiting; goes on with other work
+		_, err := Await[int](c, "done", time.Hour)
+		return 0, err
+	default:
+		return 0, Lock(c, "cw", time.Minute)
+	}
+})
+
+func TestCanceledWaiterLeavesTheQueue(t *testing.T) {
+	e := testEngine(t)
+	if _, err := cancelWaitWF.Start(bg, e, "h", cancelWaitIn{Mode: "hold"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return historyHas(e, "h", "LockAcquired") })
+	if _, err := cancelWaitWF.Start(bg, e, "w", cancelWaitIn{Mode: "giveup"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return historyHas(e, "w", "TimerCanceled") })
+	if err := e.Signal(bg, "h", "go", 1); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return historyHas(e, "h", "ExecutionCompleted") })
+	h, err := cancelWaitWF.Start(bg, e, "c2", cancelWaitIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Wait(waitCtx(t)); err != nil {
+		t.Fatalf("free lock refused: %v", err)
+	}
+}
+
+// From the T9.8 second review: a woken waiter whose last attempt comes
+// (LockWait with 2 attempts) gets the lock, another waiter behind it.
+func TestWokenWaiterLastAttempt(t *testing.T) {
+	e := testEngine(t)
+	if _, err := cancelWaitWF.Start(bg, e, "lh", cancelWaitIn{Mode: "hold"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return historyHas(e, "lh", "LockAcquired") })
+	w1, err := lastTwoWF.Start(bg, e, "lw1", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return historyHas(e, "lw1", "TimerScheduled") })
+	if _, err := lastTwoWF.Start(bg, e, "lw2", 10); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return historyHas(e, "lw2", "TimerScheduled") })
+	if err := e.Signal(bg, "lh", "go", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w1.Wait(waitCtx(t)); err != nil {
+		t.Fatalf("woken waiter on its last attempt: %v", err)
+	}
+}
+
+var lastTwoWF = DefineWorkflow("test.lock.last-two", 1, func(c Ctx, attempts int) (int, error) {
+	return 0, Lock(c, "cw", time.Minute, LockWait(RetryPolicy{Attempts: attempts, Initial: time.Hour}))
+})

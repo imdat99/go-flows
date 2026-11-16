@@ -190,6 +190,8 @@ execution (`ttl` được nâng lên ít nhất bằng `LeaseTTL` của engine):
   hoặc đã chết. Execution khác khi đó có thể lấy lock, và execution đầu lỗi
   `ErrLockLost` ở task kế tiếp.
 - **Chờ:** `flows.LockWait(policy)` chờ lock bận thay vì lỗi `ErrLockHeld`.
+  Bên chờ được xếp hàng và phục vụ theo thứ tự yêu cầu; khi lock được nhả,
+  bên kế tiếp được đánh thức ngay.
 
 ## Lease và fencing
 

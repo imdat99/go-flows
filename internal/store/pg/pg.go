@@ -376,7 +376,7 @@ var claimWorkflow = `
 		-- Lock rows are taken in key order: claims for the same execution
 		-- (an execution and its activities) do not deadlock.
 		UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
-		WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id = ANY(ARRAY(SELECT id FROM c))
+		WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id = ANY(ARRAY(SELECT id FROM c)) AND NOT reserved
 		                ORDER BY key FOR UPDATE)
 	)
 	, u AS (
@@ -845,12 +845,24 @@ const insertActivities = `
 	          CASE WHEN owner_id = '' THEN ` + notifyA + "queue)" + ` END`
 
 // acquireLock answers lock request $2 (schedule id $3, ttl $4 µs, hold $5
-// µs) of execution $1 with a pending LockAcquired or LockHeld; taking over an
+// µs, waiting $6 with its next attempt in $7 µs: store.LockRequest) of
+// execution $1 with a pending LockAcquired or LockHeld; taking over an
 // expired lock of another active execution delivers LockLost to it. The
 // conflict clause re-checks the row a concurrent request may have created.
-const acquireLock = `
+var acquireLock = `
 	WITH cur AS (
-		SELECT execution_id, sched, until, hold_us, until > now() AS live FROM flows.lock WHERE key = $2 FOR UPDATE
+		-- held_for: reserved for the waiter a release woke (T9.8), its turn
+		-- not over: active, still waiting (its lock-wait timer pending).
+		-- Read again, with the row, after waiting for a releasing
+		-- transaction: the turn is on this row.
+		SELECT k.execution_id, k.sched, k.until, k.ttl_us, k.hold_us, k.until > now() AS live, k.reserved,
+		       k.reserved AND k.until > now() AND EXISTS (
+		           SELECT 1 FROM flows.execution x
+		           WHERE x.id = k.execution_id AND x.status IN ('running', 'compensating')
+		             AND EXISTS (SELECT 1 FROM flows.pending_event p
+		                         WHERE p.execution_id = x.id AND p.type = ` + typeTimerFired + `
+		                           AND p.name = '` + store.LockWaitTimer("") + `' || $2)) AS held_for
+		FROM flows.lock k WHERE k.key = $2 FOR UPDATE OF k
 	), prev AS (
 		-- The expired holder's row, unless it runs: its row is locked (being
 		-- claimed or completed), its lease is live, or one of its activities
@@ -858,21 +870,25 @@ const acquireLock = `
 		-- does, up to hold_us past until, while one of its activities waits
 		-- (in its queue, for a retry, or for a new lease).
 		SELECT x.id, x.queue, x.locked_until, cur.sched FROM flows.execution x, cur
-		WHERE x.id = cur.execution_id AND cur.execution_id <> $1 AND NOT cur.live
+		WHERE x.id = cur.execution_id AND cur.execution_id <> $1 AND NOT cur.live AND NOT cur.reserved
 		  AND (x.locked_until IS NULL OR x.locked_until <= now())
 		  AND NOT EXISTS (SELECT 1 FROM flows.activity_task t
 		                  WHERE t.execution_id = x.id
 		                    AND (t.owner_id <> '' AND t.locked_until > now()
 		                         OR cur.until + cur.hold_us * interval '1 microsecond' > now()))
 		FOR NO KEY UPDATE OF x SKIP LOCKED
+	), avail AS (
+		-- Free, expired and takeable, a reservation over, or $1's own.
+		SELECT NOT EXISTS (SELECT 1 FROM cur WHERE execution_id <> $1 AND CASE WHEN reserved THEN held_for
+		                                                                  ELSE live OR NOT EXISTS (SELECT 1 FROM prev) END) AS ok
 	), take AS (
 		INSERT INTO flows.lock AS k (key, execution_id, sched, until, ttl_us, hold_us)
 		SELECT $2, $1, $3, now() + $4::bigint * interval '1 microsecond', $4, $5::bigint
-		WHERE NOT EXISTS (SELECT 1 FROM cur WHERE execution_id <> $1 AND (live OR NOT EXISTS (SELECT 1 FROM prev)))
+		WHERE (SELECT ok FROM avail)
 		ON CONFLICT (key) DO UPDATE
 		SET execution_id = excluded.execution_id, sched = excluded.sched, until = excluded.until,
-		    ttl_us = excluded.ttl_us, hold_us = excluded.hold_us
-		WHERE k.until <= now() OR k.execution_id = $1
+		    ttl_us = excluded.ttl_us, hold_us = excluded.hold_us, reserved = false
+		WHERE k.until <= now() OR k.execution_id = $1 OR k.reserved
 		RETURNING 1
 	), lost AS (
 		UPDATE flows.execution x SET ready_at = least(coalesce(x.ready_at, now()), now())
@@ -883,6 +899,19 @@ const acquireLock = `
 	), lost_event AS (
 		INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, name)
 		SELECT id, now(), ` + typeLockLost + `, sched, $2 FROM lost
+	), unqueue AS (
+		-- Served, or no longer waiting (a request without $6).
+		DELETE FROM flows.lock_waiter
+		WHERE key = $2 AND execution_id = $1 AND (EXISTS (SELECT 1 FROM take) OR NOT $6::boolean)
+	), enqueue AS (
+		-- Refused and waiting: queued, or its turn refreshed in its place
+		-- (to the back once it lapsed).
+		INSERT INTO flows.lock_waiter AS w (key, execution_id, expires_at)
+		SELECT $2, $1, now() + ($7::bigint + $4::bigint) * interval '1 microsecond'
+		WHERE $6::boolean AND NOT EXISTS (SELECT 1 FROM take)
+		ON CONFLICT (key, execution_id) DO UPDATE
+		SET expires_at = excluded.expires_at, woken_until = NULL, -- a turn is a release's, once
+		    id = CASE WHEN w.expires_at <= now() THEN nextval('flows.lock_waiter_id_seq') ELSE w.id END
 	)
 	INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, name, err)
 	SELECT $1, now(),
@@ -890,6 +919,98 @@ const acquireLock = `
 	       CASE WHEN EXISTS (SELECT 1 FROM take) THEN ''
 	            ELSE coalesce((SELECT e.instance_id FROM cur JOIN flows.execution e ON e.id = cur.execution_id),
 	                          'another execution') END`
+
+// waiterLive is the SQL condition that waiter row w has its turn: not
+// lapsed, and still sleeping on its lock-wait timer (fired or not; a wait
+// canceled or given up has none).
+func waiterLive(w string) string {
+	return w + `.expires_at > now() AND EXISTS (
+		SELECT 1 FROM flows.pending_event p
+		WHERE p.execution_id = ` + w + `.execution_id AND p.type = ` + typeTimerFired + `
+		  AND p.name = '` + store.LockWaitTimer("") + `' || ` + w + `.key)`
+}
+
+// waitersOf selects, for each lock held by execution id (an SQL
+// expression), the waiter whose turn it is: key, execution_id, ttl_us.
+func waitersOf(id string) string {
+	return `
+		SELECT DISTINCT ON (w.key) w.key, w.execution_id, k.ttl_us FROM flows.lock_waiter w
+		JOIN flows.lock k ON k.key = w.key AND k.execution_id = ` + id + ` AND NOT k.reserved
+		JOIN flows.execution x ON x.id = w.execution_id AND x.status IN ('running', 'compensating') -- not parked
+		WHERE ` + waiterLive("w") + ` AND w.execution_id <> ` + id + `
+		ORDER BY w.key, w.id`
+}
+
+// lockWaitersOf and wakeWaitersOf wake, for each lock held by execution id
+// (an SQL expression), its first live waiter (T9.8), before the locks are
+// dropped. lockWaitersOf locks the waiters' execution rows first, waiting
+// for a task of theirs in flight; wakeWaitersOf, a statement of its own
+// (it sees what those tasks committed: a timer just scheduled), fires
+// their lock-wait timers now, gives each its turn for the lock's TTL
+// (woken_until), and makes them ready. The rows of other executions are
+// locked after the ending one's task and children's rows (an exception to
+// lockParent's order): an ending execution holds no lock rows then, so
+// claims and acquireLock cannot close a cycle; two executions ending at
+// once, each the other's lock's waiter, can (Postgres detects it, retry
+// runs the batch again).
+func lockWaitersOf(id string) string {
+	return `
+	SELECT x.id FROM flows.execution x
+	WHERE x.id IN (SELECT execution_id FROM (` + waitersOf(id) + `) hd)
+	ORDER BY x.id
+	FOR NO KEY UPDATE`
+}
+
+func wakeWaitersOf(id string) string {
+	return `
+	WITH hd AS (` + waitersOf(id) + `
+	), turn AS (
+		-- Its turn: one TTL to come.
+		UPDATE flows.lock_waiter w
+		SET woken_until = now() + hd.ttl_us * interval '1 microsecond',
+		    expires_at = greatest(w.expires_at, now() + hd.ttl_us * interval '1 microsecond')
+		FROM hd WHERE w.key = hd.key AND w.execution_id = hd.execution_id
+	), fire AS (
+		UPDATE flows.pending_event p SET visible_at = now()
+		FROM hd
+		WHERE p.execution_id = hd.execution_id AND p.type = ` + typeTimerFired + `
+		  AND p.name = '` + store.LockWaitTimer("") + `' || hd.key AND p.visible_at > now()
+	), rdy AS (
+		-- Rows lockWaitersOf locked are this transaction's (not skipped);
+		-- a head that changed meanwhile is skipped when busy.
+		UPDATE flows.execution x SET ready_at = least(coalesce(x.ready_at, now()), now())
+		WHERE x.id IN (SELECT id FROM flows.execution WHERE id IN (SELECT execution_id FROM hd)
+		               FOR NO KEY UPDATE SKIP LOCKED)
+		RETURNING x.queue, x.locked_until
+	)
+	SELECT ` + notifyW + "queue) FROM rdy WHERE locked_until IS NULL OR locked_until <= now()"
+}
+
+// dropLocksOf releases the locks of execution id (an SQL expression) and
+// drops its waits: a lock whose waiter wakeWaitersOf just woke becomes that
+// waiter's reservation, until its turn ends; the others are deleted (a
+// reservation of id's own too: a woken waiter that leaves wakes nobody).
+func dropLocksOf(id string) string {
+	return `
+	WITH w AS (DELETE FROM flows.lock_waiter WHERE execution_id = ` + id + `
+	), r AS (
+		-- The waiter wakeWaitersOf woke in this transaction (now() is the
+		-- transaction's time): not one woken by an earlier release.
+		UPDATE flows.lock k
+		SET execution_id = w.execution_id, reserved = true, sched = 0, until = w.woken_until
+		FROM flows.lock_waiter w
+		WHERE k.execution_id = ` + id + ` AND NOT k.reserved AND w.key = k.key AND w.execution_id <> ` + id + `
+		  AND w.woken_until = now() + k.ttl_us * interval '1 microsecond'
+		RETURNING k.key
+	)
+	DELETE FROM flows.lock WHERE execution_id = ` + id + ` AND key NOT IN (SELECT key FROM r)`
+}
+
+var (
+	lockWaiters = lockWaitersOf("$1")
+	wakeWaiters = wakeWaitersOf("$1")
+	dropLocks   = dropLocksOf("$1")
+)
 
 // compensateChild reopens the completed child of execution $1 at schedule
 // id $2 for compensation, or answers $1 at once (store.Completion
@@ -1050,13 +1171,13 @@ const (
 	// dropEnded removes what an ended execution can no longer use: its
 	// pending events and its activity tasks, so their workers learn of the
 	// end at their next heartbeat (ErrLeaseLost) instead of running on.
-	// dropLocks, a statement of its own after it, releases its business
-	// locks: task rows before lock rows, as activity claims lock them (see
-	// lockParent for the whole order).
+	// dropLocks (dropLocksOf), a statement of its own after it, releases its
+	// business locks: task rows before lock rows, as activity claims lock
+	// them (see lockParent for the whole order).
 	dropEnded = `
 		WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = $1)
 		DELETE FROM flows.activity_task WHERE execution_id = $1`
-	dropLocks = `DELETE FROM flows.lock WHERE execution_id = $1`
+
 	// cancelChildrenOf asks the active children of an ended execution $1 to
 	// cancel (cancel by tree).
 	cancelChildrenOf = `
@@ -1274,7 +1395,7 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		queue(cancelActivities, l.ID, c.CanceledActivities)
 	}
 	for _, k := range sortedLocks(c.Locks) {
-		queue(acquireLock, l.ID, k.Key, k.ScheduleID, micros(k.TTL), micros(k.Hold))
+		queue(acquireLock, l.ID, k.Key, k.ScheduleID, micros(k.TTL), micros(k.Hold), k.Wait, micros(k.WaitRetry))
 	}
 	for _, sched := range c.CompensateChildren {
 		queue(compensateChild, l.ID, sched)
@@ -1302,6 +1423,8 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		queue(cancelChildrenOf, l.ID)
 	}
 	queue(dropEnded, l.ID)
+	queue(lockWaiters, l.ID)
+	queue(wakeWaiters, l.ID)
 	queue(dropLocks, l.ID)
 	if c.Status != store.StatusContinued {
 		ev := store.ChildOutcome(store.Execution{Status: c.Status, Output: c.Output, Err: c.Err, ErrKinds: c.ErrKinds})
@@ -1382,7 +1505,7 @@ const claimActivities = `
 		-- An execution's locks live while its activities run (store.Completion.Locks);
 		-- waits for a contender's lock row, as the workflow claim.
 		UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
-		WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id = ANY(ARRAY(SELECT execution_id FROM c))
+		WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id = ANY(ARRAY(SELECT execution_id FROM c)) AND NOT reserved
 		                ORDER BY key FOR UPDATE)
 	)
 	UPDATE flows.activity_task t

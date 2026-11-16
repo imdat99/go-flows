@@ -196,7 +196,8 @@ execution (`ttl` is raised to at least the engine's `LeaseTTL`):
   dead. Another execution may then take the lock, and the first one fails
   with `ErrLockLost` at its next task.
 - **Waiting:** `flows.LockWait(policy)` waits for a busy lock instead of
-  failing with `ErrLockHeld`.
+  failing with `ErrLockHeld`. Waiters are queued and served in the order
+  they asked; a release wakes the next one at once.
 
 ## Leases and fencing
 

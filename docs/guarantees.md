@@ -92,8 +92,14 @@ advisory lock and applies the embedded goose migrations once (GW-7).
 - **That a compensator has something to undo.** For an uncertain activity
   (`CompensationUncertain`), the compensation data may be the zero value.
 - **Ordering between instances.** Executions of different instances run
-  concurrently, in no particular order. Locks give mutual exclusion, not
-  queueing: waiters are not served in order.
+  concurrently, in no particular order. Locks are the exception: waiters
+  with `LockWait` are served in the order they asked, at each release: the
+  first waiter still waiting (not parked) is woken and, for one `ttl`, the
+  free lock is its only (others asking are refused, even if it died). A
+  lock lapsing, or
+  a woken waiter that leaves without the lock, wakes nobody: the next
+  waiter asks at its own next `LockWait` attempt, and the lock is anyone's
+  meanwhile.
 - **Latency bounds under failure.**
   - A crashed engine's work resumes when its leases expire (`LeaseTTL`,
     default 30 s), at the next poll (`PollMax`, default 1 s).

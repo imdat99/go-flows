@@ -32,6 +32,8 @@ var (
 	nCarrySignals    = stmtName(carrySignals)
 	nDropEnded       = stmtName(dropEnded)
 	nDropLocks       = stmtName(dropLocks)
+	nWakeWaiters     = stmtName(wakeWaiters)
+	nLockWaiters     = stmtName(lockWaiters)
 	nCancelChildOf   = stmtName(cancelChildrenOf)
 	nNotifyParent    = stmtName(notifyParent)
 	nWakeForTask     = stmtName(wakeForTask)
@@ -201,6 +203,8 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 			fb.Int(int64(k.ScheduleID))
 			fb.Int(micros(k.TTL))
 			fb.Int(micros(k.Hold))
+			fb.Bool(k.Wait)
+			fb.Int(micros(k.WaitRetry))
 		})
 	}
 	for _, sched := range c.CompensateChildren {
@@ -347,6 +351,8 @@ func (s *Store) endFast(fb *fastBatch, l store.Lease, c *store.Completion, endin
 		fb.stmt(cancelChildrenOf, nCancelChildOf, func() { fb.Int(l.ID) })
 	}
 	fb.stmt(dropEnded, nDropEnded, func() { fb.Int(l.ID) })
+	fb.stmt(lockWaiters, nLockWaiters, func() { fb.Int(l.ID) }) // T9.8, before the locks go
+	fb.stmt(wakeWaiters, nWakeWaiters, func() { fb.Int(l.ID) })
 	fb.stmt(dropLocks, nDropLocks, func() { fb.Int(l.ID) })
 	if c.Status != store.StatusContinued {
 		ev := store.ChildOutcome(store.Execution{Status: c.Status, Output: c.Output, Err: c.Err, ErrKinds: c.ErrKinds})

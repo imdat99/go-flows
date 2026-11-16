@@ -285,7 +285,24 @@ type LockRequest struct {
 	// after its worker died): it does not run, but the workflow is not
 	// idle. 0 lets the lock lapse after its TTL like an idle holder's.
 	Hold time.Duration
+	// Wait queues the request when the lock is not given (T9.8), in the
+	// order of the requests. Releasing a lock fires the lock-wait timer
+	// (LockWaitTimer) of its first waiter still waiting (its timer
+	// pending, not parked), whose turn it then is for the lock's TTL: while it lasts, a
+	// free lock is its only (others are refused, its instance id in Err).
+	// WaitRetry is how long until the waiter's next attempt (its timer);
+	// its place lapses once that attempt is overdue by TTL (a waiter dead).
+	// A lock that lapses, or a woken waiter that leaves without it, wakes
+	// nobody. A request without Wait leaves the queue.
+	Wait      bool
+	WaitRetry time.Duration
 }
+
+// LockWaitTimer is the name of the timer a waiter for lock key sleeps on
+// between attempts (LockRequest.Wait).
+func LockWaitTimer(key string) string { return lockWaitPrefix + key }
+
+const lockWaitPrefix = "flows.lock:"
 
 // NewActivityTask is an activity task to create.
 type NewActivityTask struct {

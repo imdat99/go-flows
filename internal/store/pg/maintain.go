@@ -36,7 +36,7 @@ const (
 			-- Business locks of running executions live as long as their
 			-- lease (SKIP LOCKED: never wait on a contender's lock row).
 			UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
-			WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id IN (SELECT id FROM renewed)
+			WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id IN (SELECT id FROM renewed) AND NOT reserved
 			                FOR UPDATE SKIP LOCKED)
 		)
 		SELECT id, true, false FROM renewed
@@ -60,7 +60,7 @@ const (
 		), locks AS (
 			-- An execution's locks live while its activities run.
 			UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
-			WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id IN (SELECT execution_id FROM renewed)
+			WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id IN (SELECT execution_id FROM renewed) AND NOT reserved
 			                FOR UPDATE SKIP LOCKED)
 		)
 		SELECT id, true, cancel_requested FROM renewed
@@ -305,6 +305,14 @@ func (s *Store) ReopenCompensation(ctx context.Context, instanceID string) error
 // instance id $1 (Terminate).
 var cancelChildrenOfLatest = strings.Replace(cancelChildrenOf, "x.parent_id = $1", "x.parent_id = "+latestOf, 1)
 
+// wakeWaitersLatest is wakeWaiters for the latest execution of instance id
+// $1 (Terminate).
+var (
+	lockWaitersLatest = lockWaitersOf(latestOf)
+	wakeWaitersLatest = wakeWaitersOf(latestOf)
+	dropLocksLatest   = dropLocksOf(latestOf)
+)
+
 // lockParentLatest is lockParent for the latest execution of instance id
 // $1 (Terminate).
 var lockParentLatest = strings.Replace(lockParent, "WHERE id = $1", "WHERE id = "+latestOf, 1)
@@ -342,7 +350,9 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 			b.Queue(cancelChildrenOfLatest, instanceID)
 			b.Queue(`WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = `+latestOf+`)
 				DELETE FROM flows.activity_task WHERE execution_id = `+latestOf, instanceID)
-			b.Queue(`DELETE FROM flows.lock WHERE execution_id = `+latestOf, instanceID)
+			b.Queue(lockWaitersLatest, instanceID) // T9.8, before the locks go
+			b.Queue(wakeWaitersLatest, instanceID)
+			b.Queue(dropLocksLatest, instanceID)
 			b.Queue(notifyTerminated, instanceID, ev.Err, ev.ErrKinds)
 			send := func(sb interface {
 				SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
@@ -357,7 +367,7 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) error 
 				if err := br.QueryRow().Scan(&id); err != nil {
 					return 0, err
 				}
-				for range 4 {
+				for range 6 {
 					if _, err := br.Exec(); err != nil {
 						return 0, err
 					}

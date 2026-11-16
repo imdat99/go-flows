@@ -116,6 +116,16 @@ func Run(t *testing.T, h Harness) {
 		{"LockHeldDuringActivity", testLockHeldDuringActivity},
 		{"LockKeptWhileActivityWaits", testLockKeptWhileActivityWaits},
 		{"LockAnswerInCompletion", testLockAnswerInCompletion},
+		{"LockWaitersFIFO", testLockWaitersFIFO},
+		{"LockWaiterExpires", testLockWaiterExpires},
+		{"LockWaiterEdges", testLockWaiterEdges},
+		{"LockWaiterLapsed", testLockWaiterLapsed},
+		{"LockWaiterLastAttempt", testLockWaiterLastAttempt},
+		{"LockWaiterHeadTerminated", testLockWaiterHeadTerminated},
+		{"LockWaiterRace", testLockWaiterRace},
+		{"LockWaiterStaleWoken", testLockWaiterStaleWoken},
+		{"LockWaiterTerminatedHolder", testLockWaiterTerminatedHolder},
+		{"LockWaiterParkedSkipped", testLockWaiterParkedSkipped},
 		{"ResumeParity", testResumeParity},
 		{"ResumeCompensating", testResumeCompensating},
 		{"ResumeParked", testResumeParked},
@@ -168,6 +178,9 @@ func claimOne(t *testing.T, s store.Store, who string, ttl time.Duration) store.
 	t.Helper()
 	tasks := claim(t, s, who, ttl)
 	if len(tasks) != 1 {
+		for _, x := range tasks {
+			t.Logf("claimed %s: %+v", x.Execution.InstanceID, x.Pending)
+		}
 		t.Fatalf("claimed %d tasks, want 1", len(tasks))
 	}
 	return tasks[0]

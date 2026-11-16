@@ -92,8 +92,13 @@ như thể đã giữ lock suốt.
 - **Compensator có gì để hoàn tác.** Với activity không chắc chắn
   (`CompensationUncertain`), dữ liệu compensation có thể là giá trị zero.
 - **Thứ tự giữa các instance.** Execution của các instance khác nhau chạy
-  đồng thời, không theo thứ tự nào. Lock cho loại trừ lẫn nhau, không xếp
-  hàng: bên chờ không được phục vụ theo thứ tự.
+  đồng thời, không theo thứ tự nào. Lock là ngoại lệ: bên chờ dùng
+  `LockWait` được phục vụ theo thứ tự yêu cầu, ở mỗi lần nhả lock: bên chờ
+  đầu tiên còn đang chờ (không bị park) được đánh thức, và trong một `ttl` lock rảnh chỉ
+  dành cho nó (bên khác bị từ chối, kể cả khi nó đã chết). Lock hết hạn
+  thay vì được nhả, hoặc bên chờ đã được đánh thức rời đi mà không lấy
+  lock, không đánh thức ai: bên chờ kế tiếp hỏi lại ở lần thử `LockWait`
+  của chính nó, và trong lúc đó ai cũng có thể lấy lock.
 - **Giới hạn độ trễ khi có sự cố.**
   - Việc của engine đã crash chạy tiếp khi lease của nó hết hạn
     (`LeaseTTL`, mặc định 30 s), ở lần poll kế tiếp (`PollMax`, mặc định

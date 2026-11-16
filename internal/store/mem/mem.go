@@ -61,6 +61,7 @@ type Store struct {
 	latest     map[string]int64 // instance id -> latest execution id
 	tasks      map[int64]*activityTask
 	locks      map[string]*lockRow // business locks by key
+	waiters    map[string][]waiter // lock waiters by key, first come first
 	hook       func(ctx context.Context, e store.EndInfo) error
 
 	watchers map[int]func(store.WorkKind, string)
@@ -90,12 +91,21 @@ func (s *Store) callHook(ctx context.Context, e *execution, status store.Status,
 	return nil
 }
 
+// waiter is a queued lock request (store.LockRequest.Wait).
+type waiter struct {
+	exec    int64
+	expires time.Time // its place lapses then: next attempt + TTL
+}
+
 type lockRow struct {
 	exec  int64 // holder execution id
 	sched int32 // its acquiring schedule id
 	until time.Time
 	ttl   time.Duration
 	hold  time.Duration // store.LockRequest.Hold
+	// reserved: for the waiter a release woke (exec), until its turn ends
+	// (until); not extended, taken over silently (T9.8).
+	reserved bool
 }
 
 type execution struct {
@@ -149,6 +159,7 @@ func New(clock Clock) *Store {
 		latest:     make(map[string]int64),
 		tasks:      make(map[int64]*activityTask),
 		locks:      make(map[string]*lockRow),
+		waiters:    make(map[string][]waiter),
 	}
 }
 
@@ -788,18 +799,25 @@ func (s *Store) acquireLocks(e *execution, reqs []store.LockRequest, now time.Ti
 	for _, r := range reqs {
 		k, ok := s.locks[r.Key]
 		switch {
-		case ok && k.exec != e.ID && (k.until.After(now) || s.running(k.exec, now) ||
+		case ok && k.exec != e.ID && k.reserved && k.until.After(now) && s.waiting(k.exec, r.Key):
+			// The turn of the waiter a release woke (T9.8).
+			s.addPending(e, history.Event{Type: history.LockHeld, ScheduleID: r.ScheduleID, Name: r.Key, Err: s.executions[k.exec].InstanceID}, now)
+			s.queue(e.ID, r, now)
+			continue
+		case ok && k.exec != e.ID && !k.reserved && (k.until.After(now) || s.running(k.exec, now) ||
 			k.until.Add(k.hold).After(now) && s.hasActivity(k.exec)):
 			holder := s.executions[k.exec].InstanceID
 			s.addPending(e, history.Event{Type: history.LockHeld, ScheduleID: r.ScheduleID, Name: r.Key, Err: holder}, now)
+			s.queue(e.ID, r, now)
 			continue
-		case ok && k.exec != e.ID: // expired: taken over; its holder learns it
+		case ok && k.exec != e.ID && !k.reserved: // expired: taken over; its holder learns it
 			if prev := s.executions[k.exec]; prev != nil && prev.Status.Active() {
 				s.addPending(prev, history.Event{Type: history.LockLost, ScheduleID: k.sched, Name: r.Key}, now)
 				s.hint(store.WorkflowWork, prev.Queue)
 			}
 		}
 		s.locks[r.Key] = &lockRow{exec: e.ID, sched: r.ScheduleID, until: now.Add(r.TTL), ttl: r.TTL, hold: r.Hold}
+		s.unqueue(r.Key, e.ID)
 		s.addPending(e, history.Event{Type: history.LockAcquired, ScheduleID: r.ScheduleID, Name: r.Key}, now)
 	}
 }
@@ -832,17 +850,121 @@ func (s *Store) hasActivity(id int64) bool {
 // extendLocks extends the locks held by execution id by their TTL.
 func (s *Store) extendLocks(id int64, now time.Time) {
 	for _, k := range s.locks {
-		if k.exec == id {
+		if k.exec == id && !k.reserved {
 			k.until = now.Add(k.ttl)
 		}
 	}
 }
 
-// releaseLocks releases the locks held by execution id.
+// releaseLocks releases the locks held by execution id, waking the waiter
+// whose turn each is, and drops its own waits.
 func (s *Store) releaseLocks(id int64) {
+	now := s.clock.Now()
+	for key := range s.waiters {
+		s.unqueue(key, id)
+	}
 	for key, k := range s.locks {
 		if k.exec == id {
 			delete(s.locks, key)
+			if k.reserved {
+				continue // a woken waiter leaving wakes nobody
+			}
+			if w := s.firstLive(key, id, now); w != nil {
+				s.wake(s.executions[w.exec], key, now)
+				turn := now.Add(k.ttl) // its turn: one TTL to come
+				if w.expires.Before(turn) {
+					w.expires = turn
+				}
+				s.locks[key] = &lockRow{exec: w.exec, until: turn, ttl: k.ttl, reserved: true}
+			}
+		}
+	}
+}
+
+// firstLive returns key's first waiter other than execution id still
+// waiting: its place not lapsed, its execution active, and sleeping on its
+// lock-wait timer (a wait canceled or given up has none: skipped). Lapsed
+// and inactive waiters are dropped.
+func (s *Store) firstLive(key string, id int64, now time.Time) *waiter {
+	ws := s.waiters[key]
+	keep := ws[:0]
+	var first *waiter
+	for i := range ws {
+		e := s.executions[ws[i].exec]
+		if e == nil || !e.Status.Active() || !ws[i].expires.After(now) {
+			continue // dropped
+		}
+		keep = append(keep, ws[i])
+		if first == nil && ws[i].exec != id && claimable(e.Status) && e.hasTimer(store.LockWaitTimer(key)) {
+			first = &keep[len(keep)-1]
+		}
+	}
+	if len(keep) == 0 {
+		delete(s.waiters, key)
+	} else {
+		s.waiters[key] = keep
+	}
+	return first
+}
+
+// waiting reports whether execution id is active and sleeps on its
+// lock-wait timer for key (T9.8).
+func (s *Store) waiting(id int64, key string) bool {
+	e := s.executions[id]
+	return e != nil && claimable(e.Status) && e.hasTimer(store.LockWaitTimer(key)) // not parked
+}
+
+// queue queues (or refreshes, keeping its place) execution id's wait for
+// r.Key; a request without Wait leaves the queue.
+func (s *Store) queue(id int64, r store.LockRequest, now time.Time) {
+	if !r.Wait {
+		s.unqueue(r.Key, id)
+		return
+	}
+	expires := now.Add(r.WaitRetry + r.TTL)
+	ws := s.waiters[r.Key]
+	for i := range ws {
+		if ws[i].exec == id {
+			if ws[i].expires.After(now) {
+				ws[i].expires = expires
+				return
+			}
+			ws = append(ws[:i], ws[i+1:]...) // lapsed: to the back
+			break
+		}
+	}
+	s.waiters[r.Key] = append(ws, waiter{exec: id, expires: expires})
+}
+
+func (s *Store) unqueue(key string, id int64) {
+	ws := s.waiters[key]
+	for i := range ws {
+		if ws[i].exec == id {
+			s.waiters[key] = append(ws[:i], ws[i+1:]...)
+			return
+		}
+	}
+}
+
+// hasTimer reports whether a timer called name is pending for e (fired
+// or not).
+func (e *execution) hasTimer(name string) bool {
+	for i := range e.pending {
+		if p := &e.pending[i]; p.ev.Type == history.TimerFired && p.ev.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// wake fires e's lock-wait timers for key now (it asks again at once).
+func (s *Store) wake(e *execution, key string, now time.Time) {
+	name := store.LockWaitTimer(key)
+	for i := range e.pending {
+		p := &e.pending[i]
+		if p.ev.Type == history.TimerFired && p.ev.Name == name && p.visibleAt.After(now) {
+			p.visibleAt = now
+			s.hint(store.WorkflowWork, e.Queue)
 		}
 	}
 }
