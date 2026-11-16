@@ -442,6 +442,25 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
       - Thỉnh thoảng có một run benchmark mất khoảng 1.5 s (có từ trước).
       - Claim lock dư tới `$3` dòng mỗi queue trong lúc chạy câu lệnh.
 
+### P9 — Khắc phục các hạn chế về hành vi
+
+Các mục được rút ra từ phần "Còn mở" của T8.x, xếp theo thứ tự làm. Mỗi task đi theo đúng quy trình: test trước, cài đặt, test (race, lint, bench nếu chạm đường nóng), review độc lập, rồi mới tick và commit.
+
+- [ ] **T9.1** ⚡ Poll theo thời điểm đến hạn. Poller hỏi store thời điểm sớm nhất mà việc của các queue trở nên claim được:
+    - `min(ready_at)` của execution và `min(visible_at)` của activity task, gộp vào câu claim để không tốn thêm round trip;
+    - poller ngủ tới đúng thời điểm đó.
+    Việc do engine khác commit, hand-back và việc ngoài horizon không còn trễ tới `PollMax`. Test: timer do engine B commit được engine A (đang rảnh, `PollMax` lớn) chạy đúng hạn.
+- [ ] **T9.2** Child được tạo trong đúng task mà cha kết thúc: không bỏ âm thầm nữa. Completion kết thúc mà còn child đang được tạo thì bị từ chối (`ErrInvalidCompletion`) như với activity, hoặc báo lỗi rõ cho workflow. Test ở mức engine.
+- [ ] **T9.3** Đếm stuck trong DB. Execution lưu `last_seq` của lần kẹt gần nhất (migration mới). Lần kẹt thứ hai ở cùng `last_seq`, trên bất kỳ engine nào, sẽ park. Test với 2 engine.
+- [ ] **T9.4** Giữ lock khi activity đang chờ queue hoặc chờ retry:
+    - heartbeat gia hạn lock của execution còn activity task chưa xong;
+    - có giới hạn tuyệt đối để workflow bị bỏ quên không giữ lock mãi.
+    Test: activity chờ retry lâu hơn TTL của lock mà lock vẫn còn; quá giới hạn thì lock hết hạn.
+- [ ] **T9.5** Bỏ chu trình deadlock giữa child kết thúc (`dropEnded`, `notifyParent`) và cha lấy lock (`acquireLock`): sắp lại thứ tự khoá, hoặc dùng `SKIP LOCKED` rồi thử lại. Test tái hiện tranh chấp (pg).
+- [ ] **T9.6** `Options.ListenDSN`: kết nối `LISTEN` riêng, đi thẳng tới Postgres khi pool chạy qua PgBouncer ở transaction mode. Test: engine với pool không có `LISTEN` vẫn nhận hint qua `ListenDSN`.
+- [ ] **T9.7** ⚡ Lấy lock trong 1 round trip: kết quả lock được trả về ngay trong completion, không cần resume riêng. Bench `BenchmarkEagerActivity` và một bench có lock.
+- [ ] **T9.8** Phục vụ waiter của lock theo thứ tự FIFO: bảng hàng đợi waiter; khi nhả lock thì đánh thức waiter đầu hàng thay vì để các bên poll bằng `LockWait`. Test: N waiter nhận lock đúng thứ tự.
+
 ## File và hàm tái sử dụng
 
 | Lấy từ | Dùng cho |
