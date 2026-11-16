@@ -76,7 +76,8 @@ handed back once (the process may only have stalled), and parked the same
 way, with `ErrStuck`, when it happens again at the same point. An event type the binary does not know (written by a newer
 version) hands the execution back to another engine instead.
 
-A replayed execution is cached in the process that ran it (`CacheSize`), and
+A replayed execution is cached in the process that ran it (`CacheSize`,
+`CacheBytes`), and
 its next task stays on that process for `StickyFor`. A cache hit skips the
 replay; a miss replays. Both give the same result.
 

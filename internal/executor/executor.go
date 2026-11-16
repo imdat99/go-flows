@@ -124,6 +124,9 @@ type Executor struct {
 	// Activities and children issued but not started because the
 	// workflow ended in the same task (DroppedAtEnd).
 	droppedActivities, droppedChildren int
+	// eventBytes sums the payload, compensation data and error text of
+	// every history event replayed or recorded (Size).
+	eventBytes int64
 }
 
 // resetCompletion empties the reused completion, keeping the capacity of
@@ -185,6 +188,28 @@ func (e *Executor) count(ev *history.Event) {
 // without an outcome yet. When false, a failed workflow ends at once.
 func (e *Executor) MayCompensate() bool {
 	return e.compensable > 0 || e.activities > e.outcomes
+}
+
+// The size estimate is coarse on purpose: it bounds a cache, so it needs
+// to grow with what an executor holds, not to match the heap.
+const (
+	// sizeBase is the fixed part of an executor: the executor, its state
+	// and scheduler, and the buffers reused between tasks.
+	sizeBase = 4 << 10
+	// sizeCoroutine is a live coroutine: a parked goroutine and its stack.
+	sizeCoroutine = 4 << 10
+)
+
+// Size estimates the bytes the executor keeps alive: a fixed base, the
+// live coroutines, and the payloads, compensation data and error texts of
+// every history event replayed or recorded, which the workflow's state may
+// hold (inputs, decoded results, signals). The same history gives the same
+// size whether it was replayed or run live. It is maintained per event, so
+// calling it is cheap, and it does not change while the executor is not
+// running. Payloads the workflow has dropped stay counted: the estimate
+// errs on the large side for long histories.
+func (e *Executor) Size() int64 {
+	return sizeBase + int64(e.sched.Live())*sizeCoroutine + e.eventBytes
 }
 
 // ExecutionID is the execution this executor runs.
@@ -264,9 +289,15 @@ func (e *Executor) applyBatch(batch []history.Event) error {
 			return err
 		}
 		e.lastSeq = ev.Seq
+		e.eventBytes += eventSize(ev)
 	}
 	e.st.compact()
 	return nil
+}
+
+// eventSize is an event's share of Size: the bytes it carries.
+func eventSize(ev *history.Event) int64 {
+	return int64(len(ev.Payload) + len(ev.CompData) + len(ev.Err))
 }
 
 // Execute runs a workflow task: it records TaskStarted at task.Now, applies
@@ -325,6 +356,7 @@ func (e *Executor) Execute(task *store.WorkflowTask) (c *store.Completion, err e
 	}
 	for i := range st.out {
 		st.out[i].Seq = e.lastSeq + int64(i) + 1
+		e.eventBytes += eventSize(&st.out[i])
 	}
 	c.History = st.out // the executor's buffer, reused as the completion is
 	if n := len(st.out); n > 0 {

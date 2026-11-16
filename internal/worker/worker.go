@@ -63,6 +63,11 @@ func (plainErrors) Text(err error) string { return err.Error() }
 func (plainErrors) Kinds(error) string    { return "" }
 func (plainErrors) Permanent(error) bool  { return false }
 
+// DefaultCacheBytes is the default bound on the estimated bytes of the
+// cached executors: 256 MiB, room for the default 1000 executors at about
+// 256 KiB each.
+const DefaultCacheBytes = 256 << 20
+
 // Options configure a worker.
 type Options struct {
 	// Owner identifies this worker in leases; unique per process.
@@ -84,6 +89,10 @@ type Options struct {
 	HandBack time.Duration
 	// CacheSize is the number of executors kept between tasks.
 	CacheSize int
+	// CacheBytes bounds the estimated bytes of the cached executors
+	// (executor.Size; default DefaultCacheBytes, -1: bounded by count
+	// only). Beyond it the least recently used are evicted.
+	CacheBytes int64
 	// Eager runs a workflow task's activities in this worker at once.
 	Eager bool
 	// EagerWindow is how long the workflow lease stays held, waiting for
@@ -163,6 +172,9 @@ func (o *Options) defaults() {
 	}
 	if o.CacheSize == 0 {
 		o.CacheSize = 1000
+	}
+	if o.CacheBytes == 0 {
+		o.CacheBytes = DefaultCacheBytes
 	}
 	if o.Errors == nil {
 		o.Errors = plainErrors{}
@@ -246,7 +258,7 @@ func New(st store.Store, wfs Workflows, acts Activities, opts Options) (*Worker,
 	}
 	w := &Worker{
 		st: st, wfs: wfs, acts: acts, opts: opts, log: opts.Logger,
-		cache:       newCache(opts.CacheSize),
+		cache:       newCache(opts.CacheSize, opts.CacheBytes),
 		hb:          newHeartbeat(st, opts.Owner, opts.LeaseTTL, opts.Logger),
 		wfSlots:     make(chan struct{}, opts.MaxWorkflowTasks),
 		actSlots:    make(chan struct{}, opts.MaxActivities),

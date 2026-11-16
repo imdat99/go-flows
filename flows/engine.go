@@ -43,6 +43,13 @@ type Options struct {
 	// (default 1000 executions, -1 disables it).
 	StickyFor time.Duration
 	CacheSize int
+	// CacheBytes bounds the cache by the estimated memory of the cached
+	// executions (default 256 MiB, -1: bounded by CacheSize only); beyond
+	// either bound the least recently used are evicted. The estimate is a
+	// fixed few KiB per execution and per live coroutine, plus the bytes
+	// of every payload, compensation data and error in the history
+	// replayed so far (encoded sizes, not the decoded values' heap size).
+	CacheBytes int64
 	// PollMax bounds the idle polling interval (default 1s; Postgres
 	// notifications wake pollers earlier).
 	PollMax time.Duration
@@ -149,7 +156,7 @@ func newEngineWith(st store.Store, acts worker.Activities, opts Options) (*Engin
 		Owner: opts.InstanceID, Queues: opts.Queues, LeaseTTL: opts.LeaseTTL,
 		MaxWorkflowTasks: opts.MaxWorkflowTasks, MaxActivities: opts.MaxActivities,
 		Eager: !opts.DisableEager, EagerWindow: opts.EagerWindow, StickyFor: opts.StickyFor,
-		PollMax: opts.PollMax, CacheSize: opts.CacheSize, Errors: errorCodec{}, Logger: opts.Logger,
+		PollMax: opts.PollMax, CacheSize: opts.CacheSize, CacheBytes: opts.CacheBytes, Errors: errorCodec{}, Logger: opts.Logger,
 		Observer: obs, Tracer: tr, StuckTimeout: opts.StuckTimeout, LockHold: opts.LockHold,
 	})
 	if err != nil {

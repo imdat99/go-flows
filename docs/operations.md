@@ -81,7 +81,7 @@ defer engine.Stop(shutdownCtx)
 | `LeaseTTL` | 30s | How long a dead engine holds its work. Leases renew every third of it. Shorter: faster recovery, more renewals. |
 | `MaxWorkflowTasks`, `MaxActivities` | 64, 64 | Concurrency per engine. |
 | `PollMax` | 1s | The longest idle poll interval. Notifications and local due times wake pollers earlier. |
-| `StickyFor`, `CacheSize` | 10s, 1000 | Keep a replayed execution in memory, with its next task on this engine. `CacheSize: -1` disables the cache (every task replays). |
+| `StickyFor`, `CacheSize`, `CacheBytes` | 10s, 1000, 256 MiB | Keep a replayed execution in memory, with its next task on this engine. `CacheSize: -1` disables the cache (every task replays). `CacheBytes` bounds the estimated memory of the cache (a few KiB per execution and per live coroutine, plus the encoded payloads of its history); the least recently used are evicted beyond either bound. `CacheBytes: -1` bounds by count only. |
 | `DisableEager` | false | Run every activity through the queue instead of in the scheduling engine. |
 | `ListenDSN` | (pool) | Connection string for the engine's `LISTEN` connection (one connection), for pools behind PgBouncer in transaction mode. |
 | `LockHold` | 1h | How long past its `ttl` an execution keeps a lock while one of its activities waits (in its queue, for a retry, or for another engine after a crash). Bounds how long a forgotten workflow keeps others out; negative: the lock lapses after its `ttl`. |

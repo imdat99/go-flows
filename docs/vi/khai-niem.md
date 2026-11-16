@@ -75,7 +75,8 @@ là process bị khựng), và bị park như vậy, với `ErrStuck`, khi lặp
 cùng chỗ. Loại event mà binary
 không biết (do version mới hơn ghi) thì execution được trả cho engine khác.
 
-Execution đã replay được cache trong process đã chạy nó (`CacheSize`), và
+Execution đã replay được cache trong process đã chạy nó (`CacheSize`,
+`CacheBytes`), và
 task kế tiếp của nó ở lại process đó trong `StickyFor`. Trúng cache thì bỏ
 qua replay; trượt thì replay. Kết quả như nhau.
 
