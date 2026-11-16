@@ -535,3 +535,20 @@ func (e *Executor) apply(ev *history.Event) error {
 	}
 	return e.run()
 }
+
+// NextTimer returns the earliest deadline of the timers issued and not
+// fired, canceled or dropped (after Execute: those the store holds as
+// pending events once the completion commits, whoever committed them).
+func (e *Executor) NextTimer() (time.Time, bool) {
+	var at time.Time
+	for _, c := range e.st.calls[e.st.committedTo:] {
+		cmd := c.command()
+		if cmd.Kind != command.Timer || (cmd.State != command.Pending && cmd.State != command.Committed) {
+			continue
+		}
+		if at.IsZero() || cmd.At.Before(at) {
+			at = cmd.At
+		}
+	}
+	return at, !at.IsZero()
+}

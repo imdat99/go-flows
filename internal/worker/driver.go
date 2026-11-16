@@ -270,6 +270,17 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 	case !stopping && !d.compensating && w.cache.fits(d.ex): // only an executor kept in the cache gains from it
 		c.StickyFor = w.opts.StickyFor
 	}
+	// Sticky, this worker wakes for the execution's next timer (whoever
+	// committed it): the store leaves it to this worker (T10.3) when it
+	// falls within DueKnown, half the horizon of the local due times (a
+	// margin for the clocks of both).
+	var nextTimer time.Time
+	if c.StickyFor > 0 && d.ex != nil {
+		var ok bool
+		if nextTimer, ok = d.ex.NextTimer(); ok {
+			c.DueKnown = w.wfDue.horizon / 2
+		}
+	}
 	sent := time.Now()
 	// The worker's task context, not d.ctx: a lease lost meanwhile is
 	// caught by the store's fence anyway, and a long-lived context costs the
@@ -292,6 +303,9 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		// The timer's delay counts from the claim (task.Now), before sent:
 		// the local due time is never before the store's.
 		w.wfDue.add(sent.Add(c.Timers[i].At.Sub(task.Now)))
+	}
+	if !nextTimer.IsZero() {
+		w.wfDue.add(sent.Add(nextTimer.Sub(task.Now)))
 	}
 	// Read before completed: it may hand c's executor to the cache.
 	locks, next, resumed := len(c.Locks) > 0, c.Resume, c.Resumed

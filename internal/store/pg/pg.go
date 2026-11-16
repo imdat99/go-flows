@@ -482,9 +482,10 @@ const nextWorkflowDue = `
 	FROM unnest($1::text[]) AS q(name)
 	LEFT JOIN LATERAL (
 		-- Kept leases are left out (owner_due, T10.2): their ready_at is
-		-- the lease expiry (recovery's, not a due time). So are events
-		-- falling due while sticky to the owner that committed them
-		-- (T10.3): it claims them; if it died, recovery's timed poll does. The index leaves
+		-- the lease expiry (recovery's, not a due time). So is a next due
+		-- time falling while sticky to an owner that wakes for it (T10.3,
+		-- store.Completion.DueKnown): it claims it; if it died, recovery's
+		-- timed poll does. The index leaves
 		-- them out, so the first entry after now() is the answer; locked_until
 		-- only filters leases kept by a binary older than owner_due.
 		SELECT ready_at FROM flows.execution
@@ -1096,7 +1097,7 @@ const cancelActivities = `
 // updateRunning closes a task that leaves the execution active: $2 last
 // seq (0: unchanged), $3 status (empty: unchanged), $4 keep-for, $5
 // sticky-for, $6 owner, $7/$8 the reason of a park (needs_attention) or of
-// a compensation (the workflow's error).
+// a compensation (the workflow's error), $9 due-known.
 // The lease is kept only while the execution stays
 // claimable (stickiness only applies when it is not kept). Released with work visible, it notifies other owners.
 const updateRunning = `
@@ -1119,9 +1120,11 @@ const updateRunning = `
 	        ELSE (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1) END,
 	    owner_id = CASE WHEN v.keep THEN e.owner_id ELSE '' END,
 	    -- The next due time is the owner's (T10.2, T10.3): a kept lease's, or
-	    -- the first event falling due while the execution is sticky to it.
-	    owner_due = v.keep OR coalesce($5::bigint > 0 AND
-	        (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1) <= now() + $5 * interval '1 microsecond', false),
+	    -- the first event falling due while the execution is sticky to it
+	    -- and within $9 (store.Completion.DueKnown: the owner wakes for it).
+	    owner_due = v.keep OR coalesce($5::bigint > 0 AND $9::bigint > 0 AND
+	        (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1)
+	            <= now() + least($5::bigint, $9::bigint) * interval '1 microsecond', false),
 	    locked_until = CASE WHEN v.keep THEN now() + $4 * interval '1 microsecond' END,
 	    sticky_owner = CASE WHEN NOT v.keep AND $5::bigint > 0 THEN $6 ELSE '' END,
 	    sticky_until = CASE WHEN NOT v.keep AND $5::bigint > 0 THEN now() + $5 * interval '1 microsecond' END
@@ -1413,7 +1416,8 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		queue(compensateChild, l.ID, sched)
 	}
 	if !ending {
-		queue(updateRunning, l.ID, lastSeq, string(c.Status), micros(c.KeepFor), micros(c.StickyFor), l.Owner, c.Err, c.ErrKinds)
+		queue(updateRunning, l.ID, lastSeq, string(c.Status), micros(c.KeepFor), micros(c.StickyFor), l.Owner, c.Err, c.ErrKinds,
+			micros(c.DueKnown))
 		return
 	}
 	queue(endExecution, l.ID, lastSeq, string(c.Status), c.Output, c.Err, c.ErrKinds)

@@ -702,9 +702,12 @@ func testDueSkipsManyKeptLeases(t *testing.T, h Harness) {
 	}
 }
 
-// T10.3: a timer that falls due while its execution is sticky to its owner
-// is that owner's (it claims it, knowing the time): not reported, to anyone.
-// A timer falling due after the stickiness ends is anyone's: reported.
+// T10.3: an execution's next due time, falling due while it is sticky to
+// the owner that completed its last task, is that owner's when the owner
+// says it wakes for the execution's due times (Completion.DueKnown): it
+// claims it. Not reported, to anyone. Reported when it falls due after
+// the stickiness or beyond DueKnown, or without DueKnown: the owner may
+// not know it (a timer another engine committed).
 func testDueSkipsStickyTimers(t *testing.T, h Harness) {
 	s := h.New(t)
 	dc, ok := s.(store.DueClaimer)
@@ -712,29 +715,63 @@ func testDueSkipsStickyTimers(t *testing.T, h Harness) {
 		t.Skip("store does not implement store.DueClaimer")
 	}
 	d := 30 * h.TTL // nothing falls due while the test runs
-	mustCreate(t, s, "sticky")
-	task := claimOne(t, s, owner, h.TTL)
-	started(t, s, task, &store.Completion{StickyFor: d, Timers: []history.Event{{ScheduleID: 1, At: task.Now.Add(d / 2)}}})
-	for _, who := range []string{other, owner} {
-		if tasks, next, err := dc.ClaimWorkflowTasksDue(ctx, who, []string{queue}, 10, h.TTL); err != nil || len(tasks) != 0 || next != 0 {
-			t.Fatalf("%s: a timer due while sticky reported in %v (claimed %d, %v)", who, next, len(tasks), err)
+	due := func(who string) time.Duration {
+		t.Helper()
+		tasks, next, err := dc.ClaimWorkflowTasksDue(ctx, who, []string{queue}, 10, h.TTL)
+		if err != nil || len(tasks) != 0 {
+			t.Fatalf("%s: claimed %d %v", who, len(tasks), err)
+		}
+		return next
+	}
+	reported := func(what string, want time.Duration) {
+		t.Helper()
+		for _, who := range []string{other, owner} {
+			if next := due(who); next <= want/2 || next > want+want/2 {
+				t.Fatalf("%s, to %s: next in %v, want about %v", what, who, next, want)
+			}
 		}
 	}
-	mustCreate(t, s, "later")
-	task = claimOne(t, s, owner, h.TTL)
-	started(t, s, task, &store.Completion{StickyFor: d / 4, Timers: []history.Event{{ScheduleID: 1, At: task.Now.Add(d)}}})
-	_, next, err := dc.ClaimWorkflowTasksDue(ctx, other, []string{queue}, 10, h.TTL)
-	if err != nil || next <= d/2 || next > d+d/2 {
-		t.Fatalf("a timer due after the stickiness: next in %v, want about %v (%v)", next, d, err)
+	// Each case is the only active execution: create, run, ask, end.
+	n := 0
+	run := func(c store.Completion, delay time.Duration) {
+		t.Helper()
+		n++
+		mustCreate(t, s, "i"+strconv.Itoa(n))
+		task := claimOne(t, s, owner, h.TTL)
+		c.Timers = []history.Event{{ScheduleID: 1, At: task.Now.Add(delay)}}
+		started(t, s, task, &c)
 	}
-	// Unstick hands the sticky one over: its timer is anyone's again.
+	end := func() {
+		t.Helper()
+		if _, err := s.Terminate(ctx, "i"+strconv.Itoa(n), "done"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Due while sticky, the owner tracking it: hidden.
+	run(store.Completion{StickyFor: d, DueKnown: d}, d/2)
+	for _, who := range []string{other, owner} {
+		if next := due(who); next != 0 {
+			t.Fatalf("%s: a timer due while sticky to its owner reported in %v", who, next)
+		}
+	}
+	// Unstick hands it over: anyone's again.
 	if err := s.Unstick(ctx, owner); err != nil {
 		t.Fatal(err)
 	}
-	_, next, err = dc.ClaimWorkflowTasksDue(ctx, other, []string{queue}, 10, h.TTL)
-	if err != nil || next <= 0 || next > d/2+d/4 {
-		t.Fatalf("after Unstick: next in %v, want about %v (%v)", next, d/2, err)
-	}
+	reported("after Unstick", d/2)
+	end()
+	// Due after the stickiness ends.
+	run(store.Completion{StickyFor: d / 4, DueKnown: d}, d)
+	reported("due after the stickiness", d)
+	end()
+	// Sticky, but the owner does not track due times that far.
+	run(store.Completion{StickyFor: d, DueKnown: d / 4}, d/2)
+	reported("due beyond DueKnown", d/2)
+	end()
+	// Sticky, the owner tracking nothing (it may not know the timer).
+	run(store.Completion{StickyFor: d}, d/2)
+	reported("without DueKnown", d/2)
+	end()
 }
 
 // T9.2: a continue-as-new may start children (they run on, detached, as

@@ -122,9 +122,12 @@ polls then, so a backed-off poller does not run it up to `PollMax` late
   `LeaseTTL` (`TestCrashedEngineWorkIsRecoveredWithinLeaseTTL`). Kept leases
   (eager execution) are not due times: their `ready_at` is the lease expiry.
   Nor is a timer falling due while its execution is sticky to the engine
-  that committed it (T10.3): that engine claims it, and an idle engine
-  waking for it made an empty claim (`TestStickyTimersDoNotWakeOthers`); if
-  that engine dies, the timed poll above finds it. Both are marked
+  that ran its last task (T10.3), when that engine says it wakes for it
+  (`Completion.DueKnown`: it adds the execution's next timer, whoever
+  committed it, to its local due times, within half their horizon): that
+  engine claims it, and an idle engine waking for it made an empty claim
+  (`TestStickyTimersDoNotWakeOthers`, `TestStickyOwnerFiresTimersOfOthersOnTime`);
+  if that engine dies, the timed poll above finds it. Both are marked
   (`owner_due`, written only with `ready_at`, so renewals stay HOT updates;
   `Unstick` clears it) and left out of a partial
   index (`execution_due_idx`, T10.2), so the `ready_at` lookup reads one

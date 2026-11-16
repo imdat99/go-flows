@@ -126,6 +126,7 @@ type execution struct {
 	lockedUntil time.Time
 	stickyOwner string
 	stickyUntil time.Time
+	ownerDue    bool      // the next due time is the sticky owner's (ownerDue)
 	notBefore   time.Time // released with a delay
 	history     []history.Event
 	pending     []pending
@@ -552,10 +553,29 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 	if len(e.visiblePending(now)) > 0 {
 		s.hint(store.WorkflowWork, e.Queue)
 	}
+	e.ownerDue = false
 	if c.StickyFor > 0 && e.Status.Active() {
 		e.stickyOwner, e.stickyUntil = l.Owner, now.Add(c.StickyFor)
+		e.ownerDue = ownerDue(e, c, now)
 	}
 	return leases, nil
+}
+
+// ownerDue tells whether, as Postgres' owner_due, the next due time of an
+// execution a completion leaves sticky is its owner's (T10.3): it falls
+// within the stickiness and within DueKnown, how far the owner wakes by
+// itself for the execution's due times.
+func ownerDue(e *execution, c *store.Completion, now time.Time) bool {
+	if c.DueKnown <= 0 {
+		return false
+	}
+	var first time.Time
+	for _, p := range e.pending {
+		if first.IsZero() || p.visibleAt.Before(first) {
+			first = p.visibleAt
+		}
+	}
+	return !first.IsZero() && !first.After(now.Add(min(c.StickyFor, c.DueKnown)))
 }
 
 // cancelRequests marks canceled activities and asks children to cancel.
@@ -1347,16 +1367,12 @@ func (s *Store) ClaimWorkflowTasksDue(ctx context.Context, owner string, queues 
 			// As Postgres' ready_at: the earliest pending event, if none is
 			// visible now (then the execution is ready, not due later), of an
 			// execution without a lease (a kept lease is its owner's), unless
-			// it falls due while sticky to its owner (owner_due, T10.3).
+			// it is its sticky owner's (owner_due, T10.3).
 			if at, ok := e.readyAt(now); e.lockedUntil.IsZero() && (!ok || at.After(now)) {
-				var first time.Time
-				for _, p := range e.pending {
-					if first.IsZero() || p.visibleAt.Before(first) {
-						first = p.visibleAt
+				if e.stickyOwner == "" || !e.ownerDue {
+					for _, p := range e.pending {
+						earlier(p.visibleAt)
 					}
-				}
-				if e.stickyOwner == "" || first.After(e.stickyUntil) {
-					earlier(first)
 				}
 			}
 		}

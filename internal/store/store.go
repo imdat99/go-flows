@@ -260,6 +260,12 @@ type Completion struct {
 	// StickyFor (0 clears stickiness).
 	KeepFor   time.Duration
 	StickyFor time.Duration
+	// DueKnown, with StickyFor, says the owner wakes by itself at the
+	// execution's due times (its pending timers, whoever committed them)
+	// that fall within DueKnown of now. The store then leaves a next due
+	// time within both out of the due times it reports (DueClaimer): the
+	// owner claims it, others would claim nothing (T10.3).
+	DueKnown time.Duration
 	// Resume, when set with KeepFor > 0 on an execution left running or
 	// compensating, has the store return the next task under the kept lease
 	// in the same round trip, written into *Resume (its Pending capacity

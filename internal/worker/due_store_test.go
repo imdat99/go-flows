@@ -375,8 +375,8 @@ func TestStickyTimersDoNotWakeOthers(t *testing.T) {
 		return nil, err
 	})
 	b, err := worker.New(pg.New(pool), reg, reg, worker.Options{
-		Owner: "b", Queues: []string{q}, LeaseTTL: 10 * time.Second, StickyFor: time.Minute,
-		PollMin: 10 * time.Millisecond, PollMax: 50 * time.Millisecond, Logger: testLogger(t, "b"),
+		Owner: "b", Queues: []string{q}, LeaseTTL: 30 * time.Second, StickyFor: time.Minute,
+		PollMin: 5 * time.Second, PollMax: 5 * time.Second, Logger: testLogger(t, "b"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -385,6 +385,7 @@ func TestStickyTimersDoNotWakeOthers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = b.Stop(ctx) }()
+	created := time.Now()
 	create(t, pg.New(pool), "s", "sleepy", "")
 	waitUntil(t, func() bool { // B committed the timer, sticky to itself
 		var sticky bool
@@ -408,8 +409,74 @@ func TestStickyTimersDoNotWakeOthers(t *testing.T) {
 	if e := waitEnd(t, pg.New(pool), "s"); e.Status != store.StatusCompleted {
 		t.Fatalf("s: %s %s", e.Status, e.Err)
 	}
+	// B fires its timer on time: it polls 5s apart, so only its own due
+	// time wakes it.
+	if d := time.Since(created); d > delay+2*time.Second {
+		t.Fatalf("the timer of %v fired after %v", delay, d)
+	}
 	time.Sleep(300 * time.Millisecond) // a wake-up for the timer would have claimed by now
 	if n := st.claims.Load() - before; n != 0 {
 		t.Fatalf("A claimed %d times for a timer sticky to B", n)
+	}
+}
+
+// T10.3 review: an engine that becomes sticky owner of an execution whose
+// timer another engine committed fires that timer on time: it learns the
+// execution's next timer from its executor, not only from the timers it
+// committed (which the store's due report then leaves to it).
+func TestStickyOwnerFiresTimersOfOthersOnTime(t *testing.T) {
+	const delay = 2 * time.Second
+	pool := testdb.New(t)
+	ctx := context.Background()
+	if err := pg.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	reg := newRegistry()
+	reg.addWorkflow("w", func(ctx coro.Context, _ []byte) ([]byte, error) {
+		ex := executor.FromContext(ctx)
+		timer := ex.NewTimer(ctx, delay, "t")
+		if _, ok := ex.SignalChannel("go").Receive(ctx); !ok {
+			return nil, errors.New("no signal")
+		}
+		_, err := timer.Get(ctx)
+		return nil, err
+	})
+	start := func(owner string, poll time.Duration) *worker.Worker {
+		w, err := worker.New(pg.New(pool), reg, reg, worker.Options{
+			Owner: owner, Queues: []string{q}, LeaseTTL: 30 * time.Second, StickyFor: time.Minute,
+			PollMin: poll, PollMax: poll, Logger: testLogger(t, owner),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+	// A commits the timer, then stops (its stickiness handed over).
+	a := start("a", 20*time.Millisecond)
+	created := time.Now()
+	create(t, pg.New(pool), "w", "w", "")
+	waitUntil(t, func() bool {
+		var committed bool
+		err := pool.QueryRow(ctx, `SELECT ready_at > now() FROM flows.execution`).Scan(&committed)
+		return err == nil && committed
+	})
+	if err := a.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// B takes the signal's task (sticky to B from then on) and polls 5s
+	// apart: only a due time of its own wakes it for the timer.
+	if err := pg.New(pool).Signal(ctx, "w", "go", nil); err != nil {
+		t.Fatal(err)
+	}
+	b := start("b", 5*time.Second)
+	defer func() { _ = b.Stop(ctx) }()
+	if e := waitEnd(t, pg.New(pool), "w"); e.Status != store.StatusCompleted {
+		t.Fatalf("w: %s %s", e.Status, e.Err)
+	}
+	if d := time.Since(created); d > delay+2*time.Second {
+		t.Fatalf("the timer of %v fired after %v", delay, d)
 	}
 }

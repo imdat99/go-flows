@@ -317,6 +317,7 @@ func (s *Store) endFast(fb *fastBatch, l store.Lease, c *store.Completion, endin
 			fb.Str(l.Owner)
 			fb.Str(c.Err)
 			fb.Str(c.ErrKinds)
+			fb.Int(micros(c.DueKnown))
 		})
 		return
 	}
