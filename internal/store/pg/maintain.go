@@ -266,11 +266,17 @@ func (s *Store) ReopenParked(ctx context.Context, instanceID string) error {
 func (s *Store) Unstick(ctx context.Context, owner string) error {
 	err := retry(ctx, func() error {
 		// Their queues are notified: the others learn when their work
-		// (timers this owner knew of) falls due (T9.1).
+		// (timers this owner knew of) falls due (T9.1). The rows are
+		// locked by id (T10.4): an ancestor's before a descendant's, as
+		// lockParent, not in the order the sticky index lists them.
 		_, err := s.pool.Exec(ctx, `
-			WITH u AS (
-				UPDATE flows.execution SET sticky_owner = '', sticky_until = NULL, due_owner = ''
+			WITH l AS MATERIALIZED (
+				SELECT id FROM flows.execution
 				WHERE sticky_owner = $1 AND sticky_until > now()
+				ORDER BY id FOR NO KEY UPDATE
+			), u AS (
+				UPDATE flows.execution SET sticky_owner = '', sticky_until = NULL, due_owner = ''
+				WHERE id = ANY(ARRAY(SELECT id FROM l)) AND sticky_owner = $1 AND sticky_until > now()
 				RETURNING queue
 			)
 			SELECT `+notifyW+`queue) FROM (SELECT DISTINCT queue FROM u) AS d`, owner)

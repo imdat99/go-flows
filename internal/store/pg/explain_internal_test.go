@@ -35,6 +35,7 @@ func TestGW8_ClaimsUseTheirIndexes(t *testing.T) {
 		args      []any
 	}{
 		{"workflow claim", claimWorkflow, []string{"execution_ready_idx", "lock_execution"}, []any{[]string{"q"}, "o", 10, int64(1e6)}},
+		{"workflow claim, queues", claimWorkflowQueues, []string{"execution_ready_idx", "lock_execution"}, []any{[]string{"q", "r"}, "o", 10, int64(1e6)}},
 		{"activity claim", claimActivities, []string{"activity_task_ready_idx", "lock_execution"}, []any{[]string{"q"}, "o", 10, int64(1e6)}},
 		{
 			"latest execution", `SELECT ` + executionColumns + ` FROM flows.execution WHERE instance_id = $1 ORDER BY id DESC LIMIT 1`,
@@ -137,6 +138,7 @@ func TestGW8_ClaimsReadOnlyWhatTheyClaim(t *testing.T) {
 	}
 	for _, c := range []struct{ name, sql, args string }{
 		{"workflow claim", claimWorkflow, `('{q}', 'o', 10, 60000000)`},
+		{"workflow claim, queues", claimWorkflowQueues, `('{q,r}', 'o', 10, 60000000)`},
 		{"activity claim", claimActivities, `('{q}', 'o', 10, 60000000)`},
 		{"purge", purgeEnded, `(0, 10)`},
 	} {

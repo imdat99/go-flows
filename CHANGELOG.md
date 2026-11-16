@@ -48,6 +48,15 @@ must take care of.
   (its end gets whether the start created the execution), and
   `StartWorkflowTask` returns the task's context too (T10.10).
 
+### Fixed
+
+- Ending an execution (completion, `Terminate`) takes its lock rows in key
+  order and `Unstick` its execution rows by id, as every other statement
+  does: no deadlock (detected by Postgres and retried) against a claim or
+  a lock request. A claim over several queues locks only the executions it
+  claims, not up to its limit in each queue, so a lock whose holder sits
+  in another queue is no longer refused for the time of that claim (T10.4).
+
 ### Migrations
 
 | Migration | Adds | For |

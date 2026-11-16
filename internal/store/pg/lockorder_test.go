@@ -63,36 +63,9 @@ func TestEndsLockRowsInOrder(t *testing.T) {
 			`SELECT 1 FROM flows.lock WHERE key = 'k' FOR UPDATE NOWAIT`,
 		}},
 	}
-	ends := map[string]func(s *pg.Store, task store.WorkflowTask, seq int64) error{
-		"complete": func(s *pg.Store, task store.WorkflowTask, seq int64) error {
-			c := &store.Completion{Consumed: pendingIDsOf(task), Status: store.StatusCompleted, Output: []byte("1")}
-			for _, p := range task.Pending {
-				seq++
-				ev := p.Event
-				ev.Seq = seq
-				c.History = append(c.History, ev)
-			}
-			c.History = append(c.History, history.Event{Seq: seq + 1, Type: history.ExecutionCompleted, Payload: []byte("1")})
-			_, err := s.CompleteWorkflowTask(context.Background(), task.Lease, c)
-			return err
-		},
-		"terminate": func(s *pg.Store, task store.WorkflowTask, _ int64) error {
-			_, err := s.Terminate(context.Background(), task.Execution.InstanceID, "stop")
-			return err
-		},
-	}
-	stores := map[string]func(t *testing.T) *pg.Store{
-		"fast": newStore, "pgx": newStoreWithoutFastPath,
-		"hooked": func(t *testing.T) *pg.Store { // ends in a transaction of their own (inTx)
-			t.Helper()
-			s := newStore(t)
-			s.SetHook(func(context.Context, pgx.Tx, store.EndInfo) error { return nil })
-			return s
-		},
-	}
 	for cn, tc := range cases {
-		for sn, newS := range stores {
-			for en, end := range ends {
+		for sn, newS := range lockOrderStores {
+			for en, end := range lockOrderEnds {
 				t.Run(cn+"/"+sn+"/"+en, func(t *testing.T) {
 					t.Parallel()
 					s := newS(t)
@@ -130,6 +103,40 @@ func TestEndsLockRowsInOrder(t *testing.T) {
 		}
 	}
 }
+
+// lockOrderEnds end an execution (its claimed task, history length seq):
+// a terminal completion, or Terminate.
+// lockOrderStores are the paths an end takes: fast, pgx, and in a
+// transaction of their own (a hook).
+var (
+	lockOrderEnds = map[string]func(s *pg.Store, task store.WorkflowTask, seq int64) error{
+		"complete": func(s *pg.Store, task store.WorkflowTask, seq int64) error {
+			c := &store.Completion{Consumed: pendingIDsOf(task), Status: store.StatusCompleted, Output: []byte("1")}
+			for _, p := range task.Pending {
+				seq++
+				ev := p.Event
+				ev.Seq = seq
+				c.History = append(c.History, ev)
+			}
+			c.History = append(c.History, history.Event{Seq: seq + 1, Type: history.ExecutionCompleted, Payload: []byte("1")})
+			_, err := s.CompleteWorkflowTask(context.Background(), task.Lease, c)
+			return err
+		},
+		"terminate": func(s *pg.Store, task store.WorkflowTask, _ int64) error {
+			_, err := s.Terminate(context.Background(), task.Execution.InstanceID, "stop")
+			return err
+		},
+	}
+	lockOrderStores = map[string]func(t *testing.T) *pg.Store{
+		"fast": newStore, "pgx": newStoreWithoutFastPath,
+		"hooked": func(t *testing.T) *pg.Store { // ends in a transaction of their own (inTx)
+			t.Helper()
+			s := newStore(t)
+			s.SetHook(func(context.Context, pgx.Tx, store.EndInfo) error { return nil })
+			return s
+		},
+	}
+)
 
 func pendingIDsOf(task store.WorkflowTask) []int64 {
 	ids := make([]int64, len(task.Pending))

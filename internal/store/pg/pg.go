@@ -148,8 +148,9 @@ func nonNil[T any](s []T) []T {
 // all-or-nothing (one batch or one statement): a retry starts from scratch.
 //
 // The engine's statements lock rows in one order (lockParent); a rare
-// cycle left (Unstick updates several execution rows in storage order)
-// and the application's own transactions are covered by retry.
+// cycle left (two executions ending at once, each the other's lock's
+// waiter: lockWaitersOf) and the application's own transactions are
+// covered by retry.
 func retry(ctx context.Context, fn func() error) error {
 	var err error
 	for attempt := range maxRetries {
@@ -361,27 +362,68 @@ func (s *Store) GetExecution(ctx context.Context, instanceID string) (store.Exec
 // cannot read execution_ready_idx in order, and sorts the whole ready
 // backlog on every claim (TestGW8_ClaimsReadOnlyWhatTheyClaim). Queues are
 // deduplicated (a queue listed twice would fill the limit with one row
-// twice: rows this statement locked are not skipped). Each queue locks up
-// to $3 rows, held until the statement ends even when the outer limit
-// drops them. The pending events come from pending_event_execution_idx,
-// one LATERAL per claimed execution, as arrays (readClaimed).
+// twice: rows this statement locked are not skipped). With one queue, its
+// first $3 rows are locked and claimed; with several, claimWorkflowQueues
+// locks only the rows it claims. The pending events come from
+// pending_event_execution_idx, one LATERAL per claimed execution, as
+// arrays (readClaimed).
 var claimWorkflow = `
 	WITH c AS (
 		SELECT x.id FROM (SELECT DISTINCT unnest($1::text[])) AS q(name)
 		CROSS JOIN LATERAL (
 			SELECT id, ready_at FROM flows.execution
-			WHERE queue = q.name AND status IN ('running', 'compensating')
-			  AND ready_at <= now()
-			  AND (locked_until IS NULL OR locked_until < now())
-			  AND (not_before IS NULL OR not_before <= now())
-			  AND (sticky_until IS NULL OR sticky_until < now() OR sticky_owner = $2)
+			WHERE ` + claimableIn("q.name") + `
 			ORDER BY ready_at, id
 			LIMIT $3::bigint
 			FOR NO KEY UPDATE SKIP LOCKED
 		) x
 		ORDER BY x.ready_at, x.id
 		LIMIT $3::bigint
-	)
+	)` + claimTail
+
+// claimWorkflowQueues is claimWorkflow for several queues (T10.4): each
+// locking up to $3 rows, it would hold rows (and make other statements
+// skip them: acquireLock's previous holder) that the outer limit drops.
+// The first $3 ready rows across the queues, read without locking, give
+// each queue its share; each queue then locks its share (SKIP LOCKED: rows
+// a concurrent claim holds are passed over for the queue's next ones).
+var claimWorkflowQueues = `
+	WITH n AS (
+		SELECT x.queue, count(*) AS n FROM (
+			SELECT x.queue FROM (SELECT DISTINCT unnest($1::text[])) AS q(name)
+			CROSS JOIN LATERAL (
+				SELECT queue, ready_at, id FROM flows.execution
+				WHERE ` + claimableIn("q.name") + `
+				ORDER BY ready_at, id
+				LIMIT $3::bigint
+			) x
+			ORDER BY x.ready_at, x.id
+			LIMIT $3::bigint
+		) x GROUP BY x.queue
+	), c AS (
+		SELECT x.id FROM n
+		CROSS JOIN LATERAL (
+			SELECT id FROM flows.execution
+			WHERE ` + claimableIn("n.queue") + `
+			ORDER BY ready_at, id
+			LIMIT n.n
+			FOR NO KEY UPDATE SKIP LOCKED
+		) x
+	)` + claimTail
+
+// claimableIn is the condition that an execution of queue q (an SQL
+// expression) can be claimed by owner $2 now.
+func claimableIn(q string) string {
+	return `queue = ` + q + ` AND status IN ('running', 'compensating')
+			  AND ready_at <= now()
+			  AND (locked_until IS NULL OR locked_until < now())
+			  AND (not_before IS NULL OR not_before <= now())
+			  AND (sticky_until IS NULL OR sticky_until < now() OR sticky_owner = $2)`
+}
+
+// claimTail leases the executions of CTE c, extends their locks, and
+// returns them with their pending events (claimWorkflow).
+var claimTail = `
 	, k AS (
 		-- The locks of a running execution do not lapse (store.Completion.Locks).
 		-- It waits for a lock row a contender holds (acquireLock never waits
@@ -406,6 +448,17 @@ var claimWorkflow = `
 		SELECT ` + pendingAggs + `
 		FROM flows.pending_event p WHERE p.execution_id = u.id AND p.visible_at <= now()
 	) a`
+
+// claimStatement picks the claim of queues: claimWorkflow for one queue
+// (listed once or more), claimWorkflowQueues for several.
+func claimStatement(queues []string) (sql, name string) {
+	for _, q := range queues {
+		if q != queues[0] {
+			return claimWorkflowQueues, nClaimWorkflowQueues
+		}
+	}
+	return claimWorkflow, nClaimWorkflow
+}
 
 // pendingAggs aggregates the pending event columns of a group, in delivery
 // order (visibility time, arrival), as arrays: id, then the event columns
@@ -444,8 +497,9 @@ func (s *Store) claimWorkflowTasks(ctx context.Context, owner string, queues []s
 			tasks, next, err = s.claimFast(ctx, owner, queues, limit, ttl, due)
 			return err
 		}
+		sql, _ := claimStatement(queues)
 		if !due {
-			rows, err := s.pool.Query(ctx, claimWorkflow, queues, owner, limit, micros(ttl))
+			rows, err := s.pool.Query(ctx, sql, queues, owner, limit, micros(ttl))
 			if err != nil {
 				return err
 			}
@@ -453,7 +507,7 @@ func (s *Store) claimWorkflowTasks(ctx context.Context, owner string, queues []s
 			return err
 		}
 		b := &pgx.Batch{}
-		b.Queue(claimWorkflow, queues, owner, limit, micros(ttl))
+		b.Queue(sql, queues, owner, limit, micros(ttl))
 		b.Queue(nextWorkflowDue, queues)
 		br := s.pool.SendBatch(ctx, b)
 		defer br.Close()
@@ -1008,20 +1062,27 @@ func wakeWaitersOf(id string) string {
 // drops its waits: a lock whose waiter wakeWaitersOf just woke becomes that
 // waiter's reservation, until its turn ends; the others are deleted (a
 // reservation of id's own too: a woken waiter that leaves wakes nobody).
+// The lock rows are locked in key order first (T10.4), as claims and
+// acquireLock take them, not in the order the update and delete scans
+// meet them.
 func dropLocksOf(id string) string {
 	return `
-	WITH w AS (DELETE FROM flows.lock_waiter WHERE execution_id = ` + id + `
+	WITH l AS MATERIALIZED (
+		SELECT key FROM flows.lock WHERE execution_id = ` + id + ` ORDER BY key FOR UPDATE
+	), w AS (DELETE FROM flows.lock_waiter WHERE execution_id = ` + id + `
 	), r AS (
 		-- The waiter wakeWaitersOf woke in this transaction (now() is the
 		-- transaction's time): not one woken by an earlier release.
 		UPDATE flows.lock k
 		SET execution_id = w.execution_id, reserved = true, sched = 0, until = w.woken_until
 		FROM flows.lock_waiter w
-		WHERE k.execution_id = ` + id + ` AND NOT k.reserved AND w.key = k.key AND w.execution_id <> ` + id + `
+		WHERE k.key = ANY(ARRAY(SELECT key FROM l))
+		  AND k.execution_id = ` + id + ` AND NOT k.reserved AND w.key = k.key AND w.execution_id <> ` + id + `
 		  AND w.woken_until = now() + k.ttl_us * interval '1 microsecond'
 		RETURNING k.key
 	)
-	DELETE FROM flows.lock WHERE execution_id = ` + id + ` AND key NOT IN (SELECT key FROM r)`
+	DELETE FROM flows.lock
+	WHERE key = ANY(ARRAY(SELECT key FROM l)) AND execution_id = ` + id + ` AND key NOT IN (SELECT key FROM r)`
 }
 
 var (
