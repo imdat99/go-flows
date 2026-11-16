@@ -175,6 +175,18 @@ type Worker struct {
 
 	wfSlots, actSlots chan struct{} // semaphores
 	wfHint, actHint   chan struct{} // store hints, capacity 1
+	// timers and eagerSets are reused by drivers: their eager window timer,
+	// and the channel of eager results with the map of activities in
+	// flight (a channel of MaxActivities results is ~24 KiB).
+	// detachedCtx is context.WithoutCancel(tasksCtx), made once.
+	detachedCtx context.Context //nolint:containedctx // the worker's lifetime
+	// wfJobs hands claimed workflow tasks to idle runners (runTask).
+	wfJobs chan wfJob
+	// exOpts are the options of every executor (built once: its method
+	// values would be allocated per execution).
+	exOpts    executor.Options
+	timers    sync.Pool
+	eagerSets sync.Pool
 	// eagerJobs hands eager activities to idle runners (runEager);
 	// runnersStop ends the runners once Stop drained the tasks.
 	eagerJobs     chan eagerJob
@@ -234,7 +246,7 @@ func New(st store.Store, wfs Workflows, acts Activities, opts Options) (*Worker,
 	if opts.Owner == "" || len(opts.Queues) == 0 {
 		return nil, errors.New("worker: Owner and Queues are required")
 	}
-	return &Worker{
+	w := &Worker{
 		st: st, wfs: wfs, acts: acts, opts: opts, log: opts.Logger,
 		cache:       newCache(opts.CacheSize),
 		hb:          newHeartbeat(st, opts.Owner, opts.LeaseTTL, opts.Logger),
@@ -243,10 +255,13 @@ func New(st store.Store, wfs Workflows, acts Activities, opts Options) (*Worker,
 		wfHint:      make(chan struct{}, 1),
 		actHint:     make(chan struct{}, 1),
 		eagerJobs:   make(chan eagerJob),
+		wfJobs:      make(chan wfJob),
 		runnersStop: make(chan struct{}),
 		wfDue:       newDueTimes(dueGrain(opts), 64*opts.PollMax),
 		actDue:      newDueTimes(dueGrain(opts), 64*opts.PollMax),
-	}, nil
+	}
+	w.exOpts = executor.Options{StuckTimeout: opts.StuckTimeout, ErrorText: opts.Errors.Text, ErrorKinds: opts.Errors.Kinds}
+	return w, nil
 }
 
 // dueGrain is the rounding of due times: 10 ms (at most 100 wake-ups a
@@ -269,6 +284,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	base := context.WithoutCancel(ctx)
 	pctx, pollCancel := context.WithCancel(base)
 	w.tasksCtx, w.taskCancel = context.WithCancelCause(base)
+	w.detachedCtx = context.WithoutCancel(w.tasksCtx)
 	w.pollCancel = pollCancel
 	w.beat.Go(func() { w.hb.run(w.tasksCtx) })
 	w.pollers.Go(func() { w.pollWorkflows(pctx) })
@@ -484,11 +500,7 @@ func (w *Worker) pollWorkflows(ctx context.Context) {
 		at := time.Now()
 		tasks, err := w.st.ClaimWorkflowTasks(ctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
 		for i := range tasks {
-			t := tasks[i]
-			w.tasks.Go(func() {
-				defer release(w.wfSlots, 1)
-				w.runWorkflowTask(ctx, &t, at)
-			})
+			w.runTask(wfJob{pollCtx: ctx, task: tasks[i], at: at})
 		}
 		return len(tasks), err
 	})
@@ -507,4 +519,91 @@ func (w *Worker) pollActivities(ctx context.Context) {
 		}
 		return len(tasks), err
 	})
+}
+
+// getTimer returns a stopped-or-new timer set to fire after d.
+func (w *Worker) getTimer(d time.Duration) *time.Timer {
+	if t, ok := w.timers.Get().(*time.Timer); ok {
+		t.Reset(d) // Go 1.23+ timers: no stale value survives Stop/Reset
+		return t
+	}
+	return time.NewTimer(d)
+}
+
+// putTimer stops t and keeps it for getTimer.
+func (w *Worker) putTimer(t *time.Timer) {
+	t.Stop()
+	w.timers.Put(t)
+}
+
+// eagerSet is a driver's channel of eager results and map of the eager
+// activities in flight, reused through Worker.eagerSets.
+type eagerSet struct {
+	results chan eagerResult
+	running map[int32]int64
+}
+
+// getEager returns an empty channel of eager results (buffered for every
+// activity that can run at once: a runner never blocks on a driver that
+// stopped reading) and an empty map.
+func (w *Worker) getEager() *eagerSet {
+	if s, ok := w.eagerSets.Get().(*eagerSet); ok {
+		return s
+	}
+	return &eagerSet{results: make(chan eagerResult, w.opts.MaxActivities), running: map[int32]int64{}}
+}
+
+// putEager keeps an empty set (its map cleared) for getEager.
+func (w *Worker) putEager(s *eagerSet) {
+	if len(s.results) > 0 {
+		return // not empty: drop it
+	}
+	clear(s.running)
+	w.eagerSets.Put(s)
+}
+
+// wfJob is a claimed workflow task for a runner (runTask).
+type wfJob struct {
+	pollCtx context.Context //nolint:containedctx // handed to the runner
+	task    store.WorkflowTask
+	at      time.Time
+}
+
+// runTask runs a claimed workflow task (its slot is held) on an idle
+// runner goroutine, or on a new one, as runEager does for activities: a
+// goroutine with its closure per task costs allocations. Runners stay
+// within about twice MaxWorkflowTasks and live until Stop. Jobs count in
+// tasks (Stop waits for them).
+func (w *Worker) runTask(job wfJob) {
+	w.tasks.Add(1)
+	select {
+	case w.wfJobs <- job:
+		return
+	default:
+	}
+	w.spawnTaskRunner(job)
+}
+
+// spawnTaskRunner starts a workflow task runner with its first job (not
+// inlined: the job would move to the heap on every runTask).
+//
+//go:noinline
+func (w *Worker) spawnTaskRunner(job wfJob) {
+	w.runners.Go(func() {
+		for {
+			w.task1(&job)
+			select {
+			case job = <-w.wfJobs:
+			case <-w.runnersStop:
+				return
+			}
+		}
+	})
+}
+
+func (w *Worker) task1(job *wfJob) {
+	defer w.tasks.Done()
+	defer release(w.wfSlots, 1)
+	w.runWorkflowTask(job.pollCtx, &job.task, job.at)
+	*job = wfJob{} // the runner keeps no reference while idle
 }

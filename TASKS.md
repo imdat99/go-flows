@@ -323,10 +323,10 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
     - tự ghi Bind/Execute thay cho `pgconn.Batch`, vì pgconn không cho tái dùng batch;
     - theo dõi context kiểu `Interrupt` của saga;
     - tuỳ chọn một commit mỗi activity (tương tự `AsyncStepStart`).
-    - **Kết quả:** `BenchmarkActivityRun` từ khoảng 1240 xuống khoảng 105 alloc mỗi workflow (−91%), cùng SQL và cùng số round trip. Đo bằng memprofile ở mỗi bước.
-      - `BenchmarkPublicActivityRun`: khoảng 1330 → 184.
-      - `BenchmarkEagerActivity`: 52 → 6 alloc (9.9 KiB → khoảng 740 B).
-      - `BenchmarkReplay`: 129 → 38.
+    - **Kết quả:** `BenchmarkActivityRun` từ khoảng 1240 xuống khoảng 75 alloc mỗi workflow (−94%), cùng SQL và cùng số round trip. Đo bằng memprofile ở mỗi bước.
+      - `BenchmarkPublicActivityRun`: khoảng 1330 → 140.
+      - `BenchmarkEagerActivity`: 52 → 6 alloc (9.9 KiB → khoảng 780 B).
+      - `BenchmarkReplay`: 129 → 30.
       - Thời gian: khoảng 150 ms mỗi workflow khi durable (trước 172 ms), khoảng 60 ms khi async (trước 80 ms).
     - **Đã làm:**
       - Fast path tự ghi Bind/Execute/Sync vào buffer có pool và đọc từng message (`ReceiveMessage`), thay cho `pgconn.Batch`.
@@ -341,16 +341,21 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
       - Call được cấp theo khối 8; workflow, queue, status được intern.
       - `CreateExecution` chạy trên fast path; lease trả về trong `Completion.Leases`.
       - Watcher đánh thức mọi queue một lần khi bắt đầu nghe (sửa race lúc khởi động: việc làm sẵn trước LISTEN không có hint).
-    - **Chưa đạt ≤ 80** (đạt khoảng 105). Phần còn lại:
-      - context huỷ được của mỗi attempt (2 alloc mỗi activity);
-      - scheduler, state và coroutine đầu tiên của mỗi execution;
-      - bản sao payload;
-      - phần của pgx trên kết nối LISTEN và heartbeat.
-      - Bước tiếp theo (chưa làm): context activity nhẹ tạo lười; pool executor.
+    - **Đạt ≤ 80** (đợt 3, sau khi đợt 2 dừng ở khoảng 105): khoảng 75 alloc mỗi workflow (các mẫu 73–77; benchmark end-to-end chạy cố định 50 vòng mỗi mẫu).
+      - Thêm `BenchmarkActivityRun20`: khoảng 110, tức khoảng 40 cố định cho mỗi workflow và khoảng 3.5 cho mỗi activity.
+      - Đợt 3:
+        - kết nối LISTEN chỉ theo dõi context một lần, không theo từng notification;
+        - driver dùng lại timer và kênh kết quả eager qua pool;
+        - option của executor dựng một lần;
+        - state và scheduler chứa sẵn buffer đầu tiên và root context;
+        - `coro.Canceler` thay cho closure;
+        - workflow task chạy trên runner được tái dùng;
+        - claim activity chạy trên fast path.
+      - Không bỏ context huỷ được của mỗi attempt (2 alloc mỗi activity): `context.Cause(ctx) == ErrActivityCanceled` là API đã công bố, nên phải dùng `context.WithCancelCause` thật.
     - **Lần chạy chậm thỉnh thoảng gặp** (0.5–1.7 s): trace các lời gọi store cho thấy mọi câu lệnh chậm 50–80 ms trong khi luồng engine bình thường. Đó là I/O (fsync) của máy dev, không phải lỗi engine.
     - **Perf gate:**
-      - ActivityRun ≤ 140, PublicActivityRun ≤ 240: chừa khoảng 30% vì khi máy bận, trung vị là 123 và có lần chạy tới 148.
-      - EagerActivity ≤ 8 alloc và ≤ 1 KiB; Replay ≤ 42.
+      - ActivityRun ≤ 85, PublicActivityRun ≤ 155 (50 vòng mỗi mẫu, dao động ±3%).
+      - EagerActivity ≤ 8 alloc và ≤ 1 KiB; Replay ≤ 34.
     - **Review lần 1 không đạt:**
       - Data race: driver đọc completion được tái dùng sau khi đã đưa executor vào cache (tái hiện bằng test bão signal; đã sửa).
       - Cancel request gửi tuần tự, mỗi cái chặn tới 5 s: nay đặt deadline trước, gửi các cancel request song song, chờ tối đa 1 s.

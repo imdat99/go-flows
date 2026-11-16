@@ -68,6 +68,13 @@ func (e *PanicError) Unwrap() error {
 // a run. Exclusive access passes between goroutines through channel
 // hand-offs, which give the happens-before edges.
 type Scheduler struct {
+	// Storage for the first coroutines and their queue, and the root
+	// context, in the scheduler's own allocation: a workflow's executor
+	// usually needs nothing more.
+	rootStore rootCtx
+	allBuf    [4]*Coroutine
+	readyBuf  [4]*Coroutine
+
 	ready   queue[*Coroutine]
 	live    int          // coroutines spawned and not finished
 	all     []*Coroutine // coroutines not finished, for Close
@@ -146,7 +153,9 @@ func NewScheduler(stuck time.Duration) *Scheduler {
 		reaped: make(chan struct{}),
 		stuck:  stuck,
 	}
-	s.root = &rootCtx{s: s}
+	s.rootStore.s = s
+	s.root = &s.rootStore
+	s.all, s.ready.s = s.allBuf[:0], s.readyBuf[:0]
 	watch(s)
 	return s
 }

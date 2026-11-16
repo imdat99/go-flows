@@ -1236,11 +1236,11 @@ const claimActivities = `
 			SELECT id, execution_id, visible_at FROM flows.activity_task
 			WHERE queue = q.name AND visible_at <= now()
 			ORDER BY visible_at, id
-			LIMIT $3
+			LIMIT $3::bigint
 			FOR UPDATE SKIP LOCKED
 		) x
 		ORDER BY x.visible_at, x.id
-		LIMIT $3
+		LIMIT $3::bigint
 	), k AS (
 		-- An execution's locks live while its activities run (store.Completion.Locks);
 		-- waits for a contender's lock row, as the workflow claim.
@@ -1252,8 +1252,8 @@ const claimActivities = `
 	SET owner_id = $2, lease_version = t.lease_version + 1, attempt = t.attempt + 1,
 	    -- A lease that expired without a result: its attempt may have run.
 	    uncertain = t.uncertain OR (t.owner_id <> '' AND NOT t.compensate),
-	    locked_until = now() + $4 * interval '1 microsecond',
-	    visible_at = now() + $4 * interval '1 microsecond'
+	    locked_until = now() + $4::bigint * interval '1 microsecond',
+	    visible_at = now() + $4::bigint * interval '1 microsecond'
 	WHERE t.id = ANY(ARRAY(SELECT id FROM c)) -- a join may scan the table (generic plans)
 	RETURNING t.id, t.lease_version, t.execution_id, t.instance_id, t.schedule_id, t.name, t.queue,
 	          t.input, t.compensate, t.attempt, t.cancel_requested, t.uncertain`
@@ -1263,6 +1263,11 @@ func (s *Store) ClaimActivityTasks(ctx context.Context, owner string, queues []s
 	var out []store.ActivityTask
 	err := retry(ctx, func() error {
 		out = out[:0]
+		if s.fast {
+			var err error
+			out, err = s.claimActivitiesFast(ctx, owner, queues, limit, ttl)
+			return err
+		}
 		rows, err := s.pool.Query(ctx, claimActivities, queues, owner, limit, micros(ttl))
 		if err != nil {
 			return err

@@ -46,8 +46,19 @@ fmt:
 	cd otelflows && golangci-lint fmt --config ../.golangci.yml ./...
 
 # Benchmarks: no -race, 6 samples for benchstat.
+# The end-to-end benchmarks (a workflow on Postgres per op) run a fixed 50
+# iterations per sample: with the default ~7, a few timed polls of the
+# pollers swing their per-op allocations; the plan's target is for a warm,
+# steady engine.
+E2E = ActivityRun|ActivityRun20|PublicActivityRun
+# BENCH=... selects benchmarks and runs them with the default timing.
 bench:
+ifeq ($(BENCH),.)
+	go test -run "^$$" -bench . -skip "$(E2E)" -benchmem -count 6 $(BENCHPKG) | tee $(BENCHOUT)
+	go test -run "^$$" -bench "$(E2E)" -benchtime 50x -benchmem -count 6 $(BENCHPKG) | tee -a $(BENCHOUT)
+else
 	go test -run "^$$" -bench "$(BENCH)" -benchmem -count 6 $(BENCHPKG) | tee $(BENCHOUT)
+endif
 
 # go-workflows on the same scenario (docs/benchmarks.md); a separate module.
 bench-goworkflows:

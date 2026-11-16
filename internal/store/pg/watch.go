@@ -32,8 +32,13 @@ func (s *Store) Watch(ctx context.Context, wake func(kind store.WorkKind, queue 
 	// a failure) notified nobody: poll for it once.
 	wake(store.WorkflowWork, "")
 	wake(store.ActivityWork, "")
+	// Waiting with ctx would make pgconn watch it per notification
+	// (allocations on every hint): ctx is watched once instead, its end
+	// cutting the wait short with a past deadline.
+	stop := context.AfterFunc(ctx, func() { _ = conn.PgConn().Conn().SetDeadline(time.Unix(1, 0)) })
+	defer stop()
 	for {
-		n, err := conn.WaitForNotification(ctx)
+		n, err := conn.WaitForNotification(context.Background())
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()

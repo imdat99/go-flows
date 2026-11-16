@@ -39,6 +39,7 @@ var (
 	nResumePending   = stmtName(resumePending)
 	nClaimWorkflow   = stmtName(claimWorkflow)
 	nInsertExecution = stmtName(insertExecution)
+	nClaimActivities = stmtName(claimActivities)
 )
 
 // stmt starts and ends one statement of a fast batch.
@@ -644,4 +645,47 @@ func intern(b []byte) string {
 	}
 	interned.Unlock()
 	return s
+}
+
+// claimActivitiesFast is ClaimActivityTasks on the fast path (pollers
+// claim often, mostly nothing: this keeps an empty claim cheap).
+func (s *Store) claimActivitiesFast(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.ActivityTask, error) {
+	pc, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer pc.Release()
+	fb := s.getFastBatch(ctx, pc.Conn())
+	defer fb.release()
+	fb.stmt(claimActivities, nClaimActivities, func() {
+		fb.Strs(len(queues), func(i int) string { return queues[i] })
+		fb.Str(owner)
+		fb.Int(int64(limit))
+		fb.Int(micros(ttl))
+	})
+	var out []store.ActivityTask
+	err = fb.exec(func(_ int, v [][]byte) error {
+		if len(v) != 12 {
+			return fmt.Errorf("%w: %d activity task columns", errBadValue, len(v))
+		}
+		t := store.ActivityTask{Lease: store.Lease{Owner: owner}}
+		var nums [5]int64
+		for i, col := range [...]int{0, 1, 2, 4, 9} {
+			n, err := decodeInt(v[col])
+			if err != nil {
+				return err
+			}
+			nums[i] = n
+		}
+		t.Lease.ID, t.Lease.Version, t.ExecutionID = nums[0], nums[1], nums[2]
+		t.ScheduleID, t.Attempt = int32(nums[3]), int32(nums[4]) // int4 columns
+		t.InstanceID, t.Name, t.Queue = string(v[3]), intern(v[5]), intern(v[6])
+		t.Input = cloneBytes(v[7])
+		t.Compensate = len(v[8]) == 1 && v[8][0] == 1
+		t.CancelRequested = len(v[10]) == 1 && v[10][0] == 1
+		t.Uncertain = len(v[11]) == 1 && v[11][0] == 1
+		out = append(out, t)
+		return nil
+	})
+	return out, err
 }

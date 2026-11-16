@@ -46,6 +46,7 @@ type driver struct {
 	inflight int
 	results  chan eagerResult
 	running  map[int32]int64 // schedule id -> activity lease id of eager activities in flight
+	set      *eagerSet       // results and running, from Worker.getEager
 	window   *time.Timer     // reused for every wait on eager results
 	// compensating: the workflow ended and its compensation runs
 	// (compensate.go); ledger is its state after ledgerSeq, kept between
@@ -94,7 +95,7 @@ func (w *Worker) runWorkflowTask(pollCtx context.Context, task *store.WorkflowTa
 // windowTimer (re)arms the eager window timer.
 func (d *driver) windowTimer() <-chan time.Time {
 	if d.window == nil {
-		d.window = time.NewTimer(d.w.opts.EagerWindow)
+		d.window = d.w.getTimer(d.w.opts.EagerWindow)
 	} else {
 		d.window.Reset(d.w.opts.EagerWindow) // Go 1.23+ timers: no stale value to drain
 	}
@@ -104,7 +105,12 @@ func (d *driver) windowTimer() <-chan time.Time {
 func (d *driver) run(pollCtx context.Context, task *store.WorkflowTask) {
 	defer func() {
 		if d.window != nil {
-			d.window.Stop()
+			d.w.putTimer(d.window)
+			d.window = nil
+		}
+		if d.set != nil && d.inflight == 0 { // not handed to a detached recorder
+			d.w.putEager(d.set)
+			d.set, d.results, d.running = nil, nil, nil
 		}
 		if d.ex != nil {
 			d.ex.Close()
@@ -149,7 +155,8 @@ func (d *driver) detach() {
 	}
 	n, results, w := d.inflight, d.results, d.w
 	d.inflight = 0
-	w.detached.Add(1) // before the driver releases its slot
+	d.set, d.results, d.running = nil, nil, nil // the recorder owns the channel now
+	w.detached.Add(1)                           // before the driver releases its slot
 	w.tasks.Go(func() {
 		defer w.detached.Add(-1)
 		for range n {
@@ -188,7 +195,7 @@ func (d *driver) recordResult(r eagerResult, resume bool) *store.WorkflowTask {
 		lease = &d.lease
 	}
 	if d.detached == nil {
-		d.detached = context.WithoutCancel(d.ctx)
+		d.detached = d.w.detachedCtx // d.ctx's values (none of its own), never canceled
 	}
 	// The resumed task goes to one of two buffers in turn: the task this
 	// one follows may still be referenced while it is recorded.
@@ -441,8 +448,8 @@ func (d *driver) launch(t store.ActivityTask, claimed time.Time) {
 	if d.results == nil {
 		// Buffered for every activity that can run at once: an activity
 		// never blocks on a driver that stopped reading (panic, hand-over).
-		d.results = make(chan eagerResult, w.opts.MaxActivities)
-		d.running = map[int32]int64{}
+		d.set = w.getEager()
+		d.results, d.running = d.set.results, d.set.running
 	}
 	d.inflight++
 	d.running[t.ScheduleID] = t.Lease.ID
@@ -524,9 +531,7 @@ func (d *driver) build(task *store.WorkflowTask) bool {
 		d.release(w.opts.HandBack)
 		return false
 	}
-	ex := executor.New(wf, e.ID, executor.Options{
-		StuckTimeout: w.opts.StuckTimeout, ErrorText: w.opts.Errors.Text, ErrorKinds: w.opts.Errors.Kinds,
-	})
+	ex := executor.New(wf, e.ID, w.exOpts)
 	var err error
 	if task.LastSeq > 0 { // a new execution has no history yet
 		var hist []history.Event

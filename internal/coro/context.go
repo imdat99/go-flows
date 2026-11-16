@@ -62,6 +62,19 @@ func WithCancelCause(parent Context) (Context, CancelCauseFunc) {
 	return c, func(cause error) { c.cancel(ErrCanceled, cause, true) }
 }
 
+// Canceler cancels a context made by WithCanceler (a value: no closure to
+// allocate, unlike WithCancelCause's function).
+type Canceler struct{ c *cancelCtx }
+
+// Cancel cancels the context with cause (see WithCancelCause).
+func (k Canceler) Cancel(cause error) { k.c.cancel(ErrCanceled, cause, true) }
+
+// WithCanceler is WithCancelCause returning a Canceler.
+func WithCanceler(parent Context) (Context, Canceler) {
+	c := newCancelCtx(parent, true)
+	return c, Canceler{c}
+}
+
 // Disconnected returns a context with parent's values that is not canceled
 // with parent (cleanup after cancellation, compensation).
 func Disconnected(parent Context) (Context, CancelFunc) {

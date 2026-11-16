@@ -14,15 +14,15 @@ and the benchmark waits for it to end. One op is one workflow.
 | Engine | Durable commit: time/workflow | per activity | allocs/workflow | Async commit: time/workflow | allocs |
 | --- | --- | --- | --- | --- | --- |
 | saga (`BenchmarkStepRun`, inline runs) | **96 ms** | 9.6 ms (p50 8 ms) | **63** | **22 ms** | **44** |
-| go-flows (`BenchmarkActivityRun`, eager execution) | 150 ms | 15 ms | 105 | 60 ms | ~110 |
-| go-flows public typed API (`BenchmarkPublicActivityRun`) | ~150 ms | ~15 ms | 184 | | |
+| go-flows (`BenchmarkActivityRun`, eager execution) | 150 ms | 15 ms | 75 | 60 ms | ~75 |
+| go-flows public typed API (`BenchmarkPublicActivityRun`) | ~145 ms | ~14.5 ms | 140 | | |
 | go-workflows 48e8119, default polling (200 ms) | 3.1 s (run 2.5 s) | 310 ms (250 ms) | ~26 000 | | |
 | go-workflows 48e8119, polling 1 ms | 1.0 s (run 0.77 s) | 100 ms (77 ms) | ~150 000 | | |
 
 Reading:
 
 - **go-flows against go-workflows**: 4.5x faster than go-workflows tuned for
-  latency (1 ms polling), 15x faster than its defaults, with 250 to 1 400
+  latency (1 ms polling), 15x faster than its defaults, with 350 to 2 000
   times fewer allocations. The waits differ: go-flows' benchmark learns of the end
   from the store call that commits it, go-workflows' from
   `client.GetWorkflowResult`, which polls with a growing backoff (1 ms x1.5,
@@ -35,11 +35,11 @@ Reading:
   activity, no polling), where go-workflows polls for every workflow and
   activity task and replays through reflection.
 - **go-flows against saga**: about 1.6x slower (durable) and 2.7x slower
-  (async commit), with ~1.7x the allocations. saga runs a step in ~3
+  (async commit), with ~1.2x the allocations. saga runs a step in ~3
   statements; go-flows runs ~9 per activity (below). go-flows buys event
   history (concurrency in workflows, Select, timers, signals, children,
   continue-as-new, replay) with that.
-- **The typed public layer** adds ~80 allocations per workflow over the
+- **The typed public layer** adds ~65 allocations per workflow over the
   internal worker: the JSON encoding and decoding of each activity's input
   and output (codec lookups are 0 allocs) and each activity's key.
 
@@ -64,28 +64,30 @@ gave, per execution (bind + execute):
 Forcing generic plans (`plan_cache_mode=force_generic_plan`) saved ~8%,
 within noise. The cost is the number of statements per activity on this CPU.
 
-## Allocations (go-flows, 10-activity workflow, ~105)
+## Allocations (go-flows, 10-activity workflow, ~75)
 
-T8.2 brought `BenchmarkActivityRun` from ~1 240 to ~105 allocations per
-workflow (-91%), with the same SQL and round trips, guided by memory
-profiles (`-memprofilerate 1`):
+T8.2 brought `BenchmarkActivityRun` from ~1 240 to ~75 allocations per
+workflow (-94%), with the same SQL and round trips, guided by memory
+profiles (`-memprofilerate 1`; the difference of two runs of 100 and 400
+iterations gives the steady state exactly):
 
 | Change | allocations per workflow |
 | --- | --- |
 | The fast path writes Bind/Execute/Sync messages into a pooled buffer and reads replies message by message, instead of a `pgconn.Batch` per call (its buffer, descriptions and formats were allocated each time) | ~1 240 to ~750 |
 | The claim decodes its pending-event arrays by hand (pgx planned a scan per array) | ~750 to ~600 |
 | The benchmark warms up first (the pool's SCRAM handshakes were counted); tasks carry no input/output (store.WorkflowTask); no history load for a new execution | ~600 to ~385 |
-| The context is watched once per context (a cancel request and a connection deadline when it ends), not by pgconn per call | ~385 to ~350 |
+| The context is watched once per context (a deadline, then a cancel request, when it ends), not by pgconn per call | ~385 to ~350 |
 | Eager activities run on reused runner goroutines; heartbeat entries by value; a lease's untrack is a value, not a closure | ~350 to ~250 |
-| The executor reuses its completion; resumed tasks are written into the driver's two buffers (their pending slice reused); calls are allocated in blocks of eight; workflow names, queues and statuses are interned | ~250 to ~130 |
+| The executor reuses its completion; resumed tasks are written into the driver's two buffers (their pending slice reused); calls are allocated in blocks; workflow names, queues and statuses are interned | ~250 to ~130 |
 | Workflow start (`CreateExecution`) on the fast path; completions return leases in the completion's scratch space | ~130 to ~105 |
+| The LISTEN connection is watched once, not per notification; drivers reuse their eager window timer and result channel; executor options built once; workflow state and scheduler hold their first buffers and root context; workflow tasks run on reused runner goroutines | ~105 to ~78 |
+| Activity claims on the fast path (idle polls cost little) | ~78 to ~75 |
 
-What remains (~105): per activity, a cancelable context for the attempt (2),
-the result's payload copy and the scheduled call; per execution, the
-coroutine scheduler, the workflow state and its first coroutine; and pgx's
-own cost on the LISTEN connection and the heartbeat. The plan's <= 80 would
-need a lighter, lazily created activity context and pooled executors: the
-next steps, not done.
+What remains (~75): a 20-activity workflow takes ~110, so ~40 per workflow
+(start, claim, executor, scheduler, first coroutine, driver, end) and ~3.5
+per activity, two of them the attempt's cancelable context (its
+`context.Cause` is the documented way to tell a canceled activity, so it is
+a real `context.WithCancelCause`).
 
 ## Polling (T8.2)
 
@@ -122,15 +124,16 @@ fsync), not of the engine.
 | --- | --- | --- |
 | `BenchmarkScheduler` (coroutine hand-off) | 0 allocs, ~660 ns/switch | 0 allocs |
 | `BenchmarkChannelPingPong`, `BenchmarkCommitActivity`, `BenchmarkHashArgs` | 0 allocs | 0 |
-| `BenchmarkReplay` (cold, 302 events) | 38 allocs, ~0.9 us/event | 42 |
-| `BenchmarkEagerActivity` (store side, one activity) | 6 allocs, ~740 B | 8, 1 KiB |
-| `BenchmarkActivityRun` | ~105 allocs | 140 |
-| `BenchmarkPublicActivityRun` | ~184 allocs | 240 |
+| `BenchmarkReplay` (cold, 302 events) | 30 allocs, ~0.85 us/event | 34 |
+| `BenchmarkEagerActivity` (store side, one activity) | 6 allocs, ~780 B | 8, 1 KiB |
+| `BenchmarkActivityRun` (50 iterations per sample) | ~75 allocs | 85 |
+| `BenchmarkPublicActivityRun` (50 iterations per sample) | ~140 allocs | 155 |
 | `BenchmarkCodec` encode / decode / lookup | 1 / 1 / 0 allocs | same |
 
-The end-to-end budgets carry ~30% headroom: their allocation counts move with
-how many polls happen during a run (single runs vary 104 to 120 here; a
-loaded machine measured a median of 123, runs up to 148). `flowtest`'s `BenchmarkFanOut` (256
+The end-to-end benchmarks run a fixed 50 iterations per sample (`make
+bench`): with the default ~7, a few timed polls of the pollers swung their
+per-op allocations by +-20%. Their samples now stay within +-3%; the
+budgets keep ~12% headroom. `flowtest`'s `BenchmarkFanOut` (256
 coroutines each running a mocked activity: ~5 ms for 16, ~6 to 10 ms for 64,
 ~10 to 18 ms for 256, close to linear, against go-workflows' O(n^3) tester,
 issue #377) has no rule: it counts the allocations of the whole tester

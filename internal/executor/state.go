@@ -54,7 +54,7 @@ type State struct {
 	calls     []call // issued commands, by schedule id - 1
 	signals   map[string]*coro.Channel[[]byte]
 	root      coro.Context
-	cancel    coro.CancelFunc
+	cancel    coro.Canceler
 	queue     string          // the execution's queue (from ExecutionStarted)
 	out       []history.Event // events of the current task
 	end       *ending
@@ -64,6 +64,9 @@ type State struct {
 	checkedTo int
 	// resultBlock is the rest of the block newResultCall takes from.
 	resultBlock []resultCall
+	// Initial storage of calls and out, in the state's own allocation.
+	callsBuf [16]call
+	outBuf   [8]history.Event
 	// canceling holds the commands canceled since the last TaskStarted
 	// that were committed already: their cancel must be matched by the next
 	// one too (checkTaskBoundary).
@@ -259,9 +262,11 @@ func FromContext(ctx coro.Context) *State {
 }
 
 func newState(e *Executor) *State {
-	st := &State{ex: e, signals: make(map[string]*coro.Channel[[]byte]), calls: make([]call, 0, 16)} // most executions issue a few calls: grow once
-	root, cancel := coro.WithCancelCause(coro.WithValue(e.sched.Root(), stateKey{}, st))
-	st.root, st.cancel = root, func() { cancel(ErrCanceled) }
+	// Most executions issue a few calls and events per task: grow once.
+	// The signals map is made by the first signal channel.
+	st := &State{ex: e}
+	st.calls, st.out = st.callsBuf[:0], st.outBuf[:0]
+	st.root, st.cancel = coro.WithCanceler(coro.WithValue(e.sched.Root(), stateKey{}, st))
 	return st
 }
 
@@ -276,7 +281,7 @@ func (st *State) Replaying() bool { return st.replaying }
 // Root returns the workflow's root context.
 func (st *State) Root() coro.Context { return st.root }
 
-func (st *State) cancelRoot() { st.cancel() }
+func (st *State) cancelRoot() { st.cancel.Cancel(ErrCanceled) }
 
 func (st *State) startMain(queue string, input []byte) {
 	st.queue = queue
@@ -300,14 +305,13 @@ func (st *State) finishWith(out []byte, err error) {
 	if st.end != nil {
 		return
 	}
-	var can *ContinueAsNewError
-	switch {
+	switch can := continueAsNew(err); {
 	case err == nil:
 		st.end = &ending{
 			status: store.StatusCompleted, output: out,
 			event: history.Event{Type: history.ExecutionCompleted, Payload: out},
 		}
-	case errors.As(err, &can):
+	case can != nil:
 		wf := st.ex.wf
 		st.end = &ending{
 			status: store.StatusContinued,
@@ -332,6 +336,9 @@ func (st *State) finishWith(out []byte, err error) {
 }
 
 func (st *State) signal(name string) *coro.Channel[[]byte] {
+	if st.signals == nil {
+		st.signals = make(map[string]*coro.Channel[[]byte])
+	}
 	ch, ok := st.signals[name]
 	if !ok {
 		ch = coro.NewChannel[[]byte](-1) // never drop a signal (GW-14)
@@ -349,7 +356,11 @@ func (st *State) SignalChannel(name string) *coro.Channel[[]byte] { return st.si
 // execution's state).
 func (st *State) newResultCall() *resultCall {
 	if len(st.resultBlock) == 0 {
-		st.resultBlock = make([]resultCall, 8)
+		n := 16 // the first block: most executions need no other
+		if len(st.calls) > 0 {
+			n = 8
+		}
+		st.resultBlock = make([]resultCall, n)
 	}
 	c := &st.resultBlock[0]
 	st.resultBlock = st.resultBlock[1:]
@@ -511,4 +522,11 @@ func (st *State) compact() {
 		cmd.Payload = nil
 		st.committedTo++
 	}
+}
+
+// continueAsNew returns the ContinueAsNewError in err's chain, or nil
+// (errors.AsType allocates no target, unlike errors.As).
+func continueAsNew(err error) *ContinueAsNewError {
+	c, _ := errors.AsType[*ContinueAsNewError](err)
+	return c
 }

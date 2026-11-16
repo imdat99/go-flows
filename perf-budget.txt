@@ -22,33 +22,31 @@ BenchmarkHashArgs allocs/op <= 0
 # internal/store/pg (T2.8): eager loop, store side, one activity per op
 # (complete workflow task + complete activity with resume: 2 round trips).
 # T8.2 (wire buffer instead of pgconn.Batch, context watched per context,
-# reused task buffers): measured 6 allocs, ~740 B (was 52, 9.9 KiB; pgx
+# reused task buffers): measured 6 allocs, ~780 B (was 52, 9.9 KiB; pgx
 # path: 311, 20.4 KiB). Latency is fsync-bound (~12 ms on the dev box, 2
 # commits): no rule.
 BenchmarkEagerActivity allocs/op <= 8
 BenchmarkEagerActivity B/op <= 1024
 
 # internal/executor (T3.1): cold replay of a 100-activity history (302
-# events): measured 38 allocs (T8.2: reused completion, calls allocated in
-# blocks; was 130), ~0.9 us/event.
-BenchmarkReplay allocs/op <= 42
+# events): measured 30 allocs (T8.2: reused completion, calls in blocks,
+# state with its first buffers; was 130), ~0.85 us/event.
+BenchmarkReplay allocs/op <= 34
 
 # internal/worker (T3.5): end to end on Postgres, eager execution, one op =
 # a 10-activity workflow (start, run, end; includes polling, heartbeat,
-# goroutines), after a warm-up (pool connections, prepared statements).
-# T8.2: median ~105 allocs/op (single runs 104-120 with polling; a loaded
-# machine measured a median of 123, runs 117-148, hence the headroom; was
-# ~1215),
-# ~42 KiB/op, ~15 ms/activity durable. The plan's <= 80 is approached, not
-# met: what remains is mostly per activity (a cancelable context, 2) and
-# per execution (scheduler, state) (docs/benchmarks.md).
-BenchmarkActivityRun allocs/op <= 140
+# goroutines), after a warm-up, 50 iterations per sample (Makefile).
+# T8.2: median ~75 allocs/op (samples 73-77; was ~1215), ~17 KiB/op,
+# ~15 ms/activity durable: the plan's <= 80 is met. A 20-activity workflow
+# (BenchmarkActivityRun20, no rule) takes ~110: ~40 per workflow, ~3.5 per
+# activity (2 of them its attempt's cancelable context).
+BenchmarkActivityRun allocs/op <= 85
 
 # Root package (T4.1): the typed codec on the data path; a whole workflow
 # through the public API (same shape as BenchmarkActivityRun, plus the
 # typed layer: JSON encode/decode of inputs and outputs, activity keys).
-# T8.2: median ~184 (single runs 167-200; was ~1280), headroom as above.
+# T8.2: median ~140 (samples 139-142; was ~1280).
 BenchmarkCodec/encode allocs/op <= 1
 BenchmarkCodec/decode allocs/op <= 1
 BenchmarkCodec/lookup allocs/op <= 0
-BenchmarkPublicActivityRun allocs/op <= 240
+BenchmarkPublicActivityRun allocs/op <= 155

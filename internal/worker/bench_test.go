@@ -18,7 +18,15 @@ import (
 // activities, run end to end by a worker on Postgres with eager execution
 // (the plan's main performance target: 2 round trips per activity). It
 // includes starting the workflow and waiting for its end.
-func BenchmarkActivityRun(b *testing.B) {
+func BenchmarkActivityRun(b *testing.B) { benchChain(b, 10) }
+
+// BenchmarkActivityRun20 is BenchmarkActivityRun with 20 activities: the
+// difference is the cost of 10 activities, the rest the fixed cost of a
+// workflow (start, executor, end).
+func BenchmarkActivityRun20(b *testing.B) { benchChain(b, 20) }
+
+func benchChain(b *testing.B, n int) {
+	b.Helper()
 	pool := testdb.New(b)
 	ctx := context.Background()
 	if err := pg.Migrate(ctx, pool); err != nil {
@@ -36,7 +44,7 @@ func BenchmarkActivityRun(b *testing.B) {
 	}
 	st := &endSignal{Store: pg.New(pool), ended: make(chan struct{}, 1)}
 	reg := newRegistry()
-	reg.addWorkflow("chain", chainOf(10))
+	reg.addWorkflow("chain", chainOf(n))
 	reg.addActivity("double", &worker.Activity{Run: func(_ context.Context, t *store.ActivityTask) ([]byte, []byte, error) {
 		return t.Input, nil, nil
 	}})
@@ -67,7 +75,7 @@ func BenchmarkActivityRun(b *testing.B) {
 		<-st.ended
 	}
 	b.StopTimer()
-	b.ReportMetric(float64(b.Elapsed().Microseconds())/float64(b.N*10), "µs/activity")
+	b.ReportMetric(float64(b.Elapsed().Microseconds())/float64(b.N*n), "µs/activity")
 }
 
 // endSignal reports completed executions on a channel, so the benchmark
