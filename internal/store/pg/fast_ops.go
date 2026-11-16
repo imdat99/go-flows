@@ -747,7 +747,7 @@ func (s *Store) claimActivitiesFast(ctx context.Context, owner string, queues []
 		if i == 1 {
 			return decodeDue(v, &next)
 		}
-		if len(v) != 12 {
+		if len(v) != 13 {
 			return fmt.Errorf("%w: %d activity task columns", errBadValue, len(v))
 		}
 		t := store.ActivityTask{Lease: store.Lease{Owner: owner}}
@@ -766,6 +766,7 @@ func (s *Store) claimActivitiesFast(ctx context.Context, owner string, queues []
 		t.Compensate = len(v[8]) == 1 && v[8][0] == 1
 		t.CancelRequested = len(v[10]) == 1 && v[10][0] == 1
 		t.Uncertain = len(v[11]) == 1 && v[11][0] == 1
+		t.CompData = cloneBytes(v[12]) // NULL: nil, no allocation
 		out = append(out, t)
 		return nil
 	})

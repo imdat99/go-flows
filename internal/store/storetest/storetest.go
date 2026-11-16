@@ -146,6 +146,7 @@ func Run(t *testing.T, h Harness) {
 		{"ContinueAsNewLeavesChildren", testContinueAsNewLeavesChildren},
 		{"PurgeKeepsChildrenOfActiveParents", testPurgeKeepsChildrenOfActiveParents},
 		{"UncertainAcrossAttempts", testUncertainAcrossAttempts},
+		{"CompDataAcrossAttempts", testCompDataAcrossAttempts},
 		{"GW13_ActivityCancelReachesItsWorker", testActivityCancel},
 		{"GW13_CancelBeforeRetry", testCancelBeforeRetry},
 	}
@@ -642,7 +643,7 @@ func testActivityLeaseFenced(t *testing.T, h Harness) {
 	if _, err := s.CompleteActivityTask(ctx, first.Lease, res); !errors.Is(err, store.ErrLeaseLost) {
 		t.Fatalf("stale complete: %v", err)
 	}
-	if err := s.RetryActivityTask(ctx, first.Lease, 0, false); !errors.Is(err, store.ErrLeaseLost) {
+	if err := s.RetryActivityTask(ctx, first.Lease, 0, false, nil); !errors.Is(err, store.ErrLeaseLost) {
 		t.Fatalf("stale retry: %v", err)
 	}
 	if _, err := s.CompleteActivityTask(ctx, second[0].Lease, res); err != nil {
@@ -658,7 +659,7 @@ func testActivityRetry(t *testing.T, h Harness) {
 	s := h.New(t)
 	scheduleActivity(t, s, h, "i1", store.NewActivityTask{ScheduleID: 1, Name: "a", Queue: queue})
 	a := claimActivity(t, s, owner, h.TTL)[0]
-	if err := s.RetryActivityTask(ctx, a.Lease, h.TTL, false); err != nil {
+	if err := s.RetryActivityTask(ctx, a.Lease, h.TTL, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := claimActivity(t, s, owner, h.TTL); len(got) != 0 {

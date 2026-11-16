@@ -343,7 +343,12 @@ type ActivityTask struct {
 	// too. For a
 	// compensation: the activity it undoes may not have had its effect.
 	Uncertain bool
-	Attempt   int32 // 1 for the first attempt
+	// CompData, for an invocation, is the compensation data that an
+	// earlier attempt which may have had its effect returned (the most
+	// recent one kept by RetryActivityTask; nil if none). The worker gives
+	// it to the compensator when the final attempt returns none.
+	CompData []byte
+	Attempt  int32 // 1 for the first attempt
 	// CancelRequested reports that the workflow canceled the activity
 	// before this attempt: the worker records the cancel instead of running
 	// it.
@@ -503,8 +508,10 @@ type Store interface {
 	// after delay, for another attempt. uncertain records that the attempt
 	// may have had its effect (ActivityTask.Uncertain of later attempts; not
 	// for compensation tasks). Claiming a task whose lease expired without a
-	// result marks it so too (its holder died mid-attempt).
-	RetryActivityTask(ctx context.Context, l Lease, delay time.Duration, uncertain bool) error
+	// result marks it so too (its holder died mid-attempt). A non-nil
+	// compData replaces the kept compensation data (ActivityTask.CompData
+	// of later attempts; ignored for compensation tasks); nil keeps it.
+	RetryActivityTask(ctx context.Context, l Lease, delay time.Duration, uncertain bool, compData []byte) error
 
 	// Unstick clears every execution's stickiness to owner: a stopping
 	// owner hands them over at once instead of keeping them for StickyFor.

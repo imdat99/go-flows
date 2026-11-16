@@ -15,6 +15,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -47,6 +48,15 @@ type Activity struct {
 	// Timeout bounds one attempt (0: none; the lease still bounds a dead
 	// worker).
 	Timeout time.Duration
+	// ZeroComp is the encoding of the zero compensation data (nil if
+	// unknown): an attempt that returns it returned no data, so the data of
+	// an earlier attempt that may have had its effect is kept.
+	ZeroComp []byte
+}
+
+// noComp reports whether comp is no compensation data (empty or zero).
+func (a *Activity) noComp(comp []byte) bool {
+	return len(comp) == 0 || a.ZeroComp != nil && bytes.Equal(comp, a.ZeroComp)
 }
 
 // ErrorCodec records errors: their storage-safe text, their sentinel kinds

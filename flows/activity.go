@@ -118,8 +118,15 @@ func DefineActivity[I, O, C any](name string, invoke InvokeFunc[I, O, C], compen
 // compensation data.
 func (a *Activity[I, O, C]) invoker(invoke InvokeFunc[I, O, C], withComp bool) *worker.Activity {
 	name, comp := a.name, newCodec[C]()
+	var zero []byte
+	if withComp {
+		// Returning the zero value is returning no data: the data of an
+		// earlier attempt that may have had its effect is kept.
+		var z C
+		zero, _ = comp.encode(z) // nil if it cannot be encoded: only empty data is none
+	}
 	return &worker.Activity{
-		Retry: a.cfg.retry, Timeout: a.cfg.timeout,
+		Retry: a.cfg.retry, Timeout: a.cfg.timeout, ZeroComp: zero,
 		Run: func(ctx context.Context, t *store.ActivityTask) ([]byte, []byte, error) {
 			in, err := a.in.decode(t.Input)
 			if err != nil {

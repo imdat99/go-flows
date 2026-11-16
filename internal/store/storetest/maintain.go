@@ -291,7 +291,7 @@ func testCancelBeforeRetry(t *testing.T, h Harness) {
 	}
 	// A long retry delay: the cancel makes the task claimable at once, so
 	// the workflow learns of it without waiting out the backoff.
-	if err := s.RetryActivityTask(ctx, a.Lease, time.Hour, false); err != nil {
+	if err := s.RetryActivityTask(ctx, a.Lease, time.Hour, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Signal(ctx, "i1", "x", nil); err != nil {
@@ -347,14 +347,14 @@ func testUncertainAcrossAttempts(t *testing.T, h Harness) {
 	if a.Uncertain {
 		t.Fatal("first attempt uncertain")
 	}
-	if err := s.RetryActivityTask(ctx, a.Lease, 0, false); err != nil {
+	if err := s.RetryActivityTask(ctx, a.Lease, 0, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	a = claimActivity(t, s, owner, h.TTL)[0]
 	if a.Uncertain {
 		t.Fatal("uncertain after a certain retry")
 	}
-	if err := s.RetryActivityTask(ctx, a.Lease, 0, true); err != nil {
+	if err := s.RetryActivityTask(ctx, a.Lease, 0, true, nil); err != nil {
 		t.Fatal(err)
 	}
 	a = claimActivity(t, s, owner, h.TTL)[0]
@@ -377,6 +377,63 @@ func testUncertainAcrossAttempts(t *testing.T, h Harness) {
 		if x.InstanceID == "i2" && !x.Uncertain {
 			t.Fatalf("claim after a dead holder: %+v", x)
 		}
+	}
+}
+
+// T10.7: a retry may keep compensation data for later attempts: the most
+// recent non-nil data wins, nil keeps it, a stale lease writes nothing, a
+// dead holder's reclaim keeps it, and compensation tasks keep none.
+func testCompDataAcrossAttempts(t *testing.T, h Harness) {
+	s := h.New(t)
+	scheduleActivity(t, s, h, "i1", store.NewActivityTask{ScheduleID: 1, Name: "a", Queue: queue})
+	a := claimActivity(t, s, owner, h.TTL)[0]
+	if a.CompData != nil {
+		t.Fatalf("first attempt with data %q", a.CompData)
+	}
+	steps := []struct {
+		keep []byte
+		want string
+	}{
+		{[]byte(`"c1"`), `"c1"`},
+		{nil, `"c1"`}, // nil keeps the earlier data
+		{[]byte(`"c2"`), `"c2"`},
+	}
+	for i, st := range steps {
+		if err := s.RetryActivityTask(ctx, a.Lease, 0, true, st.keep); err != nil {
+			t.Fatal(err)
+		}
+		if st.keep != nil {
+			st.keep[1] = 'x' // the store keeps its own copy
+		}
+		next := claimActivity(t, s, owner, h.TTL)
+		if len(next) != 1 || string(next[0].CompData) != st.want {
+			t.Fatalf("step %d: %+v, want data %s", i, next, st.want)
+		}
+		if err := s.RetryActivityTask(ctx, a.Lease, 0, true, []byte(`"stale"`)); !errors.Is(err, store.ErrLeaseLost) {
+			t.Fatalf("stale retry: %v", err)
+		}
+		a = next[0]
+	}
+	// Its holder dies: the next claim still has the data.
+	h.Advance(t, s, h.TTL+h.TTL/2)
+	got := claimActivity(t, s, other, h.TTL)
+	if len(got) != 1 || string(got[0].CompData) != `"c2"` || !got[0].Uncertain {
+		t.Fatalf("claim after a dead holder: %+v", got)
+	}
+
+	// A compensation task keeps no data: its input is the data.
+	s = h.New(t)
+	scheduleActivity(t, s, h, "i2", store.NewActivityTask{ScheduleID: 1, Name: "b", Queue: queue, Compensate: true, Input: []byte(`"in"`)})
+	c := claimActivity(t, s, owner, h.TTL)
+	if len(c) != 1 || c[0].InstanceID != "i2" {
+		t.Fatalf("compensation claim %+v", c)
+	}
+	if err := s.RetryActivityTask(ctx, c[0].Lease, 0, true, []byte(`"c"`)); err != nil {
+		t.Fatal(err)
+	}
+	c = claimActivity(t, s, owner, h.TTL)
+	if len(c) != 1 || c[0].CompData != nil || string(c[0].Input) != `"in"` {
+		t.Fatalf("compensation task: %+v", c)
 	}
 }
 
@@ -646,7 +703,7 @@ func testDueClaims(t *testing.T, h Harness) {
 	if err != nil || len(acts) != 1 {
 		t.Fatalf("activity claim: %v %v", acts, err)
 	}
-	if err := s.RetryActivityTask(ctx, acts[0].Lease, d/4, false); err != nil {
+	if err := s.RetryActivityTask(ctx, acts[0].Lease, d/4, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	_, next, err = dc.ClaimActivityTasksDue(ctx, owner, []string{queue}, 10, h.TTL)

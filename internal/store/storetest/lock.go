@@ -272,7 +272,7 @@ func testLockKeptWhileActivityWaits(t *testing.T, h Harness) {
 	if len(act) != 1 {
 		t.Fatalf("activities %+v", act)
 	}
-	if err := s.RetryActivityTask(ctx, act[0].Lease, h.TTL, false); err != nil {
+	if err := s.RetryActivityTask(ctx, act[0].Lease, h.TTL, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	h.Advance(t, s, h.TTL+h.TTL/2)

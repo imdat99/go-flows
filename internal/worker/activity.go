@@ -46,8 +46,9 @@ type attemptOutcome struct {
 	ev    history.Event // ActivityCompleted or ActivityFailed
 	retry bool          // retry after delay instead of recording ev
 	delay time.Duration
-	maybe bool // the retried attempt may have had its effect
-	lost  bool // the lease was lost: record nothing
+	maybe bool   // the retried attempt may have had its effect
+	keep  []byte // with maybe: its compensation data, kept for later attempts
+	lost  bool   // the lease was lost: record nothing
 }
 
 // startAttempt calls the tracer, recovering its panics.
@@ -111,19 +112,38 @@ func (w *Worker) attempt(ctx context.Context, a *Activity, t *store.ActivityTask
 		}
 		w.observe(func() { w.opts.Observer.ActivityAttempt(t, outcome, time.Since(start), o.err) })
 	}
-	if !t.Compensate && !o.lost && !o.retry && o.ev.Uncertain && len(o.ev.CompData) == 0 {
-		if _, ok := w.acts.Activity(t.Name, true); ok {
-			o.ev.CompData = nullData
-		}
+	if o.lost || o.retry {
+		return o
 	}
-	if t.Compensate && !o.lost && !o.retry {
+	if t.Compensate {
 		if o.ev.Type == history.ActivityCompleted {
 			o.ev = history.Event{Type: history.CompensationCompleted}
 		} else {
 			o.ev = history.Event{Type: history.CompensationFailed, Err: o.ev.Err, ErrKinds: o.ev.ErrKinds, Permanent: o.ev.Permanent}
 		}
+		return o
 	}
+	o.ev.CompData = w.finalComp(a, t, &o.ev)
 	return o
+}
+
+// finalComp is the compensation data to record with the final outcome ev
+// of invocation t.
+func (w *Worker) finalComp(a *Activity, t *store.ActivityTask, ev *history.Event) []byte {
+	if ev.Type != history.ActivityCompleted && !ev.Uncertain {
+		return ev.CompData // a certain failure is not compensated
+	}
+	if len(t.CompData) > 0 && a.noComp(ev.CompData) {
+		// No data of its own: an earlier attempt that may have had its
+		// effect returned some (T10.7), the most recent is kept.
+		return t.CompData
+	}
+	if ev.Uncertain && len(ev.CompData) == 0 {
+		if _, ok := w.acts.Activity(t.Name, true); ok {
+			return nullData
+		}
+	}
+	return ev.CompData
 }
 
 // attemptOnce runs the activity under runCtx (derived from ctx, possibly by
@@ -154,7 +174,7 @@ func (w *Worker) attemptOnce(ctx, runCtx context.Context, a *Activity, t *store.
 		// Interrupted by the stop deadline: not a failure. Hand the task
 		// back at once so another instance runs it again (the next claim
 		// counts as an attempt: a shutdown uses one).
-		return attemptOutcome{retry: true, err: err, maybe: true}
+		return attemptOutcome{retry: true, err: err, maybe: true, keep: w.keep(a, t, comp)}
 	}
 	if err == nil {
 		return attemptOutcome{ev: history.Event{Type: history.ActivityCompleted, Payload: out, CompData: comp}}
@@ -172,7 +192,11 @@ func (w *Worker) attemptOnce(ctx, runCtx context.Context, a *Activity, t *store.
 	uncertain := panicked || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrUncertain)
 	permanent := panicked || w.opts.Errors.Permanent(err)
 	if !permanent && t.Attempt < int32(a.Retry.Attempts) {
-		return attemptOutcome{retry: true, delay: a.Retry.Delay(t.Attempt + 1), err: err, maybe: uncertain}
+		o := attemptOutcome{retry: true, delay: a.Retry.Delay(t.Attempt + 1), err: err, maybe: uncertain}
+		if uncertain {
+			o.keep = w.keep(a, t, comp)
+		}
+		return o
 	}
 	// An earlier attempt that may have had its effect makes the failure
 	// uncertain too (a timeout, then a decline: the charge may stand).
@@ -181,6 +205,16 @@ func (w *Worker) attemptOnce(ctx, runCtx context.Context, a *Activity, t *store.
 		Type: history.ActivityFailed, Err: w.opts.Errors.Text(err), ErrKinds: w.opts.Errors.Kinds(err),
 		Permanent: permanent, Uncertain: uncertain, CompData: comp,
 	}}
+}
+
+// keep returns the compensation data of a retried attempt that may have had
+// its effect, to keep for later attempts: nil (keep the earlier data) when
+// it returned none, and for a compensation task.
+func (*Worker) keep(a *Activity, t *store.ActivityTask, comp []byte) []byte {
+	if t.Compensate || a.noComp(comp) {
+		return nil
+	}
+	return comp
 }
 
 // panicError is an activity panic, permanent and with its stack.
@@ -215,7 +249,7 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 	a, ok := w.acts.Activity(t.Name, t.Compensate)
 	if !ok {
 		// Another instance may have it: give the task back for a while.
-		if err := w.st.RetryActivityTask(tctx, t.Lease, w.opts.HandBack, false); err != nil && !errors.Is(err, store.ErrLeaseLost) {
+		if err := w.st.RetryActivityTask(tctx, t.Lease, w.opts.HandBack, false, nil); err != nil && !errors.Is(err, store.ErrLeaseLost) {
 			w.log.LogAttrs(ctx, slog.LevelWarn, "flows: hand back activity", slog.String("activity", t.Name), slog.Any("error", err))
 		}
 		return
@@ -248,7 +282,7 @@ func (w *Worker) recordOnce(ctx context.Context, t *store.ActivityTask, o attemp
 	case o.lost:
 		return nil, false, nil
 	case o.retry:
-		err := w.st.RetryActivityTask(ctx, t.Lease, o.delay, o.maybe)
+		err := w.st.RetryActivityTask(ctx, t.Lease, o.delay, o.maybe, o.keep)
 		if err == nil && o.delay > 0 {
 			// Measured after the commit: never before the store's time.
 			w.actDue.add(time.Now().Add(o.delay))

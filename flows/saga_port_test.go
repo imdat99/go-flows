@@ -381,7 +381,7 @@ func TestUncertainAttemptThenCertainFailureIsCompensated(t *testing.T) {
 		if !errors.As(err, &re) || re.Status != StatusCompensated {
 			t.Fatalf("eager=%v: %v", eager, err)
 		}
-		wantJournal(t, "unc-retry", "refund ?") // the last attempt's (zero) data: earlier attempts' data is not kept
+		wantJournal(t, "unc-retry", "refund charge-1?") // the timed-out attempt's data is kept (T10.7)
 		ctx, cancel := context.WithTimeout(bg, 5*time.Second)
 		_ = e.Stop(ctx)
 		cancel()

@@ -832,7 +832,7 @@ func (s *Store) ClaimActivityTasks(_ context.Context, owner string, queues []str
 		t.lockedUntil = now.Add(ttl)
 		s.extendLocks(t.ExecutionID, now)
 		at := t.ActivityTask
-		at.Input = clone(at.Input)
+		at.Input, at.CompData = clone(at.Input), clone(at.CompData)
 		at.CancelRequested = t.cancelRequested
 		out = append(out, at)
 	}
@@ -892,7 +892,7 @@ func (s *Store) CompleteActivityTask(_ context.Context, l store.Lease, r store.A
 }
 
 // RetryActivityTask implements store.Store.
-func (s *Store) RetryActivityTask(_ context.Context, l store.Lease, delay time.Duration, uncertain bool) error {
+func (s *Store) RetryActivityTask(_ context.Context, l store.Lease, delay time.Duration, uncertain bool, compData []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.clock.Now()
@@ -902,6 +902,9 @@ func (s *Store) RetryActivityTask(_ context.Context, l store.Lease, delay time.D
 	}
 	t.Lease.Owner, t.lockedUntil, t.visibleAt = "", time.Time{}, now.Add(delay)
 	t.Uncertain = t.Uncertain || uncertain && !t.Compensate
+	if compData != nil && !t.Compensate {
+		t.CompData = clone(compData)
+	}
 	s.hint(store.ActivityWork, t.Queue) // a delayed retry is announced too (T9.1)
 	return nil
 }

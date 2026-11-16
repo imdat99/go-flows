@@ -1539,7 +1539,7 @@ const claimActivities = `
 	    visible_at = now() + $4::bigint * interval '1 microsecond'
 	WHERE t.id = ANY(ARRAY(SELECT id FROM c)) -- a join may scan the table (generic plans)
 	RETURNING t.id, t.lease_version, t.execution_id, t.instance_id, t.schedule_id, t.name, t.queue,
-	          t.input, t.compensate, t.attempt, t.cancel_requested, t.uncertain`
+	          t.input, t.compensate, t.attempt, t.cancel_requested, t.uncertain, t.comp_data`
 
 // ClaimActivityTasks implements store.Store.
 func (s *Store) ClaimActivityTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.ActivityTask, error) {
@@ -1578,7 +1578,7 @@ func (s *Store) claimActivityTasks(ctx context.Context, owner string, queues []s
 		for rows.Next() {
 			var t store.ActivityTask
 			if err := rows.Scan(&t.Lease.ID, &t.Lease.Version, &t.ExecutionID, &t.InstanceID, &t.ScheduleID,
-				&t.Name, &t.Queue, &t.Input, &t.Compensate, &t.Attempt, &t.CancelRequested, &t.Uncertain); err != nil {
+				&t.Name, &t.Queue, &t.Input, &t.Compensate, &t.Attempt, &t.CancelRequested, &t.Uncertain, &t.CompData); err != nil {
 				rows.Close()
 				return err
 			}
@@ -1619,14 +1619,15 @@ func (s *Store) ExtendActivityTask(ctx context.Context, l store.Lease, ttl time.
 }
 
 // RetryActivityTask implements store.Store.
-func (s *Store) RetryActivityTask(ctx context.Context, l store.Lease, delay time.Duration, uncertain bool) error {
+func (s *Store) RetryActivityTask(ctx context.Context, l store.Lease, delay time.Duration, uncertain bool, compData []byte) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE flows.activity_task
 		SET owner_id = '', locked_until = NULL, visible_at = now() + $4::bigint * interval '1 microsecond',
-		    uncertain = uncertain OR ($5 AND NOT compensate)
+		    uncertain = uncertain OR ($5 AND NOT compensate),
+		    comp_data = CASE WHEN $6::bytea IS NULL OR compensate THEN comp_data ELSE $6::bytea END
 		WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''
 		RETURNING `+notifyA+`queue) -- a retry delay is announced too (T9.1)`,
-		l.ID, l.Owner, l.Version, micros(delay), uncertain)
+		l.ID, l.Owner, l.Version, micros(delay), uncertain, compData)
 	if err != nil {
 		return fmt.Errorf("retry activity task: %w", err)
 	}
