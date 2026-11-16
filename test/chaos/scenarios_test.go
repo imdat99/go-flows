@@ -19,6 +19,7 @@ import (
 
 	flows "github.com/imdat99/go-flows/flows"
 	"github.com/imdat99/go-flows/internal/history"
+	"github.com/imdat99/go-flows/internal/store"
 )
 
 // racerStats counts, for one engine, the workflow tasks it ran (and how
@@ -68,7 +69,9 @@ func (r *racerStats) StartWorkflowTask(ctx context.Context, _ flows.WorkflowTask
 }
 
 // printTasks prints, in the child, how its workflow tasks ended
-// ("TASKOK <instance>", or "TASKEND <instance> lost=<bool> err=<err>") and
+// ("TASKOK <instance>", or "TASKEND <instance> lost=<bool> invalid=<bool>
+// err=<err>", invalid for a completion the store refused past the lease
+// fence: a sequence or schedule conflict) and
 // the activity attempts that failed ("ACTEND ..."): the parent reads the
 // fence's rejections, or their absence, there.
 type printTasks struct{}
@@ -88,7 +91,8 @@ func (printTasks) StartActivity(ctx context.Context, a flows.ActivityInfo) (cont
 func (printTasks) StartWorkflowTask(ctx context.Context, w flows.WorkflowTaskInfo) (context.Context, func(flows.Status, error)) {
 	return ctx, func(_ flows.Status, err error) {
 		if err != nil {
-			fmt.Printf("TASKEND %s lost=%t err=%v\n", w.InstanceID, errors.Is(err, flows.ErrLeaseLost), err)
+			fmt.Printf("TASKEND %s lost=%t invalid=%t err=%v\n", w.InstanceID,
+				errors.Is(err, flows.ErrLeaseLost), errors.Is(err, store.ErrInvalidCompletion), err)
 		} else {
 			fmt.Printf("TASKOK %s\n", w.InstanceID)
 		}
@@ -134,22 +138,20 @@ func dumpState(t *testing.T, pool *pgxpool.Pool) {
 
 // ---- F, G: the workflow lease ----
 
-// fenceGate, when set in the parent, holds the parent's chaos.fstep2
-// attempts until closed (test F: the takeover keeps the workflow lease
-// while the thawed child writes).
-var fenceGate atomic.Pointer[chan struct{}]
+// fenceGate, when set in the parent, holds the parent's run of fenced's
+// workflow code between its steps until closed, and fenceHolding reports
+// that it got there (test F: the takeover holds the workflow lease, in
+// workflow code, while the thawed child writes). Holding it in workflow
+// code does not depend on an eager launch, which is best effort.
+var (
+	fenceGate    atomic.Pointer[chan struct{}]
+	fenceHolding atomic.Bool
+)
 
 func defineFenceStep(name string) *flows.Activity[int, int, struct{}] {
 	return flows.DefineActivity(name, func(ctx context.Context, k flows.Key, v int) (int, struct{}, error) {
 		if err := effect(ctx, name, k); err != nil {
 			return 0, struct{}{}, err
-		}
-		if g := fenceGate.Load(); g != nil && name == "chaos.fstep2" {
-			select {
-			case <-*g:
-			case <-ctx.Done():
-				return 0, struct{}{}, ctx.Err()
-			}
 		}
 		return v + 1, struct{}{}, nil
 	}, nil, flows.WithRetry(flows.RetryPolicy{Attempts: 3, Initial: 10 * time.Millisecond}))
@@ -176,6 +178,9 @@ var (
 			if hangMode == "wf-pause" {
 				v += 1000
 			}
+		} else if g := fenceGate.Load(); g != nil && !flows.Replaying(c) {
+			fenceHolding.Store(true)
+			<-*g
 		}
 		return fstep2.Run(c, v)
 	})
@@ -217,8 +222,8 @@ func childFenced(ctx context.Context, eng *flows.Engine) {
 
 // F: a process freezes in workflow code (holding the workflow lease) for
 // longer than its lease; another engine takes the workflow task over,
-// replays it and holds the lease (its next activity waits on a gate, its
-// eager window outlasts the test). The frozen process thaws and completes
+// replays it and holds the lease (its workflow code waits on a gate at the
+// same point). The frozen process thaws and completes
 // its task, with a different next step: the store's fence (owner and
 // lease version of the execution) rejects it with ErrLeaseLost, nothing of
 // it reaches the history, and the takeover's run is the one that ends.
@@ -233,12 +238,27 @@ func TestFrozenWorkflowTaskIsFencedOff(t *testing.T) {
 	}
 }
 
+// waitRefused waits for the thawed child's held task (its output from
+// mark on) to be refused by the store for its lease; any other end of
+// that task fails at once.
+func waitRefused(t *testing.T, out *syncBuffer, mark int) {
+	t.Helper()
+	waitFor(t, "the thawed child's completion to be refused", 60*time.Second, func() bool {
+		o := out.String()[mark:]
+		if strings.Contains(o, "TASKEND fence-0 lost=false") || strings.Contains(o, "TASKOK fence-0") {
+			t.Fatalf("the thawed child's task ended without a lease loss:\n%s", o)
+		}
+		return strings.Contains(o, "TASKEND fence-0 lost=true")
+	})
+}
+
 func testFencedOff(t *testing.T, owner string) {
 	t.Helper()
 	pool := setup(t)
 	release := make(chan struct{})
 	var once sync.Once
 	open := func() { once.Do(func() { close(release) }) }
+	fenceHolding.Store(false)
 	fenceGate.Store(&release)
 	t.Cleanup(func() { open(); fenceGate.Store(nil) })
 
@@ -260,37 +280,38 @@ func testFencedOff(t *testing.T, owner string) {
 	}
 	stats := &racerStats{name: owner + " (takeover)"}
 	eng := startEngineWith(t, pool, flows.Options{
-		InstanceID: owner, EagerWindow: 10 * time.Minute, Observer: stats, Tracer: stats,
+		InstanceID: owner, Observer: stats, Tracer: stats,
+		StuckTimeout: 5 * time.Minute, // its workflow code waits on the gate
 	})
-	waitFor(t, "the takeover to hold the workflow lease, its fstep2 running", 60*time.Second, func() bool {
-		return count(t, pool, `SELECT count(*) FROM chaos_attempt WHERE step = 'chaos.fstep2' AND pid = $1`, os.Getpid()) == 1 &&
+	t.Cleanup(open) // before the engine's Stop, which waits for that code
+	waitFor(t, "the takeover to hold the workflow lease, in its workflow code", 60*time.Second, func() bool {
+		return fenceHolding.Load() &&
 			count(t, pool, `SELECT count(*) FROM flows.execution WHERE instance_id = 'fence-0' AND owner_id = $1 AND locked_until > now() AND lease_version > $2`, owner, version) == 1
 	})
+	mark := len(out.String()) // the child's output from its thaw on
 	if err := cmd.Process.Signal(syscall.SIGCONT); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(context.Background(), `INSERT INTO chaos_go (key) VALUES ('fence-0')`); err != nil {
 		t.Fatal(err)
 	}
-	// The thawed child completes its task: the store refuses it.
-	waitFor(t, "the thawed child's completion to be refused", 60*time.Second, func() bool {
-		return strings.Contains(out.String(), "TASKEND fence-0 lost=true")
-	})
+	waitRefused(t, out, mark)
 	// Evidence taken: the child must not claim the execution again (its
 	// diverging code would replay the takeover's history).
 	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
 	_ = cmd.Wait()
-	// While the takeover still holds it, the refused task left nothing.
-	if n := count(t, pool, `SELECT count(*) FROM flows.execution WHERE instance_id = 'fence-0' AND owner_id = $1 AND lease_version > $2`, owner, version); n != 1 {
+	// While the takeover still holds it (before its own fstep2), the refused
+	// task left nothing.
+	if n := count(t, pool, `SELECT count(*) FROM flows.execution WHERE instance_id = 'fence-0' AND owner_id = $1 AND locked_until > now() AND lease_version > $2`, owner, version); n != 1 {
 		t.Fatal("the takeover lost the workflow lease to the stale completion")
 	}
-	if n := count(t, pool, `SELECT count(*) FROM flows.history WHERE type = $1 AND name = 'chaos.fstep2'`, int(history.ActivityScheduled)); n != 1 {
-		t.Fatalf("fstep2 scheduled %d times in the history, want 1", n)
+	if n := count(t, pool, `SELECT count(*) FROM flows.history WHERE type = $1 AND name = 'chaos.fstep2'`, int(history.ActivityScheduled)); n != 0 {
+		t.Fatalf("fstep2 scheduled %d times in the history before the takeover scheduled it", n)
 	}
-	if n := count(t, pool, `SELECT count(*) FROM flows.activity_task WHERE name = 'chaos.fstep2'`); n != 1 {
-		t.Fatalf("fstep2 tasks: %d, want 1", n)
+	if n := count(t, pool, `SELECT count(*) FROM flows.activity_task WHERE name = 'chaos.fstep2'`); n != 0 {
+		t.Fatalf("fstep2 tasks before the takeover scheduled it: %d", n)
 	}
 	open()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -335,12 +356,14 @@ func testFencedOff(t *testing.T, owner string) {
 // an interval, then freezes for 0.8 interval (interval = TTL/3 = 5s), so the
 // next tick comes due while frozen and runs late, on thaw.
 //
-// Design limit: a worker gives a lease up locally once it has not renewed
-// it for ttl - interval (heartbeat.expire, two thirds of the TTL), whatever
-// the store says. A freeze is therefore guaranteed not to lose the lease
-// only while it is shorter than about one interval (TTL/3) past the last
-// renewal; longer freezes within the TTL may lose it (safely: the work is
-// fenced and runs again).
+// Limits: on thaw the overdue tick renews first (the renewal checks owner
+// and lease version, not locked_until) and only then gives up leases not
+// renewed for ttl - interval (heartbeat.expire). A freeze within the TTL
+// therefore loses the lease locally only when it lands while a renewal is
+// in flight and lasts ttl - interval or more (that renewal's send time is
+// then too old), or when the renewal on thaw fails; another engine can take
+// the lease over only once the full TTL has passed. A loss is safe anyway:
+// the work is fenced and runs again.
 //
 // The other engine may still run the second step, or the last task: an
 // eager launch is best effort (it needs a free activity slot, and the
@@ -626,10 +649,9 @@ func TestTreesSurviveFreezeAndKill(t *testing.T) {
 	// The child's stale writes were all refused by the lease fence: none
 	// got past it to a later check (a sequence or schedule conflict), none
 	// parked an execution.
-	for _, bad := range []string{"invalid completion", "out of sequence", "needs_attention", "non-determin", "parking"} {
-		if strings.Contains(out.String(), bad) {
-			t.Fatalf("the child reported %q: a stale write got past the lease fence", bad)
-		}
+	// (Parks would show in the executions' statuses, checked below.)
+	if strings.Contains(out.String(), "invalid=true") {
+		t.Fatal("a completion of the child was refused past the lease fence: a stale write got past it")
 	}
 	assertTrees(t, pool, cmd.Process.Pid)
 }

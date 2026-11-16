@@ -343,6 +343,10 @@ func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool)
 	deadline := time.Now().Add(timeout)
 	for !cond() {
 		if time.Now().After(deadline) {
+			// The state now: the dump at cleanup comes after the engines
+			// stopped (which releases their leases).
+			t.Logf("timed out waiting for %s; state at the timeout:", what)
+			dumpState(t, db.Load())
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(20 * time.Millisecond)
