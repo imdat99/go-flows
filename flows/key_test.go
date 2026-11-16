@@ -26,6 +26,13 @@ func (l *keyLog) add(id string, k Key) {
 	l.seen[id] = append(l.seen[id], k)
 }
 
+// reset forgets id's keys: a repeated test run (-count) starts afresh.
+func (l *keyLog) reset(id string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.seen, id)
+}
+
 func (l *keyLog) get(id string) []Key {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -84,6 +91,7 @@ type keyChain struct {
 // (schedule ids restart at 1 in each), stable across the attempts of one
 // activity (T10.19).
 func TestKeyUniquePerExecution(t *testing.T) {
+	keyRuns.reset("key-chain-1")
 	e := testEngine(t)
 	keys, err := keyChainWF.Run(waitCtx(t), e, "key-chain-1", keyChain{ID: "key-chain-1"})
 	if err != nil {
@@ -119,6 +127,7 @@ func TestKeyUniqueAfterPurge(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = e.Stop(bg) })
 	const id = "key-reuse-1"
+	keyRuns.reset(id)
 	first, err := keyChainWF.Run(waitCtx(t), e, id, keyChain{ID: id, Keys: []Key{"x", "y"}})
 	if err != nil {
 		t.Fatal(err)
@@ -139,6 +148,8 @@ func TestKeyUniqueAfterPurge(t *testing.T) {
 func TestKeyOfCompensator(t *testing.T) {
 	e := testEngine(t)
 	const id = "key-undo-1"
+	keyRuns.reset(id)
+	keyComps.reset(id)
 	if _, err := keyUndoWF.Run(waitCtx(t), e, id, id); !errors.Is(err, ErrCompensated) {
 		t.Fatalf("got %v", err)
 	}
