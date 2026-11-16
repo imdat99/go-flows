@@ -39,16 +39,19 @@ func testLockHolderParked(t *testing.T, h Harness) {
 		seq.consume(t, s, claimOne(t, s, owner, h.TTL))
 	}
 	ttl := 3 * h.TTL // the steps before the lapse take far less on a loaded machine
+	// Read before the request: no later than the grant, so the lock lives
+	// at least until granted+ttl (claims of i1 only extend it).
+	granted := storeNow(t, s)
 	if ev := seq.queueForTTL(t, s, h, "i1", 1, "k", 0, 0, ttl); ev.Type != history.LockAcquired {
 		t.Fatalf("free: %+v", ev)
 	}
-	granted := storeNow(t, s)
-	within := func() bool { return storeNow(t, s).Sub(granted) < ttl }
 	// i2 waits (its timer an hour away), then i1 parks.
 	ev := seq.queueForTTL(t, s, h, "i2", 1, "k", time.Hour, time.Hour, ttl)
 	taker := ""
 	switch {
 	case ev.Type == history.LockAcquired: // too slow: lapsed already
+		t.Logf("slow machine: the lock lapsed before i2 asked (%v after the grant, TTL %v); i2 is the taker",
+			storeNow(t, s).Sub(granted), ttl)
 		taker = "i2"
 	case ev.Err != "i1":
 		t.Fatalf("waiter: %+v", ev)
@@ -59,12 +62,17 @@ func testLockHolderParked(t *testing.T, h Harness) {
 		t.Fatalf("the park woke %s", tasks[0].Execution.InstanceID)
 	}
 	if taker == "" {
-		// Kept while its TTL lasts: the waiter is still refused.
+		// Kept while its TTL lasts: the waiter is still refused. Read
+		// after the request (no earlier than its answer): if that is
+		// before granted+ttl, the lock was live when it was answered.
 		ev = seq.queueForTTL(t, s, h, "i2", 2, "k", time.Hour, time.Hour, ttl)
+		after := storeNow(t, s)
 		if ev.Type == history.LockAcquired {
-			if within() {
+			if after.Sub(granted) < ttl {
 				t.Fatalf("lock of a parked holder taken within its TTL: %+v", ev)
 			}
+			t.Logf("slow machine: the lock lapsed around i2's second request (%v after the grant, TTL %v); i2 is the taker",
+				after.Sub(granted), ttl)
 			taker = "i2"
 		} else if ev.Err != "i1" {
 			t.Fatalf("waiter after the park: %+v", ev)
@@ -85,7 +93,8 @@ func testLockHolderParked(t *testing.T, h Harness) {
 		t.Fatalf("holder: %+v %v", e, err)
 	}
 	if slices.ContainsFunc(parked, func(p store.PendingEvent) bool { return p.Event.Type == history.LockLost }) {
-		return // lost before it parked (a slow machine): told then
+		t.Log("slow machine: the holder learned of the lost lock before it parked; reopen not checked")
+		return
 	}
 	reopenLost(t, s, h, "i1", 1, "k")
 }
