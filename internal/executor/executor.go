@@ -121,6 +121,9 @@ type Executor struct {
 	activities, outcomes, compensable int
 	// comp is the completion Execute returns, reused by the next one.
 	comp store.Completion
+	// Activities and children issued but not started because the
+	// workflow ended in the same task (DroppedAtEnd).
+	droppedActivities, droppedChildren int
 }
 
 // resetCompletion empties the reused completion, keeping the capacity of
@@ -131,6 +134,12 @@ func (e *Executor) resetCompletion() *store.Completion {
 	consumed, acts, leases := c.Consumed[:0], c.Activities[:0], c.Leases[:0]
 	*c = store.Completion{Consumed: consumed, Activities: acts, Leases: leases}
 	return c
+}
+
+// DroppedAtEnd reports the activities and children the workflow issued
+// without awaiting them in the task that ended it: they were not started.
+func (e *Executor) DroppedAtEnd() (activities, children int) {
+	return e.droppedActivities, e.droppedChildren
 }
 
 // errBroken wraps the first error for every later call.
@@ -353,10 +362,22 @@ func (e *Executor) commit(c *store.Completion) error {
 	}
 	if st.end != nil {
 		// The workflow ended: commands still pending are dropped (an
-		// activity started and not awaited is not run).
+		// activity started and not awaited is not run; nor is a child,
+		// since the running children are asked to cancel at the end),
+		// and counted (DroppedAtEnd). A child started with a continue-as-new
+		// runs on, detached, as the children started before do (T9.2).
+		continued := st.end.status == store.StatusContinued
 		for _, issued := range st.calls {
-			if cmd := issued.command(); cmd.State == command.Pending {
-				cmd.State = command.Dropped
+			cmd := issued.command()
+			if cmd.State != command.Pending || continued && cmd.Kind == command.Child {
+				continue
+			}
+			cmd.State = command.Dropped
+			switch cmd.Kind {
+			case command.Activity:
+				e.droppedActivities++
+			case command.Child:
+				e.droppedChildren++
 			}
 		}
 	}

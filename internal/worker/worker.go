@@ -182,6 +182,9 @@ type Worker struct {
 	detachedCtx context.Context //nolint:containedctx // the worker's lifetime
 	// wfJobs hands claimed workflow tasks to idle runners (runTask).
 	wfJobs chan wfJob
+	// droppedHook, if set (SetDroppedHook), is told what an ending workflow
+	// did not start (flowtest).
+	droppedHook func(instanceID string, activities, children int)
 	// exOpts are the options of every executor (built once: its method
 	// values would be allocated per execution).
 	exOpts    executor.Options
@@ -230,6 +233,13 @@ func (w *Worker) stuckAgain(id, seq int64) bool {
 	}
 	w.stuck[id] = seq
 	return false
+}
+
+// SetDroppedHook sets a function told, when a workflow ends, of the
+// activities and children it started in its last task without awaiting
+// them, which were not started (they are also logged). Call before Start.
+func (w *Worker) SetDroppedHook(f func(instanceID string, activities, children int)) {
+	w.droppedHook = f
 }
 
 // Busy reports whether the worker is claiming or running anything (a test

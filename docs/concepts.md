@@ -152,7 +152,17 @@ returned and its original `Key`:
   arrival order, with none dropped. A signal sent before the workflow listens
   is kept. Unread signals move to the next execution on `ContinueAsNew`.
 - **Children are workflows started from a workflow.** `wf.Child(c, id, in)`
-  returns a `Future`. Canceling the parent cancels its running children.
+  returns a `Future`. Canceling the parent cancels its running children,
+  and so does its end. What the workflow starts without awaiting it in the
+  task that ends it:
+  - **when it ends** (completed, failed, canceled): neither children nor
+    activities are started;
+  - **when it continues as new:** its children are started and run on,
+    detached, like the children it started before (not compensated with
+    the chain); its activities are not started.
+
+  Anything not started is logged as a warning, and `flowtest` fails the
+  test.
 - **`flows.Select` waits for the first ready case.** Its cases are futures
   and signal channels, tried in order (deterministic), with an optional
   default.

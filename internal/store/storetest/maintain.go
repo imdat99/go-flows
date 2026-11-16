@@ -603,7 +603,7 @@ func testDueClaims(t *testing.T, h Harness) {
 	if _, next, err := dc.ClaimWorkflowTasksDue(ctx, owner, []string{queue}, 10, h.TTL); err != nil || next != 0 {
 		t.Fatalf("empty store: %v %v", next, err)
 	}
-	d := h.TTL // a delay the harness's clock can wait for
+	d := 30 * h.TTL // far beyond the test's run time, even on a loaded machine: nothing falls due during it
 	// A timer.
 	mustCreate(t, s, "timer")
 	task := claimOne(t, s, owner, h.TTL)
@@ -654,5 +654,40 @@ func testDueClaims(t *testing.T, h Harness) {
 	}
 	if _, next, err := dc.ClaimActivityTasksDue(ctx, owner, []string{"leased"}, 10, h.TTL); err != nil || next != 0 {
 		t.Fatalf("a running task reported due in %v (%v)", next, err)
+	}
+}
+
+// T9.2: a continue-as-new may start children (they run on, detached, as
+// the children started before); another ending may not (they would be
+// canceled at once).
+func testChildrenWithTheEnd(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "p")
+	task := claimOne(t, s, owner, h.TTL)
+	kid := store.NewExecution{InstanceID: "kid", Workflow: "cw", Version: 1, Queue: queue, ParentSched: 1}
+	ended := &store.Completion{
+		History:  []history.Event{task.Pending[0].Event, {Type: history.ExecutionCompleted}},
+		Consumed: pendingIDs(task), Status: store.StatusCompleted, Children: []store.NewExecution{kid},
+	}
+	for i := range ended.History {
+		ended.History[i].Seq = task.LastSeq + int64(i) + 1
+	}
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, ended); !errors.Is(err, store.ErrInvalidCompletion) {
+		t.Fatalf("an ending with a child: %v", err)
+	}
+	continued := *ended
+	continued.History = append([]history.Event(nil), ended.History...)
+	continued.History[1].Type = history.ExecutionContinuedAsNew
+	continued.Status = store.StatusContinued
+	continued.ContinueAsNew = &store.NewExecution{Workflow: "wf", Version: 1, Queue: queue}
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, &continued); err != nil {
+		t.Fatalf("a continue-as-new with a child: %v", err)
+	}
+	e, err := s.GetExecution(ctx, "kid")
+	if err != nil || e.Status != store.StatusRunning || e.ParentID != task.Execution.ID {
+		t.Fatalf("child %+v %v", e, err)
+	}
+	if next, err := s.GetExecution(ctx, "p"); err != nil || next.Status != store.StatusRunning || next.ID == task.Execution.ID {
+		t.Fatalf("next execution %+v %v", next, err)
 	}
 }

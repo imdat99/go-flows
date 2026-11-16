@@ -353,3 +353,25 @@ func BenchmarkFanOut(b *testing.B) {
 		})
 	}
 }
+
+// T9.2 review: what a workflow starts in its last task without awaiting it
+// is not started (it leaves no event): flowtest still reports it.
+var (
+	dropsAtTheEnd = flows.DefineWorkflow("ft.drops-at-the-end", 1, func(c flows.Ctx, _ int) (int, error) {
+		fetch.Start(c, "slow") // in the task that ends the workflow
+		kid.Child(c, "dropped-kid", 0)
+		return 1, nil
+	})
+)
+
+func TestGW17_436_DroppedAtTheEndIsReported(t *testing.T) {
+	inner := &recordingTB{TB: t}
+	tst := flowtest.New(inner)
+	flowtest.OnActivity(tst, fetch, slowFast)
+	if v, err := flowtest.Run(tst, dropsAtTheEnd, "drops", 0); err != nil || v != 1 {
+		t.Fatalf("%d %v", v, err)
+	}
+	if !inner.failed.Load() {
+		t.Fatal("what the last task started was not reported")
+	}
+}

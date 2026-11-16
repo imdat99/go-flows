@@ -91,6 +91,7 @@ func Run(t *testing.T, h Harness) {
 		{"DefensiveCopies", testDefensiveCopies},
 		{"ClaimsWithRepeatedQueues", testClaimsWithRepeatedQueues},
 		{"DueClaims", testDueClaims},
+		{"ChildrenWithTheEnd", testChildrenWithTheEnd},
 		{"TimesComeFromTheStoreClock", testStoreClock},
 		{"GW3_SignalsRacingTerminalCompletion", testSignalsRacingTerminal},
 		{"ParkedExecutionCannotKeepItsLease", testParkedCannotKeep},
@@ -512,16 +513,20 @@ func testTimers(t *testing.T, h Harness) {
 		t.Fatal(err)
 	}
 	sig := claimOne(t, s, owner, h.TTL)
-	if sig.Now.Before(at) { // on a loaded machine the claim may come late
+	if sig.Now.Before(at) { // on a loaded machine the claim (or the signal) may come late
 		if got := pendingTypes(sig); !slices.Equal(got, []history.Type{history.SignalReceived}) {
 			t.Fatalf("pending %v", got)
 		}
-	} else if sig.Pending[0].Event.Type != history.SignalReceived {
+	}
+	// Late, the timers are visible too, before or after the signal
+	// depending on when it was sent: deliver the signal only.
+	i := slices.IndexFunc(sig.Pending, func(p store.PendingEvent) bool { return p.Event.Type == history.SignalReceived })
+	if i < 0 {
 		t.Fatalf("pending %v", pendingTypes(sig))
 	}
 	c := store.Completion{
 		History:        []history.Event{{Seq: sig.LastSeq + 1, Type: history.TimerCanceled, ScheduleID: 2}},
-		Consumed:       []int64{sig.Pending[0].ID}, // the signal only
+		Consumed:       []int64{sig.Pending[i].ID}, // the signal only
 		CanceledTimers: []int32{2},
 	}
 	if _, err := s.CompleteWorkflowTask(ctx, sig.Lease, &c); err != nil {

@@ -148,7 +148,16 @@ trước, từng cái một**, với dữ liệu compensation mà mỗi activity
   được giữ. Signal chưa đọc chuyển sang execution kế tiếp khi
   `ContinueAsNew`.
 - **Child là workflow được bắt đầu từ một workflow.** `wf.Child(c, id, in)`
-  trả về `Future`. Huỷ cha thì huỷ các child đang chạy.
+  trả về `Future`. Huỷ cha thì huỷ các child đang chạy, và cha kết thúc cũng
+  vậy. Những gì workflow bắt đầu mà không await trong task kết thúc nó:
+  - **khi kết thúc** (completed, failed, canceled): cả child lẫn activity
+    đều không được chạy;
+  - **khi continue-as-new:** child được tạo và chạy tiếp, tách khỏi cha,
+    giống các child đã bắt đầu trước đó (không được hoàn tác cùng chuỗi);
+    activity thì không được chạy.
+
+  Mọi thứ không được chạy đều được ghi warning, và `flowtest` làm test
+  fail.
 - **`flows.Select` chờ case đầu tiên sẵn sàng.** Các case là future và
   signal channel, xét theo thứ tự (tất định), có thể kèm case mặc định.
 

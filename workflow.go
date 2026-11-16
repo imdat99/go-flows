@@ -154,8 +154,14 @@ func (w *Workflow[I, O]) Child(c Ctx, instanceID string, in I) *Future[O] {
 // same instance with in (return its error from the workflow function): a
 // long-lived workflow keeps its history short this way. Signals not read
 // yet (delivered or not) move to the next execution, in order; children the
-// execution started run on, detached from it. Any other end asks running
-// children to cancel.
+// execution started run on, detached from it, including those started in
+// the same task (a child whose id is taken then fails unseen: nothing
+// awaits it). Detached children are not compensated with the chain (a
+// compensation reaches the latest execution only). Activities started in
+// the same task without being awaited are not started (the engine logs a
+// warning). Any other end asks running children to cancel, and starts
+// neither the children nor the activities started in its last task
+// without being awaited (logged too).
 func ContinueAsNew[I any](c Ctx, in I) error {
 	b, err := newCodec[I]().encode(in)
 	if err != nil {

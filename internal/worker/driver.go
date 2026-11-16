@@ -273,6 +273,7 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		return d.completeFailed(task, err)
 	}
 	d.taskStatus = c.Status
+	d.reportDropped(task, c)
 	for i := range c.Timers {
 		// The timer's delay counts from the claim (task.Now), before sent:
 		// the local due time is never before the store's.
@@ -627,4 +628,24 @@ func (d *driver) release(delay time.Duration) {
 		d.w.log.LogAttrs(d.ctx, slog.LevelWarn, "flows: release workflow task", slog.Any("error", err))
 	}
 	d.untrack()
+}
+
+// reportDropped logs (and tells the dropped hook) what an ending workflow
+// started in its last task without awaiting it, which was not started
+// (T9.2: not silent).
+func (d *driver) reportDropped(task *store.WorkflowTask, c *store.Completion) {
+	if c.Status == "" || c.Status.Active() || d.ex == nil {
+		return
+	}
+	acts, kids := d.ex.DroppedAtEnd()
+	if acts+kids == 0 {
+		return
+	}
+	w := d.w
+	w.log.LogAttrs(d.ctx, slog.LevelWarn, "flows: workflow ended with activities or children it did not await: not started",
+		slog.String("instance", task.Execution.InstanceID), slog.String("status", string(c.Status)),
+		slog.Int("activities", acts), slog.Int("children", kids))
+	if w.droppedHook != nil {
+		w.droppedHook(task.Execution.InstanceID, acts, kids)
+	}
 }

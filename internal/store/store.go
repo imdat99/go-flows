@@ -196,6 +196,8 @@ type Completion struct {
 	CanceledTimers []int32
 	// Children are executions to create (child workflows); a child id
 	// already in use yields a ChildFailed pending event for this execution.
+	// An ending completion has none, except a continue-as-new: its
+	// children run on, detached (T9.2).
 	Children []NewExecution
 	// ChildCancels are cancel requests for children of this execution (by
 	// instance id); ids that are not active children are ignored.
@@ -347,9 +349,8 @@ func ValidShape(c *Completion) bool {
 			return false
 		}
 	}
-	ending := c.Status != "" && !c.Status.Active()
-	if ending && (len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Children) > 0 || len(c.Locks) > 0 || len(c.CompensateChildren) > 0) {
-		return false // they would be dropped at once
+	if !validEnding(c) {
+		return false
 	}
 	for _, k := range c.Locks {
 		if k.TTL <= 0 {
@@ -357,6 +358,20 @@ func ValidShape(c *Completion) bool {
 		}
 	}
 	return !duplicateTasks(c.Activities)
+}
+
+// validEnding reports whether an ending completion creates nothing that
+// would be dropped at once: no activity, timer, lock or child compensation,
+// and children only with a continue-as-new (they run on, detached; others
+// would be canceled at once).
+func validEnding(c *Completion) bool {
+	if c.Status == "" || c.Status.Active() {
+		return true
+	}
+	if len(c.Activities) > 0 || len(c.Timers) > 0 || len(c.Locks) > 0 || len(c.CompensateChildren) > 0 {
+		return false
+	}
+	return len(c.Children) == 0 || c.Status == StatusContinued
 }
 
 // duplicateTasks reports two tasks for one (schedule id, kind): a scan for

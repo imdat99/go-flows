@@ -469,7 +469,26 @@ Các mục được rút ra từ phần "Còn mở" của T8.x, xếp theo thứ
       - việc của engine đã crash chờ lần poll theo giờ (`PollMax`);
       - queue có hơn 64 execution giữ lease đến hạn trước timer đầu tiên thì quay về poll theo giờ;
       - timer của execution sticky với engine khác có thể làm engine rảnh claim rỗng một lần.
-- [ ] **T9.2** Child được tạo trong đúng task mà cha kết thúc: không bỏ âm thầm nữa. Completion kết thúc mà còn child đang được tạo thì bị từ chối (`ErrInvalidCompletion`) như với activity, hoặc báo lỗi rõ cho workflow. Test ở mức engine.
+- [x] **T9.2** Child được tạo trong đúng task mà cha kết thúc: không bỏ âm thầm nữa. Completion kết thúc mà còn child đang được tạo thì bị từ chối (`ErrInvalidCompletion`) như với activity, hoặc báo lỗi rõ cho workflow. Test ở mức engine.
+    - **Quyết định** (khác với hai hướng trên, đã cân nhắc):
+      - Từ chối completion thì workflow không bao giờ kết thúc được.
+      - Báo lỗi cho workflow thì vô nghĩa, vì nó đã return rồi.
+      - Vì vậy:
+        - khi continue-as-new, child được tạo thật và chạy tách khỏi cha, đúng như tài liệu vốn mô tả (trước đây bị bỏ, sai);
+        - khi kết thúc kiểu khác, child và activity chưa await không được chạy (đúng ngữ nghĩa: child đang chạy đằng nào cũng bị huỷ khi cha kết thúc), nhưng không còn âm thầm: worker ghi warning nêu số lượng, và flowtest làm test fail (`SetDroppedHook`).
+    - **Cài đặt:**
+      - executor giữ lệnh child khi continue-as-new và đếm những gì bị bỏ (`DroppedAtEnd`);
+      - `store.ValidShape` chỉ cho phép child trong completion kết thúc nếu là continue-as-new;
+      - warning ở `driver.reportDropped`.
+      - Tài liệu EN/VI và doc của `ContinueAsNew` nêu rõ từng trường hợp, và hai giới hạn: id child trùng lúc continue-as-new thì lỗi không ai thấy; child tách rời không được hoàn tác cùng chuỗi.
+    - **Test:**
+      - `TestChildrenStartedAtTheEnd`: child tách rời chạy tiếp sau khi chuỗi cha xong; đếm các lệnh bị bỏ; kết thúc không bỏ gì thì không có warning;
+      - conformance `ChildrenWithTheEnd` (mem, pg cả hai đường);
+      - flowtest `TestGW17_436_DroppedAtTheEndIsReported`.
+      - Tất cả đều đỏ khi bỏ phần sửa.
+      - Kèm theo, làm chắc lại 2 test conformance flaky khi máy tải nặng: `DueClaims`, `TimersBecomeVisibleAtTheirTime`.
+    - **Review:** lần 1 không đạt (tài liệu khẳng định sai về flowtest, hai câu mâu thuẫn, chưa ghi quyết định); lần 2 đạt.
+    - **Còn mở (thấp):** flowtest chỉ báo cho instance được truyền vào `Run`, không báo cho child của nó; hook không có recover (chỉ flowtest dùng).
 - [ ] **T9.3** Đếm stuck trong DB. Execution lưu `last_seq` của lần kẹt gần nhất (migration mới). Lần kẹt thứ hai ở cùng `last_seq`, trên bất kỳ engine nào, sẽ park. Test với 2 engine.
 - [ ] **T9.4** Giữ lock khi activity đang chờ queue hoặc chờ retry:
     - heartbeat gia hạn lock của execution còn activity task chưa xong;

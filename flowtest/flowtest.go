@@ -62,6 +62,9 @@ type Tester struct {
 	mocks   map[mockKey]*worker.Activity
 	signals []scheduledSignal
 	queues  []string
+	// dropped: what workflows started in their last task without awaiting
+	// it, by instance id (not in their histories: never started).
+	dropped map[string]string
 }
 
 type mockKey struct {
@@ -127,6 +130,18 @@ func New(tb testing.TB, opts ...Option) *Tester {
 		tb.Fatalf("flowtest: bridge returned %T", e)
 	}
 	tst.e, tst.w = engine, w
+	w.SetDroppedHook(func(id string, acts, kids int) {
+		tst.mu.Lock()
+		defer tst.mu.Unlock()
+		if tst.dropped == nil {
+			tst.dropped = map[string]string{}
+		}
+		msg := fmt.Sprintf("%d activities and %d children started in the last task (not started)", acts, kids)
+		if prev := tst.dropped[id]; prev != "" { // an earlier execution of the instance (continue-as-new)
+			msg = prev + "; " + msg
+		}
+		tst.dropped[id] = msg
+	})
 	if err := tst.e.Start(context.Background()); err != nil {
 		tb.Fatalf("flowtest: %v", err)
 	}
@@ -204,7 +219,13 @@ func Run[I, O any](tst *Tester, wf *flows.Workflow[I, O], instanceID string, in 
 		return zero, fmt.Errorf("%s: %w", instanceID, err)
 	}
 	if !tst.cfg.allowPending {
-		if pending := tst.pendingFutures(instanceID); len(pending) > 0 {
+		pending := tst.pendingFutures(instanceID)
+		tst.mu.Lock()
+		if d, ok := tst.dropped[instanceID]; ok {
+			pending = append(pending, d)
+		}
+		tst.mu.Unlock()
+		if len(pending) > 0 {
 			tst.t.Errorf("flowtest: %s ended with futures it did not await: %s", instanceID, strings.Join(pending, ", "))
 		}
 	}
