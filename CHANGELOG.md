@@ -99,6 +99,14 @@ must take care of.
   exposure is limited to activities of executions started during the
   deploy that an old engine attempted. Code that parsed keys by splitting
   on `:` must treat them as opaque (or strip the trailing `:executionID`).
+- **Restores (T10.19).** `flows.key_epoch` is data: a data-only restore
+  (`pg_dump --data-only`, logical replication) into a freshly migrated
+  database must bring its row along, or set it to one past the highest
+  restored execution id
+  (`UPDATE flows.key_epoch SET first_execution_id = (SELECT max(id) + 1 FROM flows.execution)`).
+  Otherwise the fresh database's value (1) gives every restored execution
+  the new key format, and their activities retried or compensated after the
+  restore see a key their idempotency records do not have.
 - `00013` adds a column with a constant default (no table rewrite) and an
   index built without `CONCURRENTLY`: writes to `flows.execution` wait while
   it builds. On large tables, run the migration in a quiet window.

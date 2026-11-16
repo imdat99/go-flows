@@ -125,10 +125,16 @@ var (
 	// retried attempt inserts nothing. The Key names the execution too, so
 	// a later execution of the same instance id (ContinueAsNew, or an id
 	// reused after retention) stages its own event instead of hitting ON
-	// CONFLICT. (Executions started before migration 00016 keep a Key
-	// without the execution id: see flows.Key. An outbox already running
-	// such executions with continue-as-new or reused ids must keep its own
-	// per-execution part in the event id until they have ended.)
+	// CONFLICT.
+	//
+	// Version 1 of placeOrder predates that Key (migration 00016): its
+	// executions may carry a Key without the execution id (see flows.Key),
+	// so it drew a nonce with flows.Rand and passed {order, nonce} to the
+	// activity outbox.stage-confirmed, which used Key + "/" + nonce as the
+	// event id. Version 2 below drops the nonce and passes the Order to
+	// this activity, under a new name since its input changed. A
+	// deployment upgrading from version 1 keeps version 1's workflow and
+	// activity definitions until its executions have ended.
 	//
 	// A late attempt can still insert after the run ended (the attempt
 	// outlived its lease, then the run failed and the hook dropped what was
@@ -139,7 +145,7 @@ var (
 	// before an ended instance's id can be reused. Do not age them by time
 	// alone (a run waiting on a signal can last days), or only past the
 	// longest possible run, with a staged_at column.
-	stageConfirmed = flows.DefineActivity("outbox.stage-confirmed",
+	stageConfirmed = flows.DefineActivity("outbox.stage-confirmed.v2",
 		func(ctx context.Context, k flows.Key, o Order) (struct{}, struct{}, error) {
 			payload, err := json.Marshal(o)
 			if err != nil {
@@ -163,7 +169,7 @@ var (
 			return "shp_" + o.ID, struct{}{}, nil
 		}, nil)
 
-	placeOrder = flows.DefineWorkflow("outbox.place-order", 1, func(c flows.Ctx, o Order) (string, error) {
+	placeOrder = flows.DefineWorkflow("outbox.place-order", 2, func(c flows.Ctx, o Order) (string, error) {
 		if _, err := stageConfirmed.Run(c, o); err != nil {
 			return "", err
 		}

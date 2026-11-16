@@ -19,7 +19,9 @@ import (
 // (activities run at least once). It differs between the executions of a
 // continue-as-new chain (schedule ids restart in each) and between
 // executions reusing an instance id after retention purged the earlier
-// one: execution ids are never reused.
+// one: the database never hands out an execution id twice, unless its
+// sequence is set back (TRUNCATE ... RESTART IDENTITY, or setval to a value
+// below ids already used), which makes keys repeat.
 //
 // Executions that already existed when migration 00016_key_epoch ran
 // (started by v0.1.0) keep the key "instanceID:scheduleID:name" for their
