@@ -940,7 +940,9 @@ var acquireLock = `
 		-- claimed or completed), its lease is live, or one of its activities
 		-- runs. Then the lock stays its own (its renewals extend it). So it
 		-- does, up to hold_us past until, while one of its activities waits
-		-- (in its queue, for a retry, or for a new lease).
+		-- (in its queue, for a retry, or for a new lease), or while events
+		-- wait for its workflow task (T10.5: a result delivered, the task
+		-- not claimed yet; not a future timer, nor a parked holder's).
 		SELECT x.id, x.queue, x.locked_until, cur.sched FROM flows.execution x, cur
 		WHERE x.id = cur.execution_id AND cur.execution_id <> $1 AND NOT cur.live AND NOT cur.reserved
 		  AND (x.locked_until IS NULL OR x.locked_until <= now())
@@ -948,6 +950,10 @@ var acquireLock = `
 		                  WHERE t.execution_id = x.id
 		                    AND (t.owner_id <> '' AND t.locked_until > now()
 		                         OR cur.until + cur.hold_us * interval '1 microsecond' > now()))
+		  AND NOT (cur.until + cur.hold_us * interval '1 microsecond' > now()
+		           AND x.status IN ('running', 'compensating')
+		           AND EXISTS (SELECT 1 FROM flows.pending_event p
+		                       WHERE p.execution_id = x.id AND p.visible_at <= now()))
 		FOR NO KEY UPDATE OF x SKIP LOCKED
 	), avail AS (
 		-- Free, expired and takeable, a reservation over, or $1's own.

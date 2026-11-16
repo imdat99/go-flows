@@ -302,8 +302,10 @@ type LockRequest struct {
 	TTL        time.Duration
 	// Hold keeps the lock, up to Hold past its TTL, while an activity task
 	// of the holder waits (in its queue, for a retry, or for a new lease
-	// after its worker died): it does not run, but the workflow is not
-	// idle. 0 lets the lock lapse after its TTL like an idle holder's.
+	// after its worker died), or while visible pending events of the
+	// running holder wait for its workflow task (T10.5): it does not run,
+	// but the workflow is not idle. 0 lets the lock lapse after its TTL
+	// like an idle holder's.
 	Hold time.Duration
 	// Wait queues the request when the lock is not given (T9.8), in the
 	// order of the requests. Releasing a lock fires the lock-wait timer

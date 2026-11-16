@@ -933,7 +933,7 @@ func (s *Store) acquireLocks(e *execution, reqs []store.LockRequest, now time.Ti
 			s.queue(e.ID, r, now)
 			continue
 		case ok && k.exec != e.ID && !k.reserved && (k.until.After(now) || s.running(k.exec, now) ||
-			k.until.Add(k.hold).After(now) && s.hasActivity(k.exec)):
+			k.until.Add(k.hold).After(now) && (s.hasActivity(k.exec) || s.hasWaitingEvents(k.exec, now))):
 			holder := s.executions[k.exec].InstanceID
 			s.addPending(e, history.Event{Type: history.LockHeld, ScheduleID: r.ScheduleID, Name: r.Key, Err: holder}, now)
 			s.queue(e.ID, r, now)
@@ -970,6 +970,20 @@ func (s *Store) hasActivity(id int64) bool {
 	for _, t := range s.tasks {
 		if t.ExecutionID == id {
 			return true
+		}
+	}
+	return false
+}
+
+// hasWaitingEvents reports whether execution id has visible pending events
+// (T10.5): work waiting for its workflow task, such as an activity's
+// result. A future timer is not, nor the events of a parked execution.
+func (s *Store) hasWaitingEvents(id int64, now time.Time) bool {
+	if e := s.executions[id]; e != nil && (e.Status == store.StatusRunning || e.Status == store.StatusCompensating) {
+		for _, p := range e.pending {
+			if !p.visibleAt.After(now) {
+				return true
+			}
 		}
 	}
 	return false

@@ -191,8 +191,9 @@ execution (`ttl` is raised to at least the engine's `LeaseTTL`):
 - **Kept alive while the execution works:** while it runs a task or one of
   its activities runs.
 - **Kept up to `Options.LockHold` (default 1h) past `ttl`** while one of its
-  activities waits: in its queue, for a retry, or for another engine after a
-  crash.
+  activities waits (in its queue, for a retry, or for another engine after a
+  crash), or while events wait for its next task (an activity's result, a
+  signal, a timer that fired) because no engine has claimed it yet.
 - **Lapses after `ttl` otherwise:** while the execution sleeps, waits or is
   dead. Another execution may then take the lock, and the first one fails
   with `ErrLockLost` at its next task.

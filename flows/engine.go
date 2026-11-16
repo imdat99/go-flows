@@ -73,9 +73,10 @@ type Options struct {
 	StuckTimeout time.Duration
 	// LockHold bounds how long, past its ttl, an execution keeps a lock
 	// (Lock) while none of its code or activities runs but one of its
-	// activities waits: in its queue, for a retry, or for another engine
-	// after its process died (default 1h; negative: not at all, the lock
-	// lapses after its ttl). It is recorded with the lock when taken.
+	// activities waits (in its queue, for a retry, or for another engine
+	// after its process died) or its next task waits in the queue (events
+	// delivered, not claimed yet) (default 1h; negative: not at all, the
+	// lock lapses after its ttl). It is recorded with the lock when taken.
 	LockHold time.Duration
 	// ListenDSN, when set, is the connection string of the connection the
 	// engine LISTENs on for work notifications, instead of one taken out of

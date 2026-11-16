@@ -56,6 +56,11 @@ must take care of.
   a lock request. A claim over several queues locks only the executions it
   claims, not up to its limit in each queue, so a lock whose holder sits
   in another queue is no longer refused for the time of that claim (T10.4).
+- A lock no longer lapses while its holder's next task waits in the queue
+  (an activity's result, a signal or a fired timer delivered, no engine
+  free to claim it for longer than the lock's `ttl`): such a holder keeps
+  it up to `Options.LockHold` past `ttl`, as while its activities wait
+  (T10.5).
 
 ### Migrations
 
@@ -81,6 +86,9 @@ must take care of.
   deploy, carry no trace context: their spans are roots, as before
   (T10.10). Activity tasks an old binary inserts for a traced execution
   carry none either, so those attempts' spans are roots too.
+- While old and new binaries run side by side, an old binary still takes
+  a lapsed lock whose holder's next task waits in the queue (T10.5): the
+  holder fails with `ErrLockLost` as before the fix.
 
 ## v0.1.0 (2026-11-16)
 

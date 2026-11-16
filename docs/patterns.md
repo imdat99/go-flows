@@ -189,7 +189,8 @@ if err := flows.Lock(c, "account:"+id, time.Minute, flows.LockWait(flows.Exponen
 
 Pick a `ttl` above the longest time the execution may sleep or await while
 holding the lock. While one of its activities waits in a queue or for a retry,
-the lock is kept up to `Options.LockHold` (default 1h) past its `ttl`. Take
+or its next task waits in the queue (an activity's result delivered), the lock
+is kept up to `Options.LockHold` (default 1h) past its `ttl`. Take
 several locks in a fixed order.
 
 ## Releasing events only on success (outbox)

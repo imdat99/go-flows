@@ -185,8 +185,9 @@ execution (`ttl` được nâng lên ít nhất bằng `LeaseTTL` của engine):
 - **Được giữ sống khi execution làm việc:** khi nó chạy một task hoặc một
   activity của nó đang chạy.
 - **Được giữ thêm tối đa `Options.LockHold` (mặc định 1h) sau `ttl`** khi một
-  activity của nó đang chờ: trong queue, chờ retry, hoặc chờ engine khác sau
-  crash.
+  activity của nó đang chờ (trong queue, chờ retry, hoặc chờ engine khác sau
+  crash), hoặc khi có event chờ task kế tiếp của nó (kết quả activity, signal,
+  timer đã tới hạn) mà chưa engine nào claim.
 - **Hết hạn sau `ttl` trong các trường hợp khác:** khi execution ngủ, chờ
   hoặc đã chết. Execution khác khi đó có thể lấy lock, và execution đầu lỗi
   `ErrLockLost` ở task kế tiếp.

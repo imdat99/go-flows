@@ -189,7 +189,8 @@ if err := flows.Lock(c, "account:"+id, time.Minute, flows.LockWait(flows.Exponen
 
 Chọn `ttl` lớn hơn khoảng thời gian dài nhất mà execution có thể sleep hoặc
 await trong lúc giữ lock. Khi một activity của nó đang chờ trong queue hoặc chờ
-retry, lock được giữ thêm tối đa `Options.LockHold` (mặc định 1h) sau `ttl`.
+retry, hoặc task kế tiếp của nó đang chờ trong queue (đã có kết quả activity),
+lock được giữ thêm tối đa `Options.LockHold` (mặc định 1h) sau `ttl`.
 Lấy nhiều lock theo một thứ tự cố định.
 
 ## Chỉ phát event khi thành công (outbox)

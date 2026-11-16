@@ -2,6 +2,7 @@ package storetest
 
 import (
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -297,6 +298,128 @@ func testLockKeptWhileActivityWaits(t *testing.T, h Harness) {
 	if len(others) != 1 || others[0].Execution.InstanceID != "i1" || others[0].Pending[0].Event.Type != history.LockLost {
 		t.Fatalf("the previous holder was not told: %+v", others)
 	}
+}
+
+// T10.5: an execution keeps its locks past their TTL, up to Hold, while
+// events wait for it (a result its activity delivered, its workflow task
+// not claimed yet: no engine serves its queue for a while); past Hold, or
+// with only a future timer pending, the lock lapses as usual. i1 runs in
+// queue "held", which the test claims only on purpose.
+func testLockKeptWhileEventsWait(t *testing.T, h Harness) {
+	s := h.New(t)
+	const held = "held"
+	claimHeld := func() store.WorkflowTask {
+		t.Helper()
+		tasks, err := s.ClaimWorkflowTasks(ctx, owner, []string{held}, 10, h.TTL)
+		if err != nil || len(tasks) != 1 {
+			t.Fatalf("claim i1: %+v %v", tasks, err)
+		}
+		return tasks[0]
+	}
+	seq := lockSeq{}
+	ne := newExec("i1")
+	ne.Queue = held
+	if _, _, err := s.CreateExecution(ctx, ne); err != nil {
+		t.Fatal(err)
+	}
+	mustCreate(t, s, "i2")
+	seq.consume(t, s, claimOne(t, s, owner, h.TTL))
+	// i1 takes k and schedules an activity and a timer far ahead.
+	hold := 3 * h.TTL
+	task := claimHeld()
+	c := &store.Completion{
+		Consumed:   pendingIDs(task),
+		Locks:      []store.LockRequest{{ScheduleID: 1, Key: "k", TTL: h.TTL, Hold: hold}},
+		Activities: []store.NewActivityTask{{ScheduleID: 2, Name: "a", Queue: queue}},
+		Timers:     []history.Event{{ScheduleID: 3, At: task.Now.Add(time.Hour)}},
+	}
+	add := func(ev history.Event) {
+		seq["i1"]++
+		ev.Seq = seq["i1"]
+		c.History = append(c.History, ev)
+	}
+	for _, p := range task.Pending {
+		add(p.Event)
+	}
+	add(history.Event{Type: history.LockRequested, ScheduleID: 1, Name: "k"})
+	add(history.Event{Type: history.ActivityScheduled, ScheduleID: 2, Name: "a"})
+	add(history.Event{Type: history.TimerScheduled, ScheduleID: 3, At: task.Now.Add(time.Hour)})
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, c); err != nil {
+		t.Fatal(err)
+	}
+	if task = claimHeld(); len(task.Pending) != 1 || task.Pending[0].Event.Type != history.LockAcquired {
+		t.Fatalf("free lock: %v", pendingTypes(task))
+	}
+	seq.consume(t, s, task)
+	// The activity runs and delivers its result: i1 has no activity left,
+	// only the result waiting for its workflow task (and its timer).
+	act := claimActivity(t, s, other, h.TTL)
+	if len(act) != 1 {
+		t.Fatalf("activities %+v", act)
+	}
+	if _, err := s.CompleteActivityTask(ctx, act[0].Lease, store.ActivityResult{Event: history.Event{Type: history.ActivityCompleted, Payload: []byte(`1`)}}); err != nil {
+		t.Fatal(err)
+	}
+	h.Advance(t, s, h.TTL+h.TTL/2)
+	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 1, "k"); ev.Type != history.LockHeld || ev.Err != "i1" {
+		t.Fatalf("lock taken while its holder's result waits: %+v", ev)
+	}
+	// Past Hold, it lapses: i2 takes it, i1 is told.
+	h.Advance(t, s, hold)
+	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 2, "k"); ev.Type != history.LockAcquired {
+		t.Fatalf("past Hold: %+v", ev)
+	}
+	task = claimHeld()
+	if got := pendingTypes(task); !slices.Contains(got, history.LockLost) || !slices.Contains(got, history.ActivityCompleted) {
+		t.Fatalf("the previous holder was not told: %v", got)
+	}
+	seq.consume(t, s, task)
+	// i1 takes k2 again and sleeps on its timer only: k2 lapses at its TTL.
+	task = wakeHeld(t, s, claimHeld)
+	if ev := seq.requestHeld(t, s, task, claimHeld, 4, "k2", h.TTL, hold); ev.Type != history.LockAcquired {
+		t.Fatalf("free k2: %+v", ev)
+	}
+	h.Advance(t, s, h.TTL+h.TTL/2)
+	if ev, _ := seq.requestLock(t, s, h, wakeTask(t, s, h, "i2"), 3, "k2"); ev.Type != history.LockAcquired {
+		t.Fatalf("lock of a sleeping holder kept: %+v", ev)
+	}
+}
+
+// wakeHeld signals i1 and claims it with claimHeld.
+func wakeHeld(t *testing.T, s store.Store, claimHeld func() store.WorkflowTask) store.WorkflowTask {
+	t.Helper()
+	if err := s.Signal(ctx, "i1", "wake", nil); err != nil {
+		t.Fatal(err)
+	}
+	return claimHeld()
+}
+
+// requestHeld is requestLockHold for an execution claimed by claimHeld
+// (not in the suite's queue): the answer, its task consumed.
+func (seq lockSeq) requestHeld(t *testing.T, s store.Store, task store.WorkflowTask, claimHeld func() store.WorkflowTask, sched int32, key string, ttl, hold time.Duration) history.Event {
+	t.Helper()
+	id := task.Execution.InstanceID
+	c := &store.Completion{Consumed: pendingIDs(task), Locks: []store.LockRequest{{ScheduleID: sched, Key: key, TTL: ttl, Hold: hold}}}
+	for _, p := range task.Pending {
+		seq[id]++
+		ev := p.Event
+		ev.Seq = seq[id]
+		c.History = append(c.History, ev)
+	}
+	seq[id]++
+	c.History = append(c.History, history.Event{Seq: seq[id], Type: history.LockRequested, ScheduleID: sched, Name: key})
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, c); err != nil {
+		t.Fatalf("request %s: %v", key, err)
+	}
+	next := claimHeld()
+	seq.consume(t, s, next)
+	for _, p := range next.Pending {
+		if p.Event.ScheduleID == sched && (p.Event.Type == history.LockAcquired || p.Event.Type == history.LockHeld) {
+			return p.Event
+		}
+	}
+	t.Fatalf("no answer for %s: %v", key, pendingTypes(next))
+	return history.Event{}
 }
 
 // T9.7: a completion that takes locks and keeps its lease can return the

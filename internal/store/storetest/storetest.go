@@ -117,6 +117,7 @@ func Run(t *testing.T, h Harness) {
 		{"LockValidation", testLockValidation},
 		{"LockHeldDuringActivity", testLockHeldDuringActivity},
 		{"LockKeptWhileActivityWaits", testLockKeptWhileActivityWaits},
+		{"LockKeptWhileEventsWait", testLockKeptWhileEventsWait},
 		{"LockAnswerInCompletion", testLockAnswerInCompletion},
 		{"LockWaitersFIFO", testLockWaitersFIFO},
 		{"LockWaiterExpires", testLockWaiterExpires},
