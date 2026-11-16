@@ -144,7 +144,7 @@ func testLockHolderParkedTerminated(t *testing.T, h Harness) {
 	if ev := seq.queueFor(t, s, h, "i2", 1, "k", time.Hour, time.Hour); ev.Type != history.LockHeld || ev.Err != "i1" {
 		t.Fatalf("lock of a parked holder: %+v", ev)
 	}
-	if err := s.Terminate(ctx, "i1", "operator"); err != nil {
+	if _, err := s.Terminate(ctx, "i1", "operator"); err != nil {
 		t.Fatal(err)
 	}
 	woken := claimOne(t, s, owner, h.TTL)
