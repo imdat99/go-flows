@@ -223,8 +223,7 @@ sau đó phát các dòng đã sẵn sàng tới broker bạn chọn.
 hãy để nguyên message.
 
 [`examples/outbox`](../../examples/outbox) ghép tất cả lại: một activity đặt
-sẵn event, chống trùng theo `Key` của nó cộng một nonce riêng cho mỗi
-execution; hook phát hành hoặc huỷ event đó và thêm một event
+sẵn event, chống trùng theo `Key` của nó (riêng cho mỗi execution); hook phát hành hoặc huỷ event đó và thêm một event
 `workflow.ended`; một relay phát các dòng đã sẵn sàng tới một
 event bus giả bằng `FOR UPDATE SKIP LOCKED`, retry có backoff. Giao nhận
 at-least-once, kèm event id để consumer chống trùng; các event đã phát hành

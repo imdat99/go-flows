@@ -28,6 +28,15 @@ must take care of.
 
 ### Changed
 
+- `flows.Key` carries the execution id:
+  `instanceID:scheduleID:name:executionID` (T10.19). Schedule ids restart
+  at 1 in every execution, so the first activity of every execution of a
+  continue-as-new chain, or of an instance id reused after retention purged
+  the earlier execution, had the same key, and idempotency records keyed by
+  it (`idem`, an outbox) silently skipped the later executions' work.
+  Executions that exist when migration `00016` runs keep the old format for
+  their whole life (see the upgrade notes). `Engine.Start` now reads the key
+  epoch from the database and fails if `Migrate` has not run.
 - `Engine.Terminate` no longer reads the execution again for the observer,
   and a hooked end no longer costs an extra `SELECT` round trip (T10.9).
 - `PollMax` is capped at a third of `LeaseTTL`: idle engines poll at least
@@ -71,9 +80,25 @@ must take care of.
 | `00013_due_owner` | `execution.due_owner`, `execution_due_idx` | due times of kept leases and sticky timers are their owner's (T10.2, T10.3) |
 | `00014_kept_comp_data` | `activity_task.comp_data` | compensation data kept across attempts (T10.7) |
 | `00015_trace_context` | `execution.trace`, `activity_task.trace` | the trace context of an execution (T10.10) |
+| `00016_key_epoch` | table `key_epoch` (one row) | the first execution id whose activity keys carry it (T10.19) |
 
 ### Upgrade notes
 
+- **Activity keys (T10.19).** An activity whose attempts or compensation
+  span the upgrade must see one key, or `idem` runs its effect twice (a
+  retry) or finds nothing to undo (`idem.Abort` in an uncertain
+  compensation). So the key format is fixed per execution: `00016` records
+  one past the highest execution id allocated so far, and executions below
+  it keep `instanceID:scheduleID:name` until they end (their continue-as-new
+  successors get the new format). Nothing to do for those. The one gap is a
+  mixed fleet: an execution started after `00016` ran gets the new format
+  on new engines, but old engines still give its activities the old key, so
+  an attempt by an old engine retried or compensated by a new one sees two
+  keys. To close it, stop the old engines (`Stop` drains them) before
+  running `Migrate` and starting the new ones; with a rolling deploy, the
+  exposure is limited to activities of executions started during the
+  deploy that an old engine attempted. Code that parsed keys by splitting
+  on `:` must treat them as opaque (or strip the trailing `:executionID`).
 - `00013` adds a column with a constant default (no table rewrite) and an
   index built without `CONCURRENTLY`: writes to `flows.execution` wait while
   it builds. On large tables, run the migration in a quiet window.

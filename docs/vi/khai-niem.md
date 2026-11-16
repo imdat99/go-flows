@@ -94,9 +94,15 @@ var charge = flows.DefineActivity("charge",
 
 - **Activity chạy ít nhất một lần.** Crash hoặc mất lease thì engine khác
   chạy lại attempt.
-- **Mỗi activity có một `flows.Key`** (`instanceID:scheduleID:name`). Key
-  giống nhau ở mọi attempt và mọi lần replay, nên module khử trùng hiệu ứng
-  của nó theo key (package `idem`): hiệu ứng khi đó xảy ra đúng một lần.
+- **Mỗi activity có một `flows.Key`**
+  (`instanceID:scheduleID:name:executionID`). Key giống nhau ở mọi attempt
+  và mọi lần replay, compensator của nó cũng nhận đúng key đó, nên module
+  khử trùng hiệu ứng của nó theo key (package `idem`): hiệu ứng khi đó xảy ra
+  đúng một lần. Key có execution id, nên các execution của một chuỗi
+  continue-as-new (schedule id bắt đầu lại từ 1) và một instance id được
+  dùng lại sau khi retention xoá không bao giờ trùng key. Execution bắt đầu
+  trước migration `00016` (v0.1.0) giữ dạng cũ `instanceID:scheduleID:name`
+  suốt đời. Hãy coi key là chuỗi mờ, đừng tách nó ra.
 - **Retry diễn ra trên activity task** (`RetryPolicy`; mặc định
   `DefaultRetry`: 5 lần, delay từ 1 s nhân đôi tới 1 phút), không nằm trong
   workflow. History chỉ ghi kết quả cuối, nên đổi policy là an toàn.

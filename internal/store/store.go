@@ -371,6 +371,10 @@ type ActivityTask struct {
 	CancelRequested bool
 	// Trace is the trace context of the task's execution (Execution.Trace).
 	Trace []byte
+	// LegacyKey: the task's execution started before the store's key epoch
+	// (KeyEpocher), so its activity key keeps the format without an
+	// execution id. Set by the worker, not the store.
+	LegacyKey bool
 }
 
 // ActivityResult ends an activity task: Event (ActivityCompleted or
@@ -667,6 +671,16 @@ const (
 type DueClaimer interface {
 	ClaimWorkflowTasksDue(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) (tasks []WorkflowTask, next time.Duration, err error)
 	ClaimActivityTasksDue(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) (tasks []ActivityTask, next time.Duration, err error)
+}
+
+// KeyEpocher is implemented by stores that hold executions started before
+// activity keys carried an execution id (T10.19): KeyEpoch is the first
+// execution id whose keys carry it. Executions with a lower id keep the
+// earlier key format for their whole life, so the attempts and the
+// compensation of one activity always see the same key. A store without it
+// has no such executions (every key carries the execution id).
+type KeyEpocher interface {
+	KeyEpoch(ctx context.Context) (int64, error)
 }
 
 // Watcher is implemented by stores that can push hints that work is ready

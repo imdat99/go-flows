@@ -95,9 +95,15 @@ var charge = flows.DefineActivity("charge",
 
 - **Activities run at least once.** A crash or a lost lease means another
   engine runs the attempt again.
-- **Each activity gets a `flows.Key`** (`instanceID:scheduleID:name`). The key
-  is the same on every attempt and replay, so a module deduplicates its
-  effect on it (package `idem`): the effect then happens once.
+- **Each activity gets a `flows.Key`**
+  (`instanceID:scheduleID:name:executionID`). The key is the same on every
+  attempt and replay, and its compensator gets it too, so a module
+  deduplicates its effect on it (package `idem`): the effect then happens
+  once. It names the execution, so the executions of a continue-as-new chain
+  (whose schedule ids restart at 1) and an instance id reused after retention
+  never share a key. Executions started before migration `00016` (v0.1.0)
+  keep the older `instanceID:scheduleID:name` for their whole life. Treat the
+  key as opaque.
 - **Retries happen on the activity task** (`RetryPolicy`; default
   `DefaultRetry`: 5 attempts, delays from 1 s doubling to 1 min), not in the
   workflow. The history records only the final outcome, so changing a policy

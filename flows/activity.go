@@ -5,20 +5,43 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/imdat99/go-flows/internal/store"
 	"github.com/imdat99/go-flows/internal/worker"
 )
 
-// Key identifies one activity of one workflow run: "instanceID:scheduleID:
-// name". It is the same on every attempt and replay of that activity, so
-// it is the idempotency key the activity's side effects should be deduplicated
-// by (activities run at least once).
+// Key identifies one activity of one workflow execution:
+// "instanceID:scheduleID:name:executionID". It is the same on every attempt
+// and replay of that activity, and its compensator gets it too, so it is
+// the idempotency key the activity's side effects should be deduplicated by
+// (activities run at least once). It differs between the executions of a
+// continue-as-new chain (schedule ids restart in each) and between
+// executions reusing an instance id after retention purged the earlier
+// one: execution ids are never reused.
+//
+// Executions that already existed when migration 00016_key_epoch ran
+// (started by v0.1.0) keep the key "instanceID:scheduleID:name" for their
+// whole life, so idempotency records stored by their earlier attempts stay
+// valid. Treat a Key as opaque: do not parse it.
 type Key string
 
+// activityKey builds t's key without fmt: one allocation, pre-sized.
 func activityKey(t *store.ActivityTask) Key {
-	return Key(t.InstanceID + ":" + strconv.Itoa(int(t.ScheduleID)) + ":" + t.Name)
+	var num [20]byte // a decimal int64
+	var b strings.Builder
+	b.Grow(len(t.InstanceID) + len(t.Name) + 3 + 11 + 20)
+	b.WriteString(t.InstanceID)
+	b.WriteByte(':')
+	b.Write(strconv.AppendInt(num[:0], int64(t.ScheduleID), 10))
+	b.WriteByte(':')
+	b.WriteString(t.Name)
+	if !t.LegacyKey {
+		b.WriteByte(':')
+		b.Write(strconv.AppendInt(num[:0], t.ExecutionID, 10))
+	}
+	return Key(b.String())
 }
 
 // InvokeFunc runs an activity: its output, and the data its compensator

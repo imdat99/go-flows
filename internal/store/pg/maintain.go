@@ -438,3 +438,18 @@ func (s *Store) NoteStuck(ctx context.Context, l store.Lease, seq int64) (bool, 
 	}
 	return again, nil
 }
+
+var _ store.KeyEpocher = (*Store)(nil)
+
+// KeyEpoch implements store.KeyEpocher: the first execution id whose
+// activity keys carry it, recorded by migration 00016_key_epoch.
+func (s *Store) KeyEpoch(ctx context.Context) (int64, error) {
+	var epoch int64
+	err := retry(ctx, func() error {
+		return s.pool.QueryRow(ctx, `SELECT first_execution_id FROM flows.key_epoch`).Scan(&epoch)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("read key epoch (run Migrate first): %w", err)
+	}
+	return epoch, nil
+}

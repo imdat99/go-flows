@@ -242,6 +242,9 @@ type Worker struct {
 	runnersOnce   sync.Once // Stop may run more than once
 	runners       sync.WaitGroup
 	wfDue, actDue *dueTimes // local wake-ups for committed delays
+	// keyEpoch is the store's key epoch (store.KeyEpocher), read at Start:
+	// activities of executions below it keep the legacy key format.
+	keyEpoch int64
 
 	mu sync.Mutex
 	// pollCancel stops claiming (Stop's first step); taskCancel ends the
@@ -314,6 +317,13 @@ func (w *Worker) Start(ctx context.Context) error {
 	defer w.mu.Unlock()
 	if w.started {
 		return errors.New("worker: already started")
+	}
+	if ke, ok := w.st.(store.KeyEpocher); ok {
+		epoch, err := ke.KeyEpoch(ctx)
+		if err != nil {
+			return fmt.Errorf("worker: start: %w", err)
+		}
+		w.keyEpoch = epoch
 	}
 	w.started = true
 	base := context.WithoutCancel(ctx)

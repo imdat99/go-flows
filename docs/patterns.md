@@ -223,7 +223,7 @@ then publishes the ready rows to the broker of your choice.
 leave the messages there.
 
 [`examples/outbox`](../examples/outbox) puts it together: an activity stages
-an event deduplicated by its `Key` plus a per-execution nonce, the hook
+an event deduplicated by its `Key` (unique per execution), the hook
 releases or drops it and stages a `workflow.ended` event, and a relay
 publishes ready rows to a stub bus with `FOR UPDATE SKIP LOCKED` and retries
 with backoff. Delivery is at least once,

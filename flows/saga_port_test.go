@@ -99,12 +99,17 @@ var (
 	})
 )
 
+// callsOf counts the calls of the activity "instanceID:scheduleID:name" in
+// every execution of the instance (keys end with the execution id).
 func callsOf(k string) int32 {
-	c, ok := calls.Load(Key(k))
-	if !ok {
-		return 0
-	}
-	return c.(*atomic.Int32).Load()
+	var n int32
+	calls.Range(func(key, c any) bool {
+		if strings.HasPrefix(string(key.(Key)), k+":") {
+			n += c.(*atomic.Int32).Load()
+		}
+		return true
+	})
+	return n
 }
 
 // resetCalls forgets the counts of instance id (tests reuse ids with -count).

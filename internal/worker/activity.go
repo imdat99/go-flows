@@ -84,6 +84,7 @@ var nullData = []byte("null")
 // lost) and decides what to record: an activity outcome, or for a
 // compensation task, CompensationCompleted or CompensationFailed.
 func (w *Worker) attempt(ctx context.Context, a *Activity, t *store.ActivityTask) attemptOutcome {
+	t.LegacyKey = t.ExecutionID < w.keyEpoch
 	var start time.Time
 	if w.opts.Observer != nil {
 		start = time.Now()

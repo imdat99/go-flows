@@ -87,8 +87,8 @@ func TestPostgresEndToEnd(t *testing.T) {
 		if err != nil {
 			t.Fatalf("run %d: %v", i, err)
 		}
-		want := "pick-" + strconv.Itoa(i) + ":1:pgtest.pick"
-		if len(keys) != 3 || keys[0] != want {
+		want := "pick-" + strconv.Itoa(i) + ":1:pgtest.pick:"
+		if len(keys) != 3 || !strings.HasPrefix(keys[0], want) {
 			t.Fatalf("run %d keys %v, want first %q", i, keys, want)
 		}
 	}
@@ -483,5 +483,46 @@ func TestListenDSN(t *testing.T) {
 	keys, err := pickAll.Run(cctx, client, "listen-1", []item{{SKU: "a", Qty: 1}})
 	if err != nil || len(keys) != 1 {
 		t.Fatalf("run: %v %v", keys, err)
+	}
+}
+
+// T10.19 upgrade: an execution below the key epoch (it existed when
+// migration 00016 ran) keeps the legacy key "instance:schedule:name" for its
+// whole life; an execution started after it gets the execution id too.
+func TestLegacyKeysBeforeEpoch(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	if err := flows.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	client, err := flows.New(pool, flows.Options{InstanceID: "client"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := pickAll.Start(ctx, client, "legacy-1", []item{{"a", 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// As if legacy-1 had been started by v0.1.0, before the migration.
+	if _, err := pool.Exec(ctx, `UPDATE flows.key_epoch SET first_execution_id = (SELECT max(id) + 1 FROM flows.execution)`); err != nil {
+		t.Fatal(err)
+	}
+	e, err := flows.New(pool, flows.Options{InstanceID: "pg-legacy", PollMax: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Stop(ctx) })
+	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	keys, err := old.Wait(wctx)
+	if err != nil || len(keys) != 1 || keys[0] != "legacy-1:1:pgtest.pick" {
+		t.Fatalf("legacy keys %q %v", keys, err)
+	}
+	keys, err = pickAll.Run(wctx, e, "new-1", []item{{"a", 1}})
+	if err != nil || len(keys) != 1 || !strings.HasPrefix(keys[0], "new-1:1:pgtest.pick:") {
+		t.Fatalf("new keys %q %v", keys, err)
 	}
 }
