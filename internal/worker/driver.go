@@ -669,6 +669,18 @@ func (d *driver) reportDropped(task *store.WorkflowTask, c *store.Completion) {
 		slog.String("instance", task.Execution.InstanceID), slog.String("status", string(c.Status)),
 		slog.Int("activities", acts), slog.Int("children", kids))
 	if w.droppedHook != nil {
-		w.droppedHook(task.Execution.InstanceID, acts, kids)
+		w.callDroppedHook(task.Execution.InstanceID, acts, kids)
 	}
+}
+
+// callDroppedHook calls the dropped hook, recovering (and logging) its
+// panics: the task is committed, the rest of its completion must run.
+func (w *Worker) callDroppedHook(instanceID string, acts, kids int) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.log.LogAttrs(context.Background(), slog.LevelError, "flows: panic in dropped hook",
+				slog.String("instance", instanceID), slog.Any("panic", r))
+		}
+	}()
+	w.droppedHook(instanceID, acts, kids)
 }

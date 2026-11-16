@@ -16,13 +16,20 @@
 // runs in milliseconds, and nothing depends on the wall clock (go-workflows
 // tester issues #494, #481). A workflow that waits for something that can
 // never come fails Run with ErrBlocked, at once. Run reports activities and
-// children the workflow started but did not await (#436).
+// children the workflow, or any of its descendants, started but did not
+// await (#436).
 //
 // Activities run for real unless mocked; their own sleeps take wall time,
-// and virtual time does not move while one runs. So an activity that waits
-// for its context to be canceled by a workflow timer (Select over a timer
-// and the activity, canceling it) never sees the timer fire: mock it to
-// return.
+// and virtual time does not move while one runs: an activity takes no
+// virtual time, whatever the speed of the machine. So an activity that
+// waits for its context to be canceled by a workflow timer (Select over a
+// timer and the activity, canceling it) never sees the timer fire, and Run
+// fails with ErrNeverIdle after 30s of wall time. This is a limitation, not
+// a bug to be fixed by moving time anyway: the tester cannot tell such an
+// activity from a slow one, and moving time under a running activity would
+// expire its lease and timeouts, making the outcome depend on the wall
+// clock. Mock the activity to return, or model the wait in the workflow (a
+// signal, a child workflow, a timer).
 //
 // Run, Advance and Settle must be called from the test's goroutine.
 package flowtest
@@ -219,15 +226,7 @@ func Run[I, O any](tst *Tester, wf *flows.Workflow[I, O], instanceID string, in 
 		return zero, fmt.Errorf("%s: %w", instanceID, err)
 	}
 	if !tst.cfg.allowPending {
-		pending := tst.pendingFutures(instanceID)
-		tst.mu.Lock()
-		if d, ok := tst.dropped[instanceID]; ok {
-			pending = append(pending, d)
-		}
-		tst.mu.Unlock()
-		if len(pending) > 0 {
-			tst.t.Errorf("flowtest: %s ended with futures it did not await: %s", instanceID, strings.Join(pending, ", "))
-		}
+		tst.reportPending(instanceID)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -260,9 +259,16 @@ func (tst *Tester) Advance(d time.Duration) {
 	tst.Settle()
 }
 
-// ErrNeverIdle reports an engine that stayed busy for 30s of wall time.
+// ErrNeverIdle reports an engine that stayed busy for 30s of wall time:
+// an activity running for long, or one waiting for a cancel that only a
+// workflow timer would send (see the package documentation: virtual time
+// does not move while activities run, so that timer never fires).
 var ErrNeverIdle = errors.New("flowtest: the engine never became idle (an activity running for long, " +
-	"or waiting for a cancel that a workflow timer would send: virtual time does not move while activities run)")
+	"or waiting for a cancel that a workflow timer would send: virtual time does not move while activities run; mock the activity)")
+
+// idleTimeout is how long (wall time) waitIdle waits for an idle engine
+// before ErrNeverIdle.
+var idleTimeout = 30 * time.Second
 
 // drive runs until done, moving virtual time when idle.
 func (tst *Tester) drive(done func() bool) error {
@@ -316,7 +322,7 @@ func (tst *Tester) moveTo(at time.Time) {
 // waitIdle waits (wall time) until the engine is idle with nothing
 // claimable: a few consecutive observations, as pollers wake every 2ms.
 func (tst *Tester) waitIdle() error {
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(idleTimeout)
 	for quiet := 0; quiet < 4; {
 		ready, _, _ := tst.st.Wake("flowtest", tst.queues)
 		if ready || tst.w.Busy() {
@@ -332,17 +338,44 @@ func (tst *Tester) waitIdle() error {
 	return nil
 }
 
+// reportPending reports, as test errors, the futures that instanceID and
+// its descendants (the children started by the latest execution of each,
+// recursively) ended without awaiting.
+func (tst *Tester) reportPending(instanceID string) {
+	seen := map[string]bool{instanceID: true}
+	for queue := []string{instanceID}; len(queue) > 0; {
+		id := queue[0]
+		queue = queue[1:]
+		pending, children := tst.pendingFutures(id)
+		tst.mu.Lock()
+		if d, ok := tst.dropped[id]; ok {
+			pending = append(pending, d)
+		}
+		tst.mu.Unlock()
+		if len(pending) > 0 {
+			tst.t.Errorf("flowtest: %s ended with futures it did not await: %s", id, strings.Join(pending, ", "))
+		}
+		for _, c := range children {
+			if !seen[c] {
+				seen[c] = true
+				queue = append(queue, c)
+			}
+		}
+	}
+}
+
 // pendingFutures lists the activities and children an instance's latest
-// execution started and had no outcome for when it ended.
-func (tst *Tester) pendingFutures(instanceID string) []string {
+// execution started and had no outcome for when it ended, and the instance
+// ids of all the children it started.
+func (tst *Tester) pendingFutures(instanceID string) (pending, children []string) {
 	ctx := context.Background()
 	ex, err := tst.st.GetExecution(ctx, instanceID)
 	if err != nil || ex.Status.Active() {
-		return nil
+		return nil, nil
 	}
 	hist, err := tst.st.LoadHistory(ctx, ex.ID, 0)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	open := map[int32]string{}
 	var order []int32
@@ -354,18 +387,18 @@ func (tst *Tester) pendingFutures(instanceID string) []string {
 		case history.ChildScheduled:
 			open[ev.ScheduleID] = fmt.Sprintf("child %s %q (schedule id %d)", ev.Name, ev.Ref, ev.ScheduleID)
 			order = append(order, ev.ScheduleID)
+			children = append(children, ev.Ref)
 		case history.ActivityCompleted, history.ActivityFailed, history.ChildCompleted, history.ChildFailed:
 			delete(open, ev.ScheduleID)
 		default:
 		}
 	}
-	var out []string
 	for _, id := range order {
 		if s, ok := open[id]; ok {
-			out = append(out, s)
+			pending = append(pending, s)
 		}
 	}
-	return out
+	return pending, children
 }
 
 // EventTypes lists the event types of the history of the latest execution

@@ -237,7 +237,8 @@ type Worker struct {
 
 // SetDroppedHook sets a function told, when a workflow ends, of the
 // activities and children it started in its last task without awaiting
-// them, which were not started (they are also logged). Call before Start.
+// them, which were not started (they are also logged). Its panics are
+// recovered and logged. Call before Start.
 func (w *Worker) SetDroppedHook(f func(instanceID string, activities, children int)) {
 	w.droppedHook = f
 }

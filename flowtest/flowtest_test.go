@@ -3,7 +3,10 @@ package flowtest_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -304,9 +307,23 @@ func TestGW17_436_PendingFuturesAreReported(t *testing.T) {
 type recordingTB struct {
 	testing.TB
 	failed atomic.Bool
+	mu     sync.Mutex
+	msgs   []string
 }
 
-func (r *recordingTB) Errorf(string, ...any) { r.failed.Store(true) }
+func (r *recordingTB) Errorf(format string, args ...any) {
+	r.failed.Store(true)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.msgs = append(r.msgs, fmt.Sprintf(format, args...))
+}
+
+// messages returns the reports, one per line.
+func (r *recordingTB) messages() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.msgs, "\n")
+}
 
 // GW-17, go-workflows #377: fan-out over many coroutines stays fast (it
 // was O(n^3) in the go-workflows tester).
@@ -373,5 +390,91 @@ func TestGW17_436_DroppedAtTheEndIsReported(t *testing.T) {
 	}
 	if !inner.failed.Load() {
 		t.Fatal("what the last task started was not reported")
+	}
+}
+
+// T10.11: an activity waiting for the cancel a workflow timer would send is
+// a documented limitation (virtual time does not move while activities
+// run): Run fails with ErrNeverIdle, it does not hang. Mocking the activity
+// to return makes the workflow end.
+var (
+	// stopWaiting ends waitsForCancel at the end of the test (sooner than
+	// the tester's Stop deadline).
+	stopWaiting    atomic.Pointer[chan struct{}]
+	waitsForCancel = flows.DefineActivity("ft.waits-for-cancel", func(ctx context.Context, _ flows.Key, _ int) (int, struct{}, error) {
+		select {
+		case <-ctx.Done():
+			return 0, struct{}{}, ctx.Err()
+		case <-*stopWaiting.Load():
+			return 0, struct{}{}, errors.New("test over")
+		}
+	}, nil)
+	timerVsActivity = flows.DefineWorkflow("ft.timer-vs-activity", 1, func(c flows.Ctx, _ int) (string, error) {
+		ac, cancel := flows.WithCancel(c)
+		f := waitsForCancel.Start(ac, 0)
+		won := ""
+		flows.Select(c,
+			flows.OnFuture(flows.NewTimer(c, time.Minute), func(flows.Ctx, struct{}, error) { cancel(); won = "timer" }),
+			flows.OnFuture(f, func(flows.Ctx, int, error) { won = "activity" }),
+		)
+		return won, nil
+	})
+)
+
+func TestActivityWaitingForATimerIsNeverIdle(t *testing.T) {
+	flowtest.SetIdleTimeout(t, 300*time.Millisecond)
+	stop := make(chan struct{})
+	stopWaiting.Store(&stop)
+	tst := flowtest.New(t, flowtest.AllowPendingFutures())
+	t.Cleanup(func() { close(stop) }) // before the tester stops
+	if _, err := flowtest.Run(tst, timerVsActivity, "race", 0); !errors.Is(err, flowtest.ErrNeverIdle) {
+		t.Fatalf("got %v, want ErrNeverIdle", err)
+	}
+	mocked := flowtest.New(t)
+	flowtest.OnActivity(mocked, waitsForCancel, func(context.Context, flows.Key, int) (int, struct{}, error) {
+		return 0, struct{}{}, nil
+	})
+	if won, err := flowtest.Run(mocked, timerVsActivity, "race", 0); err != nil || won != "activity" {
+		t.Fatalf("%q %v", won, err)
+	}
+}
+
+// T10.11: the futures abandoned by the children (and grandchildren) of the
+// instance passed to Run are reported too, both those left pending and
+// those dropped at the end.
+var (
+	grandparent = flows.DefineWorkflow("ft.grandparent", 1, func(c flows.Ctx, _ int) (int, error) {
+		return parentOfForgetful.Child(c, "parent-of-forgetful", 0).Get(c)
+	})
+	parentOfForgetful = flows.DefineWorkflow("ft.parent-of-forgetful", 1, func(c flows.Ctx, _ int) (int, error) {
+		a, err := forgetful.Child(c, "forgetful-kid", 0).Get(c)
+		if err != nil {
+			return 0, err
+		}
+		b, err := dropsAtTheEnd.Child(c, "drops-kid", 0).Get(c)
+		return a + b, err
+	})
+)
+
+func TestChildrenPendingFuturesAreReported(t *testing.T) {
+	inner := &recordingTB{TB: t}
+	tst := flowtest.New(inner)
+	flowtest.OnActivity(tst, fetch, slowFast)
+	if v, err := flowtest.Run(tst, grandparent, "grandparent", 0); err != nil || v != 2 {
+		t.Fatalf("%d %v", v, err)
+	}
+	msgs := inner.messages()
+	for _, want := range []string{"forgetful-kid", "drops-kid"} {
+		if !strings.Contains(msgs, want) {
+			t.Errorf("%s not reported: %q", want, msgs)
+		}
+	}
+	if strings.Contains(msgs, "parent-of-forgetful ended") || strings.Contains(msgs, "grandparent ended") {
+		t.Errorf("an instance that awaited everything was reported: %q", msgs)
+	}
+	ok := flowtest.New(t, flowtest.AllowPendingFutures())
+	flowtest.OnActivity(ok, fetch, slowFast)
+	if _, err := flowtest.Run(ok, grandparent, "grandparent", 0); err != nil {
+		t.Fatal(err)
 	}
 }

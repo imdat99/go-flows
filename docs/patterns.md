@@ -250,5 +250,10 @@ func TestBook(t *testing.T) {
   virtual time. A workflow that sleeps for a week finishes in milliseconds.
 - **Blocked workflows.** A workflow that can never end fails with
   `flowtest.ErrBlocked`.
-- **Pending futures.** Activities started and never awaited fail the test,
-  unless you pass `AllowPendingFutures`.
+- **Pending futures.** Activities and children started and never awaited,
+  by the workflow or any of its descendants, fail the test, unless you pass
+  `AllowPendingFutures`.
+- **Activities take no virtual time.** Virtual time does not move while an
+  activity runs. An activity that waits for the cancel a workflow timer
+  would send never sees that timer fire, and `Run` fails with
+  `flowtest.ErrNeverIdle`: mock such an activity to return.

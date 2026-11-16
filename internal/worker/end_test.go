@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -103,5 +104,72 @@ func TestChildrenStartedAtTheEnd(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "instance=p0") {
 		t.Fatalf("an end without drops logged one:\n%s", logs.String())
+	}
+}
+
+// endObserver records the ends it is told of.
+type endObserver struct {
+	mu    sync.Mutex
+	ended []string
+}
+
+func (*endObserver) ActivityAttempt(*store.ActivityTask, string, time.Duration, error) {}
+
+func (o *endObserver) Ended(e store.EndInfo) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.ended = append(o.ended, e.InstanceID)
+}
+
+func (o *endObserver) seen(id string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return slices.Contains(o.ended, id)
+}
+
+// T10.11: a panic in the dropped hook is recovered and logged where it is
+// called: the rest of the completed task (the end reported to the
+// observer) still runs.
+func TestDroppedHookPanicIsRecovered(t *testing.T) {
+	st := mem.New(nil)
+	reg := newRegistry()
+	reg.addWorkflow("kid", func(coro.Context, []byte) ([]byte, error) { return nil, nil })
+	reg.addWorkflow("parent", func(ctx coro.Context, _ []byte) ([]byte, error) {
+		executor.FromContext(ctx).StartChild(ctx, "kid-dropped", "kid", 1, q, nil) // not awaited
+		return []byte("ended"), nil
+	})
+	var logs syncBuffer
+	obs := &endObserver{}
+	w, err := worker.New(st, reg, reg, worker.Options{
+		Owner: "w1", Queues: []string{q}, LeaseTTL: 5 * time.Second, PollMax: 50 * time.Millisecond,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)), Observer: obs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.SetDroppedHook(func(string, int, int) { panic("hook") })
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := w.Stop(ctx); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	})
+	create(t, st, "p", "parent", "")
+	if e := waitEnd(t, st, "p"); e.Status != store.StatusCompleted {
+		t.Fatalf("p: %s", e.Status)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !obs.seen("p") || !strings.Contains(logs.String(), "panic in dropped hook") {
+		if time.Now().After(deadline) {
+			t.Fatalf("observer saw the end: %v; logs:\n%s", obs.seen("p"), logs.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if strings.Contains(logs.String(), "panic in workflow task") {
+		t.Fatalf("the hook's panic reached the task:\n%s", logs.String())
 	}
 }
