@@ -18,7 +18,8 @@
 //
 //  1. An activity stages a business event (ready = false) in its own
 //     transaction, deduplicated by its event id: activities run at least
-//     once, so a retry finds the row already there.
+//     once, so a retry finds the row already there. In a real activity
+//     the insert goes in the same transaction as the business change.
 //  2. The RunHook runs inside the transaction that ends the execution: on
 //     completed it releases the staged events (ready = true); on any other
 //     end (failed, compensated, canceled, terminated) it drops them. It
@@ -137,8 +138,14 @@ var (
 	//
 	// A late attempt can still insert after the run ended (the attempt
 	// outlived its lease, then the run failed and the hook dropped what was
-	// there): that orphan row is never released. A periodic job should
-	// delete rows that stay not ready for long, say a day.
+	// there). That orphan stays not ready, but a later run reusing the
+	// instance id (after retention purged it) would release it on
+	// completion. A periodic job should delete not-ready rows of instances
+	// that have ended (they have a workflow.ended row), and do so
+	// before an ended instance's id can be reused. Do not age them by time
+	// alone (a run waiting on a signal can last days), or only past the
+	// longest possible run, with a staged_at column. Scoping the hook's
+	// release to the current execution's nonce also closes the gap.
 	stageConfirmed = flows.DefineActivity("outbox.stage-confirmed",
 		func(ctx context.Context, k flows.Key, in staged) (struct{}, struct{}, error) {
 			payload, err := json.Marshal(in.Order)
@@ -277,7 +284,7 @@ func relayBatch(ctx context.Context, pool *pgxpool.Pool, bus EventBus, n int) er
 			if ctx.Err() != nil {
 				return fmt.Errorf("relay stopped: %w", ctx.Err()) // stopping: leave the rest to the next relay
 			}
-			backoff := min(100*time.Millisecond<<e.attempts, 5*time.Second)
+			backoff := min(100*time.Millisecond<<min(e.attempts, 6), 5*time.Second) // clamp before shifting
 			if _, err := tx.Exec(ctx, `
 				UPDATE app_outbox.events
 				SET attempts = attempts + 1, last_error = $2, next_at = now() + $3 * interval '1 millisecond'
