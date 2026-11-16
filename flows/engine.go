@@ -179,6 +179,11 @@ func (e *Engine) Start(ctx context.Context) error { return e.w.Start(ctx) }
 
 // Stop stops taking tasks and waits for the running ones until ctx is done;
 // those still running then are canceled and resumed by another instance.
+// No new claim is started after Stop begins, apart from one already being
+// issued: a claim in flight completes (its tasks run as part of the drain)
+// within a short grace period, else it is canceled. Stop returns ctx's
+// error only if running tasks were canceled; an idle engine whose deadline
+// passes returns nil.
 func (e *Engine) Stop(ctx context.Context) error { return e.w.Stop(ctx) }
 
 // Signal sends a signal called name with payload (JSON-encoded) to the

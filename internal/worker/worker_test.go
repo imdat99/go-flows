@@ -454,7 +454,11 @@ func TestStopDeadlineDoesNotFailWork(t *testing.T) {
 				time.Sleep(time.Millisecond)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-			_ = w1.Stop(ctx)
+			// A task was interrupted (not an idle worker): the deadline's
+			// error.
+			if err := w1.Stop(ctx); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("stop interrupting a task: %v, want the deadline's error", err)
+			}
 			cancel()
 			if e, _ := st.GetExecution(context.Background(), "i1"); e.Status != store.StatusRunning {
 				t.Fatalf("stop deadline ended the workflow: %s %s", e.Status, e.Err)

@@ -367,10 +367,11 @@ const stopGrace = time.Second
 // not recorded, and another instance runs it again once its lease expires.
 var errStopping = errors.New("worker stopping")
 
-// Stop stops claiming (no claim starts after it begins; one in flight
-// completes, within stopGrace and ctx, else it is canceled), then waits
-// for in-flight tasks until ctx is done; tasks still running then are
-// canceled, and Stop returns ctx's error. Workflow leases kept for eager
+// Stop stops claiming (no new claim is started after it begins, apart from
+// one already being issued; a claim in flight completes within stopGrace
+// and ctx, else it is canceled), then waits for in-flight tasks until ctx
+// is done; tasks still running then are canceled, and only then does Stop
+// return ctx's error (an idle worker whose deadline passes returns nil). Workflow leases kept for eager
 // execution are released as their tasks end, so another instance can
 // continue at once.
 func (w *Worker) Stop(ctx context.Context) error {

@@ -96,8 +96,9 @@ Chi phí đo được và nguyên nhân nằm trong [benchmarks.md](../benchmark
   chạy cho tới khi `ctx` kết thúc, rồi huỷ phần còn lại. Lease của chúng được
   nhả hoặc để hết hạn, và engine khác chạy tiếp. Các execution đang sticky
   được nhả ngay, nên engine kế tiếp không phải chờ `StickyFor`.
-- **Claim lúc `Stop`.** Khi `Stop` đã bắt đầu thì không claim nào bắt đầu
-  nữa. Claim đang chạy dở có thể đã commit trong database dù bị huỷ, nên
+- **Claim lúc `Stop`.** Khi `Stop` đã bắt đầu thì không claim mới nào được
+  bắt đầu nữa, trừ một claim đang được gửi đi (giới hạn bởi thời gian chờ
+  bên dưới). Claim đang chạy dở có thể đã commit trong database dù bị huỷ, nên
   `Stop` cho nó chạy xong, tối đa 1 giây (hoặc tới khi `ctx` kết thúc, nếu
   sớm hơn), và các task nó claim được chạy trong lúc drain. Claim vẫn chưa
   xong sau đó (database không với tới được) bị huỷ: engine rảnh vẫn dừng

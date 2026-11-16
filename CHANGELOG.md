@@ -59,6 +59,17 @@ must take care of.
 
 ### Fixed
 
+- A claim in flight when `Engine.Stop` begins is no longer dropped
+  (T10.13). The claim was canceled with the polls, yet on Postgres it could
+  still commit: its tasks stayed leased to the stopped engine for a whole
+  `LeaseTTL`, and other engines found them only at a timed poll. Now no new
+  claim is started after `Stop` begins, apart from one already being
+  issued; a claim in flight completes within a grace period of 1 second
+  (or `Stop`'s deadline, if sooner), its tasks run as part of the drain,
+  and a claim still running then (a database out of reach) is canceled, so
+  an idle engine stops promptly. `Stop` returns its context's error only
+  if running tasks were canceled: an idle engine whose deadline passes
+  returns nil.
 - Ending an execution (completion, `Terminate`) takes its lock rows in key
   order and `Unstick` its execution rows by id, as every other statement
   does: no deadlock (detected by Postgres and retried) against a claim or
