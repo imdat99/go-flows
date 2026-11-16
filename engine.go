@@ -56,6 +56,13 @@ type Options struct {
 	// Tracer, when set, wraps activity attempts and workflow tasks in spans
 	// (OpenTelemetry: package otelflows).
 	Tracer Tracer
+	// StuckTimeout bounds how long workflow code may run without yielding
+	// to the engine (default 10s). Code that exceeds it is handed back;
+	// exceeding it again at the same point of its history parks the
+	// execution (ErrStuck). Each engine counts for itself: with N engines,
+	// it may stall once on each before it is parked (each attempt leaves a
+	// goroutine running until its process exits).
+	StuckTimeout time.Duration
 }
 
 // Engine runs the workflows and activities defined in this binary against
@@ -87,6 +94,11 @@ func newEngineWith(st store.Store, acts worker.Activities, opts Options) (*Engin
 		_, _ = rand.Read(b[:])
 		opts.InstanceID = host + "-" + hex.EncodeToString(b[:])
 	}
+	for _, q := range opts.Queues {
+		if err := text.CheckName(ErrInvalidArgument, "queue name", q); err != nil {
+			return nil, err
+		}
+	}
 	if len(opts.Queues) == 0 {
 		opts.Queues = []string{DefaultQueue}
 	}
@@ -113,7 +125,7 @@ func newEngineWith(st store.Store, acts worker.Activities, opts Options) (*Engin
 		MaxWorkflowTasks: opts.MaxWorkflowTasks, MaxActivities: opts.MaxActivities,
 		Eager: !opts.DisableEager, EagerWindow: opts.EagerWindow, StickyFor: opts.StickyFor,
 		PollMax: opts.PollMax, CacheSize: opts.CacheSize, Errors: errorCodec{}, Logger: opts.Logger,
-		Observer: obs, Tracer: tr,
+		Observer: obs, Tracer: tr, StuckTimeout: opts.StuckTimeout,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("flows: %w", err)
@@ -147,10 +159,11 @@ func (e *Engine) Signal(ctx context.Context, instanceID, name string, payload an
 // Cancel asks the running execution of instanceID to cancel: its root
 // context is canceled, which cancels its activities, timers and children.
 // The workflow decides what to do (it can clean up in a Disconnected
-// context); if it returns an error, its activities are compensated, and it
-// ends canceled. Once the workflow has ended and compensates (or is parked),
-// a cancel is accepted but has no effect: compensation always completes
-// (Terminate stops it).
+// context). If it returns the cancellation (an error wrapping ErrCanceled),
+// its activities are compensated and it ends canceled; another error ends
+// it as a failure (compensated or failed), a result completes it. Once the
+// workflow has ended and compensates (or is parked), a cancel is accepted
+// but has no effect: compensation always completes (Terminate stops it).
 func (e *Engine) Cancel(ctx context.Context, instanceID string) error {
 	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
 		return err
@@ -168,6 +181,19 @@ func (e *Engine) RetryCompensation(ctx context.Context, instanceID string) error
 		return err
 	}
 	return e.st.ReopenCompensation(ctx, instanceID)
+}
+
+// Resume resumes the execution of instanceID parked as needs_attention
+// because its workflow code was wrong (errors.Is ErrNonDeterministic or
+// ErrStuck), once fixed code is deployed: it runs again from its history,
+// replayed by the code now registered (parked again if that still does
+// not match). ErrNotActive when the execution is not parked that way; a
+// failed compensation resumes with RetryCompensation.
+func (e *Engine) Resume(ctx context.Context, instanceID string) error {
+	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
+		return err
+	}
+	return e.st.ReopenParked(ctx, instanceID)
 }
 
 // Terminate ends the running execution of instanceID at once, without
@@ -199,8 +225,9 @@ func (e *Engine) Terminate(ctx context.Context, instanceID, reason string) error
 }
 
 // PurgeEnded deletes up to limit executions that ended more than olderThan
-// ago (their histories with them), freeing their instance ids. Children of
-// a running execution are kept until it ends (it may compensate them).
+// ago (their histories with them), freeing their instance ids. Descendants
+// of an active execution (children, grandchildren) are kept until it ends:
+// its compensation may reach them.
 func (e *Engine) PurgeEnded(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
 	return e.st.PurgeEnded(ctx, olderThan, limit)
 }

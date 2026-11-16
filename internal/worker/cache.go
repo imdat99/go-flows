@@ -56,9 +56,20 @@ func (c *cache) put(ex *executor.Executor) {
 	}
 	var evicted []*executor.Executor
 	c.mu.Lock()
-	if _, ok := c.items[ex.ExecutionID()]; ok {
+	if el, ok := c.items[ex.ExecutionID()]; ok {
+		// Two drivers of one execution (a lease lost and taken over): keep
+		// the executor further along its history; the other would only be
+		// replayed past (a stale one is never used: take checks LastSeq).
+		cur := exOf(el)
+		if cur.LastSeq() >= ex.LastSeq() {
+			c.mu.Unlock()
+			ex.Close()
+			return
+		}
+		el.Value = ex
+		c.lru.MoveToFront(el)
 		c.mu.Unlock()
-		ex.Close()
+		cur.Close()
 		return
 	}
 	c.items[ex.ExecutionID()] = c.lru.PushFront(ex)

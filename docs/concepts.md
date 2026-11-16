@@ -33,7 +33,7 @@ Statuses of an execution:
 | --- | --- |
 | `running` | Workflow code runs or waits (activities, timers, signals, children). |
 | `compensating` | It failed or was canceled; compensators are running. |
-| `needs_attention` | Parked: replay diverged from the history (`ErrNonDeterministic`), or a compensator failed after its retries (`ErrCompensationFailed`). Nothing runs until an operator acts. |
+| `needs_attention` | Parked: its code is wrong (replay diverged from the history, `ErrNonDeterministic`; or it ran without yielding, `ErrStuck`), or a compensator failed after its retries (`ErrCompensationFailed`). Nothing runs until an operator acts: `Engine.Resume` after deploying fixed code, `Engine.RetryCompensation` after fixing the compensation's cause. |
 | `completed` | The workflow returned a result. |
 | `compensated` | It failed, and at least one compensator ran (its completed activities were undone). A child reopened for its parent's compensation also ends here. |
 | `failed` | It failed with nothing to compensate. |
@@ -67,9 +67,14 @@ The replay checks each recorded call against the code: its type, name,
 argument hash and timer duration. It also fails a replay that ends before the
 history does. On any mismatch the execution is **parked** as
 `needs_attention` with `ErrNonDeterministic`. It is never failed, because
-failing would compensate work that did happen. To change a workflow's
+failing would compensate work that did happen; once code matching its
+history is deployed, `Engine.Resume` runs it again. To change a workflow's
 sequence of calls, deploy it as a new version and keep the old definition
-registered until its executions have ended.
+registered until its executions have ended. Workflow code that runs without
+yielding to the engine for `StuckTimeout` (a blocking call, a busy loop) is
+handed back once (the process may only have stalled), and parked the same
+way, with `ErrStuck`, when it happens again at the same point. An event type the binary does not know (written by a newer
+version) hands the execution back to another engine instead.
 
 A replayed execution is cached in the process that ran it (`CacheSize`), and
 its next task stays on that process for `StickyFor`. A cache hit skips the
@@ -98,7 +103,9 @@ var charge = flows.DefineActivity("charge",
   is safe.
   - `flows.Permanent(err)` stops the retries.
   - `WithTimeout` bounds each attempt.
-- **Outputs, inputs and compensation data are JSON.** Keep them small: IDs,
+- **Outputs, inputs and compensation data are JSON.** Strings must be valid
+  UTF-8 (invalid bytes become U+FFFD): pass binary data as `[]byte`. Keep
+  them small: IDs,
   not documents.
 
 **Eager execution.** When a workflow task schedules an activity and the

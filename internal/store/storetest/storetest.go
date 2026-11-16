@@ -89,19 +89,23 @@ func Run(t *testing.T, h Harness) {
 		{"InvalidCompletions", testInvalidCompletions},
 		{"ActivityQueuesAndLimit", testActivityQueuesAndLimit},
 		{"DefensiveCopies", testDefensiveCopies},
+		{"ClaimsWithRepeatedQueues", testClaimsWithRepeatedQueues},
 		{"TimesComeFromTheStoreClock", testStoreClock},
 		{"GW3_SignalsRacingTerminalCompletion", testSignalsRacingTerminal},
 		{"ParkedExecutionCannotKeepItsLease", testParkedCannotKeep},
 		{"RenewLeases", testRenewLeases},
 		{"GW4_PurgeEnded", testPurgeEnded},
 		{"GW4_PurgeKeepsActiveExecutions", testPurgeKeepsActiveExecutions},
+		{"GW4_PurgeKeepsDescendantsOfActiveExecutions", testPurgeKeepsDescendantsOfActiveExecutions},
 		{"KeptLeaseHolderDies", testKeptLeaseHolderDies},
+		{"KeptLeaseExpiresWithoutEvents", testKeptLeaseExpiresWithoutEvents},
 		{"GW3_TerminalWithNilConsumed", testTerminalWithNilConsumed},
 		{"WatchHints", testWatch},
 		{"Terminate", testTerminate},
 		{"CompensationTask", testCompensationTask},
 		{"ActivityResultTypes", testActivityResultTypes},
 		{"ReopenCompensation", testReopenCompensation},
+		{"ReopenParked", testReopenParked},
 		{"CompensateChildren", testCompensateChildren},
 		{"Locks", testLocks},
 		{"LockRenewal", testLockRenewal},
@@ -1244,6 +1248,35 @@ func testActivityQueuesAndLimit(t *testing.T, h Harness) {
 	other, err := s.ClaimActivityTasks(ctx, owner, []string{"other"}, 10, h.TTL)
 	if err != nil || len(other) != 1 || other[0].Name != "b" {
 		t.Fatalf("other queue: %+v %v", other, err)
+	}
+}
+
+// T8.4 review: a queue listed twice (or several queues) does not shrink a
+// claim: each ready task is claimed once, up to the limit.
+func testClaimsWithRepeatedQueues(t *testing.T, h Harness) {
+	s := h.New(t)
+	for _, id := range []string{"i1", "i2", "i3"} {
+		mustCreate(t, s, id)
+	}
+	tasks, err := s.ClaimWorkflowTasks(ctx, owner, []string{queue, queue, "other", queue}, 3, h.TTL)
+	if err != nil || len(tasks) != 3 {
+		t.Fatalf("workflow claim: %d %v", len(tasks), err)
+	}
+	seen := map[int64]bool{}
+	for _, tk := range tasks {
+		if seen[tk.Execution.ID] || len(tk.Pending) != 1 {
+			t.Fatalf("claimed %+v", tasks)
+		}
+		seen[tk.Execution.ID] = true
+	}
+	started(t, s, tasks[0], &store.Completion{Activities: []store.NewActivityTask{
+		{ScheduleID: 1, Name: "a", Queue: queue},
+		{ScheduleID: 2, Name: "a", Queue: queue},
+		{ScheduleID: 3, Name: "a", Queue: queue},
+	}})
+	acts, err := s.ClaimActivityTasks(ctx, owner, []string{queue, queue, queue}, 3, h.TTL)
+	if err != nil || len(acts) != 3 || acts[0].ScheduleID == acts[1].ScheduleID {
+		t.Fatalf("activity claim: %+v %v", acts, err)
 	}
 }
 

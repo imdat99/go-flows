@@ -32,7 +32,7 @@ Các trạng thái của execution:
 | --- | --- |
 | `running` | Code workflow đang chạy hoặc đang chờ (activity, timer, signal, child). |
 | `compensating` | Workflow lỗi hoặc bị huỷ; các compensator đang chạy. |
-| `needs_attention` | Bị park: replay lệch với history (`ErrNonDeterministic`), hoặc một compensator thất bại sau khi hết retry (`ErrCompensationFailed`). Không có gì chạy cho tới khi người vận hành can thiệp. |
+| `needs_attention` | Bị park: code sai (replay lệch với history, `ErrNonDeterministic`; hoặc chạy mà không nhường, `ErrStuck`), hoặc một compensator thất bại sau khi hết retry (`ErrCompensationFailed`). Không có gì chạy cho tới khi người vận hành can thiệp: `Engine.Resume` sau khi deploy code đã sửa, `Engine.RetryCompensation` sau khi sửa nguyên nhân của compensation. |
 | `completed` | Workflow trả về kết quả. |
 | `compensated` | Workflow lỗi, và có ít nhất một compensator đã chạy (các activity đã hoàn tất được hoàn tác). Child được mở lại để phục vụ compensation của cha cũng kết thúc ở đây. |
 | `failed` | Workflow lỗi và không có gì để hoàn tác. |
@@ -66,8 +66,14 @@ Khi replay, mỗi lời gọi đã ghi được so với code: loại, tên, has
 thời lượng timer. Replay kết thúc trước khi hết history cũng bị coi là lệch.
 Khi lệch, execution bị **park** ở `needs_attention` với
 `ErrNonDeterministic`. Nó không bao giờ bị fail, vì fail sẽ hoàn tác những
-việc đã thực sự xảy ra. Muốn đổi chuỗi lời gọi của workflow thì deploy thành
-version mới, và giữ định nghĩa cũ cho tới khi các execution của nó kết thúc.
+việc đã thực sự xảy ra; khi code khớp với history đã được deploy,
+`Engine.Resume` cho nó chạy lại. Muốn đổi chuỗi lời gọi của workflow thì
+deploy thành version mới, và giữ định nghĩa cũ cho tới khi các execution của
+nó kết thúc. Code workflow chạy mà không nhường cho engine quá
+`StuckTimeout` (lời gọi chặn, vòng lặp bận) được trả lại một lần (có thể chỉ
+là process bị khựng), và bị park như vậy, với `ErrStuck`, khi lặp lại ở
+cùng chỗ. Loại event mà binary
+không biết (do version mới hơn ghi) thì execution được trả cho engine khác.
 
 Execution đã replay được cache trong process đã chạy nó (`CacheSize`), và
 task kế tiếp của nó ở lại process đó trong `StickyFor`. Trúng cache thì bỏ
@@ -95,7 +101,9 @@ var charge = flows.DefineActivity("charge",
   workflow. History chỉ ghi kết quả cuối, nên đổi policy là an toàn.
   - `flows.Permanent(err)` dừng retry.
   - `WithTimeout` giới hạn mỗi attempt.
-- **Output, input và dữ liệu compensation là JSON.** Giữ chúng nhỏ: ID,
+- **Output, input và dữ liệu compensation là JSON.** Chuỗi phải là UTF-8
+  hợp lệ (byte sai bị thay bằng U+FFFD): dữ liệu nhị phân hãy truyền dạng
+  `[]byte`. Giữ chúng nhỏ: ID,
   không phải cả tài liệu.
 
 **Thực thi eager.** Khi một workflow task lên lịch activity và engine còn

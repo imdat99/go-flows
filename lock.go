@@ -75,7 +75,7 @@ func Lock(c Ctx, key string, ttl time.Duration, opts ...LockOption) error {
 	}
 	for attempt := int32(1); ; attempt++ {
 		err := st.Lock(c.c, key, ttl)
-		if err == nil || attempt >= int32(cfg.wait.Attempts) {
+		if err == nil || int(attempt) >= cfg.wait.Attempts {
 			return err
 		}
 		if err := Sleep(c, max(cfg.wait.Delay(attempt+1), minLockWait)); err != nil {

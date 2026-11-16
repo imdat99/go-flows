@@ -95,7 +95,7 @@ github.com/imdat99/go-flows`).
 | `otelflows` (module riêng) | Tracer và observer metric OpenTelemetry. |
 | `analyzer` (module riêng) | `flowsvet`: báo code workflow không tất định, cho `go vet` hoặc golangci-lint. |
 
-Module gốc chỉ phụ thuộc pgx, goose và uuid.
+Module gốc chỉ phụ thuộc pgx và goose.
 
 ## Phát triển
 

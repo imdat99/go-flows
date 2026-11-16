@@ -96,7 +96,7 @@ github.com/imdat99/go-flows`).
 | `otelflows` (separate module) | OpenTelemetry tracer and metrics observer. |
 | `analyzer` (separate module) | `flowsvet`: reports non-deterministic workflow code, for `go vet` or golangci-lint. |
 
-The root module depends on pgx, goose and uuid only.
+The root module depends on pgx and goose only.
 
 ## Development
 

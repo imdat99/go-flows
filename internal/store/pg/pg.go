@@ -327,44 +327,71 @@ func (s *Store) GetExecution(ctx context.Context, instanceID string) (store.Exec
 }
 
 // claimWorkflow grants leases on up to $3 ready executions of the queues $1
-// to owner $2 for $4 microseconds (GW-8: index scan in readiness order).
-const claimWorkflow = `
+// to owner $2 for $4 microseconds (GW-8: index scan in readiness order),
+// and returns each with its visible pending events, in one statement (one
+// implicit transaction: a claim never commits without its events read).
+//
+// Each queue is read on its own (LATERAL): with queue = ANY($1) the planner
+// cannot read execution_ready_idx in order, and sorts the whole ready
+// backlog on every claim (TestGW8_ClaimsReadOnlyWhatTheyClaim). Queues are
+// deduplicated (a queue listed twice would fill the limit with one row
+// twice: rows this statement locked are not skipped). Each queue locks up
+// to $3 rows, held until the statement ends even when the outer limit
+// drops them. The pending events come from pending_event_execution_idx,
+// one LATERAL per claimed execution, as arrays (readClaimed).
+var claimWorkflow = `
 	WITH c AS (
-		SELECT id FROM flows.execution
-		WHERE queue = ANY($1) AND status IN ('running', 'compensating')
-		  AND ready_at <= now()
-		  AND (locked_until IS NULL OR locked_until < now())
-		  AND (not_before IS NULL OR not_before <= now())
-		  AND (sticky_until IS NULL OR sticky_until < now() OR sticky_owner = $2)
-		ORDER BY ready_at, id
+		SELECT x.id FROM (SELECT DISTINCT unnest($1::text[])) AS q(name)
+		CROSS JOIN LATERAL (
+			SELECT id, ready_at FROM flows.execution
+			WHERE queue = q.name AND status IN ('running', 'compensating')
+			  AND ready_at <= now()
+			  AND (locked_until IS NULL OR locked_until < now())
+			  AND (not_before IS NULL OR not_before <= now())
+			  AND (sticky_until IS NULL OR sticky_until < now() OR sticky_owner = $2)
+			ORDER BY ready_at, id
+			LIMIT $3
+			FOR NO KEY UPDATE SKIP LOCKED
+		) x
+		ORDER BY x.ready_at, x.id
 		LIMIT $3
-		FOR NO KEY UPDATE SKIP LOCKED
 	)
 	, k AS (
 		-- The locks of a running execution do not lapse (store.Completion.Locks).
 		-- It waits for a lock row a contender holds (acquireLock never waits
 		-- on an execution row: no cycle) and re-checks its holder.
+		-- Lock rows are taken in key order: claims for the same execution
+		-- (an execution and its activities) do not deadlock.
 		UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
-		FROM c WHERE k.execution_id = c.id
+		WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id = ANY(ARRAY(SELECT id FROM c))
+		                ORDER BY key FOR UPDATE)
 	)
-	UPDATE flows.execution e
-	SET owner_id = $2, lease_version = e.lease_version + 1,
-	    locked_until = now() + $4 * interval '1 microsecond', not_before = NULL
-	FROM c WHERE e.id = c.id
-	RETURNING e.id, e.instance_id, e.workflow, e.version, e.queue, e.status, e.parent_id, e.parent_sched,
-	          e.input, e.output, e.err, e.err_kinds, e.created_at, e.ended_at,
-	          e.lease_version, e.last_seq, now()`
+	, u AS (
+		UPDATE flows.execution e
+		SET owner_id = $2, lease_version = e.lease_version + 1,
+		    locked_until = now() + $4 * interval '1 microsecond', not_before = NULL
+		WHERE e.id = ANY(ARRAY(SELECT id FROM c)) -- a join may scan the table (generic plans)
+		RETURNING e.id, e.instance_id, e.workflow, e.version, e.queue, e.status, e.parent_id, e.parent_sched,
+		          e.input, e.output, e.err, e.err_kinds, e.created_at, e.ended_at,
+		          e.lease_version, e.last_seq
+	)
+	SELECT u.*, now(), a.*
+	FROM u CROSS JOIN LATERAL ( -- an aggregate without GROUP BY: one row, even without events
+		SELECT ` + pendingAggs + `
+		FROM flows.pending_event p WHERE p.execution_id = u.id AND p.visible_at <= now()
+	) a`
 
-// claimedPending returns the visible pending events of the executions
-// leased by this transaction: in the same implicit transaction as
-// claimWorkflow, now() is the same, so locked_until identifies them.
-const claimedPending = `
-	SELECT p.id, p.execution_id, ` + pendingColumnsP + `
-	FROM flows.pending_event p
-	JOIN flows.execution e ON e.id = p.execution_id
-	WHERE e.owner_id = $1 AND e.locked_until = now() + $2 * interval '1 microsecond'
-	  AND p.visible_at <= now()
-	ORDER BY p.execution_id, p.visible_at, p.id`
+// pendingAggs aggregates the pending event columns of a group, in delivery
+// order (visibility time, arrival), as arrays: id, then the event columns
+// (eventColumns). Without events, each is an empty array.
+var pendingAggs = func() string {
+	cols := append([]string{"id"}, strings.Split(strings.Join(strings.Fields(eventColumns), ""), ",")...)
+	out := make([]string, len(cols))
+	for i, c := range cols {
+		out[i] = "coalesce(array_agg(p." + c + " ORDER BY p.visible_at, p.id), '{}')"
+	}
+	return strings.Join(out, ", ")
+}()
 
 const pendingColumnsP = `p.type, p.schedule_id, p.attempt, p.name, p.version, p.ref, p.queue, p.arg_hash,
 	p.payload, p.comp_data, p.err, p.err_kinds, p.uncertain, p.permanent, p.at`
@@ -374,19 +401,12 @@ func (s *Store) ClaimWorkflowTasks(ctx context.Context, owner string, queues []s
 	var tasks []store.WorkflowTask
 	err := retry(ctx, func() error {
 		tasks = tasks[:0]
-		b := &pgx.Batch{}
-		b.Queue(claimWorkflow, queues, owner, limit, micros(ttl))
-		b.Queue(claimedPending, owner, micros(ttl))
-		br := s.pool.SendBatch(ctx, b)
-		defer br.Close()
-		var err error
-		if tasks, err = readTasks(br, owner); err != nil {
+		rows, err := s.pool.Query(ctx, claimWorkflow, queues, owner, limit, micros(ttl))
+		if err != nil {
 			return err
 		}
-		if err := readPending(br, tasks); err != nil {
-			return err
-		}
-		return br.Close()
+		tasks, err = readClaimed(rows, owner)
+		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("claim workflow tasks: %w", err)
@@ -394,11 +414,48 @@ func (s *Store) ClaimWorkflowTasks(ctx context.Context, owner string, queues []s
 	return tasks, nil
 }
 
-func readTasks(br pgx.BatchResults, owner string) ([]store.WorkflowTask, error) {
-	rows, err := br.Query()
-	if err != nil {
-		return nil, err
+// claimedEvents receives the pending event arrays of a claimed execution
+// (pendingAggs: id, then eventColumns).
+type claimedEvents struct {
+	eventArgs
+	ids []int64
+	ats []pgtype.Timestamptz
+}
+
+// readClaimed reads claimWorkflow's rows: the execution, the lease version,
+// last seq and store time, then its pending events as arrays.
+func readClaimed(rows pgx.Rows, owner string) ([]store.WorkflowTask, error) {
+	defer rows.Close()
+	var tasks []store.WorkflowTask
+	var a claimedEvents
+	for rows.Next() {
+		var t store.WorkflowTask
+		e, err := scanExecution(rows, &t.Lease.Version, &t.LastSeq, &t.Now,
+			&a.ids, &a.types, &a.scheds, &a.attempts, &a.names, &a.versions, &a.refs, &a.queues, &a.hashes,
+			&a.payloads, &a.comps, &a.errs, &a.kinds, &a.uncertain, &a.permanent, &a.ats)
+		if err != nil {
+			return nil, err
+		}
+		t.Execution = e
+		t.Lease.ID, t.Lease.Owner = e.ID, owner
+		if n := len(a.ids); n > 0 {
+			t.Pending = make([]store.PendingEvent, n)
+			for i := range n {
+				t.Pending[i] = store.PendingEvent{ID: a.ids[i], Event: history.Event{
+					Type: history.Type(a.types[i]), ScheduleID: a.scheds[i], Attempt: a.attempts[i],
+					Name: a.names[i], Version: a.versions[i], Ref: a.refs[i], Queue: a.queues[i],
+					Payload: a.payloads[i], CompData: a.comps[i], Err: a.errs[i], ErrKinds: a.kinds[i],
+					Uncertain: a.uncertain[i], Permanent: a.permanent[i],
+				}}
+				finishEvent(&t.Pending[i].Event, a.ats[i], a.hashes[i])
+			}
+		}
+		tasks = append(tasks, t)
 	}
+	return tasks, rows.Err()
+}
+
+func readTasks(rows pgx.Rows, owner string) ([]store.WorkflowTask, error) {
 	defer rows.Close()
 	var tasks []store.WorkflowTask
 	for rows.Next() {
@@ -416,11 +473,7 @@ func readTasks(br pgx.BatchResults, owner string) ([]store.WorkflowTask, error) 
 
 // readPending distributes pending rows (id, execution_id, event columns)
 // onto tasks.
-func readPending(br pgx.BatchResults, tasks []store.WorkflowTask) error {
-	rows, err := br.Query()
-	if err != nil {
-		return err
-	}
+func readPending(rows pgx.Rows, tasks []store.WorkflowTask) error {
 	defer rows.Close()
 	byID := make(map[int64]int, len(tasks))
 	for i, t := range tasks {
@@ -566,11 +619,18 @@ func readResume(br pgx.BatchResults, owner string) (store.WorkflowTask, bool, er
 	if _, err := br.Exec(); err != nil {
 		return store.WorkflowTask{}, false, err
 	}
-	tasks, err := readTasks(br, owner)
+	rows, err := br.Query()
 	if err != nil {
 		return store.WorkflowTask{}, false, err
 	}
-	if err := readPending(br, tasks); err != nil {
+	tasks, err := readTasks(rows, owner)
+	if err != nil {
+		return store.WorkflowTask{}, false, err
+	}
+	if rows, err = br.Query(); err != nil {
+		return store.WorkflowTask{}, false, err
+	}
+	if err := readPending(rows, tasks); err != nil {
 		return store.WorkflowTask{}, false, err
 	}
 	if len(tasks) == 0 {
@@ -810,6 +870,9 @@ const updateRunning = `
 	    status = v.status,
 	    err = CASE WHEN $3::text IN ('needs_attention', 'compensating') THEN $7::text ELSE e.err END,
 	    err_kinds = CASE WHEN $3::text IN ('needs_attention', 'compensating') THEN $8::text ELSE e.err_kinds END,
+	    -- A kept lease is claimable at its expiry: events delivered under it
+	    -- (wakeForTask) leave ready_at alone, so a dead holder's execution
+	    -- is found then, possibly with nothing pending (an empty task).
 	    ready_at = CASE WHEN v.keep
 	        THEN least((SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
 	                   now() + $4 * interval '1 microsecond')
@@ -867,11 +930,15 @@ const (
 	// dropEnded removes what an ended execution can no longer use: its
 	// pending events and its activity tasks, so their workers learn of the
 	// end at their next heartbeat (ErrLeaseLost) instead of running on, and
-	// its business locks. No lock-order cycle: activity completions lock the
-	// execution row before the task row (wakeForTask); claims and renewals
-	// lock execution or task rows, then lock rows with SKIP LOCKED; a lock
-	// takeover (acquireLock) locks a lock row, then the previous holder's
-	// execution row with SKIP LOCKED.
+	// its business locks. Lock order: activity completions lock the
+	// execution row before the task row (wakeForTask); claims lock
+	// execution or task rows, then wait for lock rows, taken in key order;
+	// a lock takeover (acquireLock) locks a lock row, then the previous
+	// holder's execution row with SKIP LOCKED. One cycle remains, rare and
+	// broken by Postgres' deadlock detection (retry runs the statement
+	// again): an ending child holding its lock row here, then locking its
+	// parent's row (notifyParent), against its parent's completion holding
+	// that row and waiting in acquireLock for the same key.
 	dropEnded = `
 		WITH p AS (DELETE FROM flows.pending_event WHERE execution_id = $1),
 		     k AS (DELETE FROM flows.lock WHERE execution_id = $1)
@@ -1129,18 +1196,25 @@ func readCompletion(br pgx.BatchResults, sh completionShape) (map[actKey]int64, 
 // claimActivities grants leases on up to $3 visible activity tasks of the
 // queues $1 to owner $2 for $4 microseconds. visible_at moves to the lease
 // expiry, so the ready index only holds claimable tasks.
+// Each queue (deduplicated) is read on its own, as in claimWorkflow.
 const claimActivities = `
 	WITH c AS (
-		SELECT id, execution_id FROM flows.activity_task
-		WHERE queue = ANY($1) AND visible_at <= now()
-		ORDER BY visible_at, id
+		SELECT x.id, x.execution_id FROM (SELECT DISTINCT unnest($1::text[])) AS q(name)
+		CROSS JOIN LATERAL (
+			SELECT id, execution_id, visible_at FROM flows.activity_task
+			WHERE queue = q.name AND visible_at <= now()
+			ORDER BY visible_at, id
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		) x
+		ORDER BY x.visible_at, x.id
 		LIMIT $3
-		FOR UPDATE SKIP LOCKED
 	), k AS (
 		-- An execution's locks live while its activities run (store.Completion.Locks);
 		-- waits for a contender's lock row, as the workflow claim.
 		UPDATE flows.lock k SET until = now() + k.ttl_us * interval '1 microsecond'
-		FROM c WHERE k.execution_id = c.execution_id
+		WHERE k.key IN (SELECT key FROM flows.lock WHERE execution_id = ANY(ARRAY(SELECT execution_id FROM c))
+		                ORDER BY key FOR UPDATE)
 	)
 	UPDATE flows.activity_task t
 	SET owner_id = $2, lease_version = t.lease_version + 1, attempt = t.attempt + 1,
@@ -1148,7 +1222,7 @@ const claimActivities = `
 	    uncertain = t.uncertain OR (t.owner_id <> '' AND NOT t.compensate),
 	    locked_until = now() + $4 * interval '1 microsecond',
 	    visible_at = now() + $4 * interval '1 microsecond'
-	FROM c WHERE t.id = c.id
+	WHERE t.id = ANY(ARRAY(SELECT id FROM c)) -- a join may scan the table (generic plans)
 	RETURNING t.id, t.lease_version, t.execution_id, t.instance_id, t.schedule_id, t.name, t.queue,
 	          t.input, t.compensate, t.attempt, t.cancel_requested, t.uncertain`
 

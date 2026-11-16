@@ -135,6 +135,40 @@ func testKeptLeaseHolderDies(t *testing.T, h Harness) {
 	}
 }
 
+// T8.4 review: a kept lease that expires with nothing pending may be
+// claimed as a task without events (Postgres: events delivered under a
+// kept lease leave its readiness alone, so its expiry makes it ready) or
+// not at all (memory); either way, the next event makes it claimable with
+// that event.
+func testKeptLeaseExpiresWithoutEvents(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "i1")
+	task := claimOne(t, s, owner, h.TTL)
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, &store.Completion{
+		History:  []history.Event{{Seq: 1, Type: history.ExecutionStarted}},
+		Consumed: pendingIDs(task),
+		KeepFor:  h.TTL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.Advance(t, s, h.TTL+h.TTL/2)
+	got := claim(t, s, other, h.TTL)
+	switch {
+	case len(got) > 1, len(got) == 1 && len(got[0].Pending) != 0:
+		t.Fatalf("claimed %+v", got)
+	case len(got) == 1: // release the empty task as a worker would
+		if _, err := s.CompleteWorkflowTask(ctx, got[0].Lease, &store.Completion{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Signal(ctx, "i1", "s", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := claimOne(t, s, other, h.TTL); len(got.Pending) != 1 {
+		t.Fatalf("pending %v", pendingTypes(got))
+	}
+}
+
 // GW-3: a terminal completion of a resumed task that delivered nothing
 // (Consumed nil) is still rejected while a signal is pending.
 func testTerminalWithNilConsumed(t *testing.T, h Harness) {
@@ -487,6 +521,44 @@ func testPurgeKeepsActiveExecutions(t *testing.T, h Harness) {
 	for _, id := range []string{"parked", "compensating"} {
 		if _, err := s.GetExecution(ctx, id); err != nil {
 			t.Fatalf("%s purged: %v", id, err)
+		}
+	}
+}
+
+// T8.4 review: compensation reaches grandchildren (a reopened child
+// compensates its own children), so a grandchild is kept while any ancestor
+// is active, even though its own parent ended.
+func testPurgeKeepsDescendantsOfActiveExecutions(t *testing.T, h Harness) {
+	s := h.New(t)
+	mustCreate(t, s, "g")
+	task := claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{Children: []store.NewExecution{{InstanceID: "p", Workflow: "cw", Version: 1, Queue: queue, ParentSched: 1}}})
+	p := claimOne(t, s, owner, h.TTL)
+	started(t, s, p, &store.Completion{Children: []store.NewExecution{{InstanceID: "c", Workflow: "cw", Version: 1, Queue: queue, ParentSched: 1}}})
+	c := claimOne(t, s, owner, h.TTL)
+	if c.Execution.InstanceID != "c" {
+		t.Fatalf("claimed %s", c.Execution.InstanceID)
+	}
+	if _, err := s.CompleteWorkflowTask(ctx, c.Lease, &store.Completion{
+		History:  []history.Event{{Seq: 1, Type: history.ExecutionStarted}, {Seq: 2, Type: history.ExecutionCompleted}},
+		Consumed: pendingIDs(c), Status: store.StatusCompleted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p = claimOne(t, s, owner, h.TTL) // its child's result
+	if _, err := s.CompleteWorkflowTask(ctx, p.Lease, &store.Completion{
+		History:  []history.Event{{Seq: p.LastSeq + 1, Type: history.ExecutionCompleted}},
+		Consumed: pendingIDs(p), Status: store.StatusCompleted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.Advance(t, s, h.TTL)
+	if n, err := s.PurgeEnded(ctx, 0, 10); err != nil || n != 0 {
+		t.Fatalf("purged %d %v", n, err)
+	}
+	for _, id := range []string{"p", "c"} {
+		if _, err := s.GetExecution(ctx, id); err != nil {
+			t.Fatalf("%s purged while g is active: %v", id, err)
 		}
 	}
 }

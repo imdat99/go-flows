@@ -45,7 +45,10 @@ nhau khi replay.
 **Non-determinism thì park, không fail.** Replay lệch với history thì
 execution bị park ở `needs_attention` (GW-11). Lệch nghĩa là khác loại lời
 gọi, tên, hash tham số, thời lượng timer, hoặc replay ngắn hơn history.
-Version workflow lạ thì được trả cho engine khác thay vì fail (GW-12).
+Code chạy mà không nhường cũng bị park như vậy (`ErrStuck`), khi điều đó
+xảy ra hai lần ở cùng chỗ. `Engine.Resume`
+cho execution như vậy chạy lại khi code đã sửa được deploy. Version workflow
+lạ, hoặc loại event lạ, thì được trả cho engine khác thay vì fail (GW-12).
 
 **Panic không thoát ra ngoài.** Panic trong activity, compensator, code
 workflow, coroutine và giải mã signal đều được recover và chuyển thành lỗi
@@ -101,17 +104,13 @@ như thể đã giữ lock suốt.
 - **Tính tất định của code bạn sửa.** Đổi chuỗi lời gọi của một version
   workflow đã deploy sẽ park các execution đang chạy của nó. Hãy deploy thay
   đổi thành version mới.
-- **Khôi phục từ park do non-determinism.** Hiện chưa có lệnh nào của engine
-  mở lại execution như vậy, và deploy lại code cũ cũng không (nó chỉ ngăn
-  các lần park tiếp theo). Lối ra là `Terminate`, vốn **không chạy
-  compensation**: các activity đã hoàn tất giữ nguyên hiệu ứng, nên hãy
-  hoàn tác thủ công hoặc để instance mới tính tới chúng.
-  (`RetryCompensation` chỉ áp dụng cho compensation thất bại.)
-- **Tiến triển của workflow không bao giờ nhường.** Code workflow bị chặn mà
-  không gọi engine (vòng lặp bận) không bị park: task của nó được trả lại và
-  bị thử lại mãi. Engine ghi log ở mức error. Mỗi lần thử còn để lại một
-  goroutine quay vòng (không gì dừng được nó), nên CPU tăng dần cho tới khi
-  process khởi động lại: hãy sửa và deploy lại.
+- **Execution bị park tự chạy lại.** Deploy code đã sửa không tự làm execution
+  bị park vì code chạy lại: hãy gọi `Engine.Resume`. Lối ra còn lại,
+  `Terminate`, **không chạy compensation**: các activity đã hoàn tất giữ
+  nguyên hiệu ứng.
+- **Dừng code không bao giờ nhường.** Workflow bị kẹt được park, nhưng
+  goroutine của nó không dừng được: nó chạy tiếp (quay vòng, với vòng lặp
+  bận) cho tới khi process thoát. Hãy sửa code và khởi động lại các process.
 - **Giới hạn kích thước.** Payload lưu dạng JSON trong cột `bytea`. Input,
   output và signal lớn làm tốn thời gian replay và bộ nhớ; giữ chúng ở mức
   ID.

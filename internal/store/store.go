@@ -78,6 +78,12 @@ const (
 	// KindCompensationFailed marks the reason of an execution parked because
 	// a compensation failed for good; ReopenCompensation resumes only those.
 	KindCompensationFailed = "compensation_failed"
+	// KindNonDeterministic and KindStuck mark the reasons of an execution
+	// parked because its code is wrong (its replay diverged from the
+	// history, or it did not yield); ReopenParked resumes only those, once
+	// fixed code is deployed.
+	KindNonDeterministic = "non_deterministic"
+	KindStuck            = "stuck"
 )
 
 // Status of an execution. Values are stored: never change them.
@@ -396,7 +402,9 @@ type Store interface {
 	// ClaimWorkflowTasks claims up to limit executions of the given queues
 	// that have visible pending events and no live lease, preferring the
 	// oldest ready ones, for ttl. Executions sticky to another owner are
-	// skipped until the stickiness expires.
+	// skipped until the stickiness expires. An execution whose kept lease
+	// (Completion.KeepFor) expired may be claimed with no pending events
+	// (a task that delivers nothing): its holder died.
 	ClaimWorkflowTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]WorkflowTask, error)
 	// LoadHistory returns the history events with Seq > afterSeq.
 	LoadHistory(ctx context.Context, executionID, afterSeq int64) ([]history.Event, error)
@@ -450,7 +458,7 @@ type Store interface {
 	RenewLeases(ctx context.Context, owner string, workflows, activities []Lease, ttl time.Duration) (Renewal, error)
 
 	// PurgeEnded deletes up to limit executions that ended before
-	// now - olderThan (but not the children of an active execution), with their history, pending events and tasks, and
+	// now - olderThan (but not the descendants of an active execution), with their history, pending events and tasks, and
 	// returns how many it deleted. Their instance ids become free. Rows
 	// locked elsewhere are skipped, so concurrent purges split the work.
 	PurgeEnded(ctx context.Context, olderThan time.Duration, limit int) (int, error)
@@ -461,6 +469,12 @@ type Store interface {
 	// CompensationRetryRequested pending event. ErrNotFound for an unknown
 	// id, ErrNotActive when the latest execution is not parked that way.
 	ReopenCompensation(ctx context.Context, instanceID string) error
+	// ReopenParked resumes an execution parked because its code was wrong
+	// (its ErrKinds hold KindNonDeterministic or KindStuck): it becomes
+	// running again, its reason cleared, ready to be claimed (and replayed
+	// by the code deployed since). ErrNotFound for an unknown id,
+	// ErrNotActive when the latest execution is not parked that way.
+	ReopenParked(ctx context.Context, instanceID string) error
 
 	// Terminate ends the active execution of an instance id by force:
 	// ExecutionTerminated is appended to its history, no workflow code or

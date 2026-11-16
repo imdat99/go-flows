@@ -44,8 +44,10 @@ replay.
 **Non-determinism parks, never fails.** A replay that diverges from the
 history parks the execution as `needs_attention` (GW-11). Diverging means a
 different call type, name, argument hash or timer duration, or a replay
-shorter than the history. An unknown workflow version is handed back to
-another engine rather than failed (GW-12).
+shorter than the history. Code that runs without yielding parks the same
+way (`ErrStuck`), when it does so twice at the same point. `Engine.Resume` runs such an execution again once fixed
+code is deployed. An unknown workflow version, or an unknown event type, is
+handed back to another engine rather than failed (GW-12).
 
 **Panics never escape.** Panics in activities, compensators, workflow code,
 coroutines and signal decoding are recovered and become errors (`ErrPanic`)
@@ -101,16 +103,12 @@ advisory lock and applies the embedded goose migrations once (GW-7).
 - **Determinism of code you change.** Changing a deployed workflow version's
   sequence of calls parks its running executions. Deploy changes as a new
   version.
-- **Recovery from a non-determinism park.** No engine call reopens such an
-  execution today, and redeploying the old code does not either (it only
-  stops further parks). The way out is `Terminate`, which runs **no
-  compensation**: activities that completed keep their effects, so undo them
-  by hand or let the new instance account for them. (`RetryCompensation`
-  applies only to failed compensations.)
-- **Progress of a workflow that never yields.** Workflow code that blocks
-  without calling the engine (a busy loop) is not parked: its task is handed
-  back, and it is retried again and again. The engine logs it at error
-  level. Each attempt also leaves its goroutine spinning (nothing can stop
-  it), so CPU use grows until the process restarts: fix and redeploy.
+- **That a parked execution resumes by itself.** Deploying fixed code does
+  not resume an execution parked for its code: call `Engine.Resume`. The
+  other way out, `Terminate`, runs **no compensation**: activities that
+  completed keep their effects.
+- **Stopping code that never yields.** A stuck workflow is parked, but its
+  goroutine cannot be stopped: it keeps running (spinning, for a busy loop)
+  until the process exits. Fix the code and restart the processes.
 - **Size limits.** Payloads are stored as JSON in `bytea` columns. Large
   inputs, outputs and signals cost replay time and memory; keep them to IDs.

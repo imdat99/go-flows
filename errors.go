@@ -3,6 +3,7 @@ package flows
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -26,8 +27,18 @@ var (
 	// workflow: an instance id is an idempotency key.
 	ErrInstanceConflict = store.ErrInstanceConflict
 	// ErrNonDeterministic is the reason of an execution parked as
-	// needs_attention: its replay diverged from its history.
+	// needs_attention: its replay diverged from its history (the deployed
+	// code no longer matches it). Engine.Resume resumes it once fixed code
+	// is deployed.
 	ErrNonDeterministic = executor.ErrNonDeterministic
+	// ErrStuck is the reason of an execution parked as needs_attention
+	// because its workflow code ran without yielding to the engine for
+	// longer than Options.StuckTimeout, twice at the same point of its
+	// history (a blocking call or a busy loop: do such work in activities;
+	// once is handed back, as a stalled process).
+	// Its goroutine cannot be stopped and stays until the process exits.
+	// Engine.Resume resumes it once fixed code is deployed.
+	ErrStuck = coro.ErrStuck
 	// ErrCanceled is the error of an activity, timer, child or workflow whose
 	// context was canceled.
 	ErrCanceled = executor.ErrCanceled
@@ -89,7 +100,8 @@ var kinds = struct {
 	{"timeout", ErrTimeout},
 	{"canceled", ErrCanceled},
 	{"await_timeout", ErrAwaitTimeout},
-	{"non_deterministic", ErrNonDeterministic},
+	{store.KindNonDeterministic, ErrNonDeterministic},
+	{store.KindStuck, ErrStuck},
 	{store.KindTerminated, ErrTerminated},
 	{store.KindInstanceExists, ErrInstanceExists},
 	{"activity_canceled", ErrActivityCanceled},
@@ -120,6 +132,9 @@ func RegisterErrorKind(name string, sentinel error) {
 	if strings.ContainsAny(name, ", ") || name == kindPermanent || sentinel == nil {
 		panic(fmt.Sprintf("flows: invalid error kind %q", name))
 	}
+	if !reflect.TypeOf(sentinel).Comparable() { // errors.Is would panic comparing it
+		panic(fmt.Sprintf("flows: error kind %q: sentinel of type %T is not comparable", name, sentinel))
+	}
 	kinds.Lock()
 	defer kinds.Unlock()
 	for _, k := range kinds.list {
@@ -147,17 +162,23 @@ func errorKinds(err error) string {
 			}
 		}
 	}
-	kinds.RLock()
-	for _, k := range kinds.list {
+	for _, k := range kindList() { // not under the lock: errors.Is calls RecordedError.Is, which takes it
 		if errors.Is(err, k.sentinel) && !contains(out, k.name) {
 			out = append(out, k.name)
 		}
 	}
-	kinds.RUnlock()
 	return strings.Join(out, ",")
 }
 
 func contains(s []string, v string) bool { return slices.Contains(s, v) }
+
+// kindList returns the registered kinds. The list only grows (appends
+// never change its elements), so the slice can be read without the lock.
+func kindList() []errorKind {
+	kinds.RLock()
+	defer kinds.RUnlock()
+	return kinds.list
+}
 
 // maxErrorText bounds stored error text (errors are for people; histories
 // stay small).
@@ -179,9 +200,7 @@ func (e *RecordedError) Error() string { return e.Message }
 
 // Is matches the sentinels of the recorded kinds.
 func (e *RecordedError) Is(target error) bool {
-	kinds.RLock()
-	defer kinds.RUnlock()
-	for _, k := range kinds.list {
+	for _, k := range kindList() {
 		if k.sentinel == target && contains(e.kinds, k.name) {
 			return true
 		}

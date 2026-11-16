@@ -80,7 +80,10 @@ func WithCompensateRetry(p RetryPolicy) ActivityOption {
 func WithTimeout(d time.Duration) ActivityOption { return func(c *activityConfig) { c.timeout = d } }
 
 // WithQueue runs the activity on queue (workers poll their queues).
-func WithQueue(queue string) ActivityOption { return func(c *activityConfig) { c.queue = queue } }
+func WithQueue(queue string) ActivityOption {
+	mustQueue(queue)
+	return func(c *activityConfig) { c.queue = queue }
+}
 
 // Activity is an activity definition: a side-effecting call made by
 // workflows, run by workers at least once, optionally with a compensator.
@@ -143,7 +146,9 @@ func (a *Activity[I, O, C]) invoker(invoke InvokeFunc[I, O, C], withComp bool) *
 			}
 			ob, err := a.out.encode(out)
 			if err != nil {
-				return nil, cb, Permanent(fmt.Errorf("encode output of %s: %w", name, err))
+				// It took effect, but its result cannot be stored: an
+				// uncertain failure, so that its compensator still runs.
+				return nil, cb, Permanent(fmt.Errorf("%w: encode output of %s: %w", worker.ErrUncertain, name, err))
 			}
 			return ob, cb, nil
 		},

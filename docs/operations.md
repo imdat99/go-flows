@@ -70,6 +70,7 @@ defer engine.Stop(shutdownCtx)
 | `PollMax` | 1s | The longest idle poll interval. Notifications and local due times wake pollers earlier. |
 | `StickyFor`, `CacheSize` | 10s, 1000 | Keep a replayed execution in memory, with its next task on this engine. `CacheSize: -1` disables the cache (every task replays). |
 | `DisableEager` | false | Run every activity through the queue instead of in the scheduling engine. |
+| `StuckTimeout` | 10s | How long workflow code may run without yielding. Once: handed back; twice at the same point: parked (`ErrStuck`). Raise it if workflow code legitimately computes for long. |
 | `EagerWindow` | 200ms | How long an execution waits for its eager activities before letting signals and timers in. |
 
 Measured costs and their causes are in [benchmarks.md](benchmarks.md).
@@ -107,8 +108,9 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // ended over 30 days ag
 
 - **What is deleted.** Purging cascades to history, pending events, activity
   tasks and locks.
-- **What is kept.** Children of an active parent (running, compensating or
-  parked) are kept, because the parent may compensate them.
+- **What is kept.** Descendants of an active execution (running,
+  compensating or parked) are kept, children and grandchildren alike,
+  because compensation may reach them.
 - **Ids.** A purged instance id can be started again. Until then,
   `Workflow.Start` with that id returns the old execution.
 - **`idem` tables.** Purge them with `idem.Purge`, using an age well above
@@ -157,7 +159,7 @@ and write through the engine's API.
 | Symptom | Cause | Action |
 | --- | --- | --- |
 | `needs_attention`, `err_kinds` has `compensation_failed` | A compensator gave up after its retries. | Fix the cause (data, downstream system), then `engine.RetryCompensation(ctx, id)`. The failed compensator runs again, then the remaining ones. |
-| `needs_attention` for non-determinism (`err_kinds` has `non_deterministic`; the `Handle.Wait` error matches `ErrNonDeterministic`) | The deployed code no longer matches the history, usually because a workflow changed without a version bump. | Restore the old code under the old version so that no more executions park. A parked one cannot be reopened: `Terminate` it (no compensation runs, so undo its completed effects by hand if needed) and start a new instance. |
+| `needs_attention` for wrong code (`err_kinds` has `non_deterministic` or `stuck`; the `Handle.Wait` error matches `ErrNonDeterministic` or `ErrStuck`) | The deployed code no longer matches the history (usually a workflow changed without a version bump), or it blocks without yielding. | Deploy code that matches the history (the old code under the old version), or that yields, then `engine.Resume(ctx, id)`: it replays and runs on (parked again if it still does not match). A stuck attempt's goroutine runs until its process exits: restart the processes. `Terminate` is the alternative; it runs no compensation. |
 | An execution stays `compensating` | It waits for an activity that ignores its context, runs on a queue no engine serves, or retries for a long time. | Check `flows.activity_task` for the execution. `Terminate` ends it without compensation. |
 | An execution stays `running` with nothing in progress | It waits for a signal, a timer or a child, as designed. | Send the signal, or `Cancel` it, which lets the workflow clean up and compensate. |
 | Work resumes slowly after a crash | Leases of the dead engine run until `LeaseTTL`. | Lower `LeaseTTL` if recovery time matters more than renewal traffic. |

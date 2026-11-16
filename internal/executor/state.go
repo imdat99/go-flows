@@ -62,6 +62,10 @@ type State struct {
 	// ones issued since must all be matched by recorded events by the next
 	// one (checkTaskBoundary).
 	checkedTo int
+	// canceling holds the commands canceled since the last TaskStarted
+	// that were committed already: their cancel must be matched by the next
+	// one too (checkTaskBoundary).
+	canceling []*command.Command
 	// committedTo counts the leading calls that are settled (done, canceled
 	// or dropped with nothing left to commit): commit skips them.
 	committedTo int
@@ -129,6 +133,7 @@ type call interface {
 // resultCall is an activity or child workflow.
 type resultCall struct {
 	coro.HookSlot
+	st  *State
 	cmd command.Command
 	f   coro.Future[Result]
 }
@@ -138,6 +143,7 @@ func (c *resultCall) command() *command.Command { return &c.cmd }
 // OnCancel implements coro.Hook: the context of the call was canceled.
 func (c *resultCall) OnCancel() {
 	_ = c.cmd.Cancel() // activities and children are cancelable
+	c.st.canceled(&c.cmd)
 	c.f.Set(Result{Err: ErrCanceled}, nil)
 }
 
@@ -157,6 +163,7 @@ func (c *resultCall) resolve(ev *history.Event) error {
 // timerCall is a timer.
 type timerCall struct {
 	coro.HookSlot
+	st  *State
 	cmd command.Command
 	f   coro.Future[struct{}]
 }
@@ -166,6 +173,7 @@ func (c *timerCall) command() *command.Command { return &c.cmd }
 // OnCancel implements coro.Hook.
 func (c *timerCall) OnCancel() {
 	_ = c.cmd.Cancel()
+	c.st.canceled(&c.cmd)
 	c.f.Set(struct{}{}, ErrCanceled)
 }
 
@@ -305,9 +313,12 @@ func (st *State) finishWith(out []byte, err error) {
 			event:  history.Event{Type: history.ExecutionContinuedAsNew, Payload: can.Input},
 		}
 	case errors.Is(err, ErrCanceled) && st.root.Err() != nil:
+		// Stored like a failure: sanitized text (a NUL or invalid UTF-8
+		// would be refused by the store forever), bounded, with its kinds.
+		msg, kinds := st.ex.opts.errorText(err), st.ex.opts.errorKinds(err)
 		st.end = &ending{
-			status: store.StatusCanceled, err: err.Error(),
-			event: history.Event{Type: history.ExecutionCanceled, Err: err.Error()},
+			status: store.StatusCanceled, err: msg, kinds: kinds,
+			event: history.Event{Type: history.ExecutionCanceled, Err: msg, ErrKinds: kinds},
 		}
 	default:
 		msg, kinds := st.ex.opts.errorText(err), st.ex.opts.errorKinds(err)
@@ -340,7 +351,7 @@ func (st *State) issue(c call) {
 // ScheduleActivity issues an activity; the future resolves with its result,
 // or with ErrCanceled when ctx is canceled first.
 func (st *State) ScheduleActivity(ctx coro.Context, name, queue string, input []byte) *coro.Future[Result] {
-	c := &resultCall{cmd: command.Command{Kind: command.Activity, Name: name, Queue: queue, Payload: input, ArgHash: history.HashArgs(input)}}
+	c := &resultCall{st: st, cmd: command.Command{Kind: command.Activity, Name: name, Queue: queue, Payload: input, ArgHash: history.HashArgs(input)}}
 	st.issue(c)
 	coro.Watch(ctx, c)
 	return &c.f
@@ -350,7 +361,7 @@ func (st *State) ScheduleActivity(ctx coro.Context, name, queue string, input []
 // outcome, or with ErrCanceled when ctx is canceled first (the child is
 // asked to cancel).
 func (st *State) StartChild(ctx coro.Context, instanceID, workflow string, version int32, queue string, input []byte) *coro.Future[Result] {
-	c := &resultCall{cmd: command.Command{
+	c := &resultCall{st: st, cmd: command.Command{
 		Kind: command.Child, Name: workflow, Version: version, Ref: instanceID, Queue: queue,
 		Payload: input, ArgHash: history.HashArgs(input),
 	}}
@@ -368,7 +379,7 @@ func (st *State) NewTimer(ctx coro.Context, d time.Duration, name string) *coro.
 		f.Set(struct{}{}, nil)
 		return f
 	}
-	c := &timerCall{cmd: command.Command{Kind: command.Timer, Name: name, At: st.now.Add(d).Truncate(time.Microsecond)}}
+	c := &timerCall{st: st, cmd: command.Command{Kind: command.Timer, Name: name, At: st.now.Add(d).Truncate(time.Microsecond)}}
 	st.issue(c)
 	coro.Watch(ctx, c)
 	return &c.f
@@ -416,17 +427,38 @@ func (st *State) applyCommandEvent(ev *history.Event) error {
 	return c.resolve(ev)
 }
 
+// canceled notes a cancel of a committed command (checkTaskBoundary).
+func (st *State) canceled(cmd *command.Command) {
+	if cmd.State == command.CancelPending {
+		st.canceling = append(st.canceling, cmd)
+	}
+}
+
 // checkTaskBoundary runs at each TaskStarted: every command issued by the
 // previous task must have been matched by its recorded events (or dropped
 // before commit). An unmatched one means this code issues commands the
 // recorded run did not: non-determinism (GW-11).
 func (st *State) checkTaskBoundary() error {
 	for _, c := range st.calls[st.checkedTo:] {
-		if cmd := c.command(); cmd.State == command.Pending {
+		switch cmd := c.command(); cmd.State {
+		case command.Pending:
 			return fmt.Errorf("%w: %v %q (schedule id %d) issued on replay is not in the history",
+				ErrNonDeterministic, cmd.Kind, cmd.Name, cmd.ID)
+		case command.Committed, command.CancelPending, command.Canceled, command.Dropped, command.Done:
+		}
+	}
+	// A cancel is committed in the task that issues it: on replay, its
+	// event (or the outcome delivered in that task) settles it before the
+	// next TaskStarted. One still pending was not in the recorded run.
+	for i, cmd := range st.canceling {
+		st.canceling[i] = nil
+		if cmd.State == command.CancelPending {
+			st.canceling = st.canceling[:0]
+			return fmt.Errorf("%w: cancel of %v %q (schedule id %d) issued on replay is not in the history",
 				ErrNonDeterministic, cmd.Kind, cmd.Name, cmd.ID)
 		}
 	}
+	st.canceling = st.canceling[:0]
 	st.checkedTo = len(st.calls)
 	return nil
 }

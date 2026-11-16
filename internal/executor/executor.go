@@ -47,6 +47,10 @@ var (
 	ErrContinueAsNew = errors.New("continue as new")
 	// errWrongWorkflow reports history of another workflow.
 	errWrongWorkflow = errors.New("executor: history belongs to another workflow")
+	// ErrUnknownEvent reports an event type this binary does not know,
+	// written by a newer one: the execution is handed back (to an engine
+	// that knows it), not parked as non-deterministic.
+	ErrUnknownEvent = errors.New("executor: unknown event type (written by a newer version?)")
 )
 
 // Func is a workflow function on encoded input and output.
@@ -405,6 +409,9 @@ func (e *Executor) run() error {
 
 // apply applies one event (recorded or live) to the workflow state.
 func (e *Executor) apply(ev *history.Event) error {
+	if !ev.Type.Valid() {
+		return fmt.Errorf("%w: %v (seq %d)", ErrUnknownEvent, ev.Type, ev.Seq)
+	}
 	st := e.st
 	switch ev.Type {
 	case history.TaskStarted:

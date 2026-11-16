@@ -11,14 +11,25 @@ any function whose first parameter is `flows.Ctx`:
 - the wall clock (`time.Now`, `Sleep`, `After`, `NewTimer`, ...): use
   `flows.Now`, `flows.Sleep`, `flows.NewTimer`;
 - randomness (`math/rand`, `crypto/rand`): use `flows.Rand`;
-- `os.Getenv`: pass configuration as input;
-- `sync.WaitGroup`, `sync.Mutex` and friends: use `flows.WaitGroup`.
+- `os.Getenv`, `Environ`, `Hostname`, `Getpid`, `Getwd`: pass configuration
+  as input;
+- `context.WithTimeout` and `WithDeadline` (wall-clock deadlines): use
+  `flows.NewTimer` with `flows.Select`;
+- random ids from `github.com/google/uuid` (`New`, `NewString`, `NewV7`...;
+  not the name-based `NewSHA1`/`NewMD5`): use `flows.SideEffect`;
+- `sync.WaitGroup`, `sync.Mutex` and friends, declared or reached through a
+  struct field, and `errgroup.Group.Go`: use `flows.Go` and
+  `flows.WaitGroup`.
 
 Function literals passed to `flows.SideEffect` are not checked (their value
 is recorded): pass the literal inline, as a function held in a variable is
 checked. Activities are not checked (they take a `context.Context`).
-Methods of a `math/rand` `Rand` and `sync.Map.Range` are reported too, and
-so are forbidden functions used as values (`now := time.Now`).
+Methods of a `math/rand` `Rand` and `sync.Map.Range` are reported too (the
+constructors `rand.New`, `NewSource`, `NewPCG`... are not), and so are
+forbidden functions used as values (`now := time.Now`).
+
+Only functions taking `flows.Ctx` are checked: a helper without it that
+iterates over a map, for example, is not.
 
 It is a separate module, so its dependency on `golang.org/x/tools` stays out
 of go-flows itself.

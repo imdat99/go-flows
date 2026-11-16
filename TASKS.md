@@ -359,7 +359,51 @@ Ký hiệu ⚡ là task chạm đường nóng, phải có benchmark.
     - **Chuyển sang T8.4:**
       - park do non-determinism không có cách mở lại (chỉ có `Terminate`), mà doc của `Handle.Wait` lại nói "can still resume once fixed";
       - workflow quay vòng không nhường thì bị trả lại mãi, mỗi lần để lại một goroutine quay (CPU tăng).
-- [ ] **T8.4** Review tổng thể toàn repo bằng subagent (đọc lạnh), sửa các phát hiện.
+- [x] **T8.4** Review tổng thể toàn repo bằng subagent (đọc lạnh), sửa các phát hiện.
+    - **Review lạnh:** 3 subagent đọc lạnh song song (store, runtime/worker, API công khai/công cụ). Tổng cộng 4 High, 10 Medium, khoảng 20 Low. Mỗi High/Medium có test đỏ trước khi sửa.
+    - **Store:**
+      - Claim workflow và activity không còn sort cả backlog: LATERAL theo từng queue, queue được khử trùng; migration `00008` đổi `execution_ready_idx` thành `(queue, ready_at, id)`; UPDATE theo `id = ANY(ARRAY(...))`.
+      - Pending event đọc ngay trong câu claim (LATERAL + `array_agg` qua `pending_event_execution_idx`), vẫn một câu lệnh, atomic.
+      - `PurgeEnded` giữ mọi hậu duệ của execution còn hoạt động, bằng cách đi ngược lên từ từng ứng viên (đọc cỡ số dòng xoá).
+      - Test plan ở quy mô 20k dòng: `TestGW8_ClaimsReadOnlyWhatTheyClaim`.
+      - Hợp đồng: lease giữ (kept lease) hết hạn mà không có event thì claim có thể trả task rỗng (pg) hoặc không trả gì (mem).
+      - Fast path và đường pgx xếp câu lệnh cùng thứ tự; lock row được lấy theo thứ tự key.
+      - `ReopenParked` mới.
+      - Mem từ chối text NUL hoặc UTF-8 sai, giống pg.
+    - **Runtime:**
+      - Replay phát hiện cancel không có trong history (GW-11, `State.canceling`).
+      - Loại event lạ thì trả lại (`ErrUnknownEvent`), không park.
+      - Output activity không encode được tính là uncertain, nên vẫn được compensate.
+      - Kênh kết quả eager chỉ tạo khi có activity eager (bớt khoảng 24 KiB mỗi task).
+      - Due time không còn bị bỏ sót khi commit chậm hơn delay.
+      - Slot eager không rò; cache giữ executor có `LastSeq` cao hơn; log lỗi ghi outcome lên mức error.
+    - **Mục đã biết:**
+      - Workflow không nhường: lần đầu trả lại; lần thứ hai ở cùng `LastSeq` thì park với `ErrStuck` (thêm `Options.StuckTimeout`).
+      - `Engine.Resume` mở lại execution bị park do code sai (non-determinism hoặc stuck).
+    - **API:**
+      - Lỗi của workflow bị huỷ được làm sạch như lỗi fail (trước đó NUL làm execution không bao giờ kết thúc).
+      - `idem`: thêm `ErrUnstorable` cho NUL; kết quả UTF-8 sai trả về giống nhau ở lần đầu và lần trùng.
+      - `flowsvet` báo thêm: uuid, `os.Hostname`/`Environ`/`Getpid`/`Getwd`, `context.WithTimeout`/`WithDeadline`, method `sync` qua field, `errgroup.Go`; bỏ qua các constructor của rand.
+      - `RegisterErrorKind`: từ chối sentinel không so sánh được; không còn RLock lồng nhau.
+      - Kiểm tra version trước khi chuyển sang int32; kiểm tra tên queue.
+      - `Handle.Wait` trên instance của workflow khác trả `ErrInstanceConflict`.
+      - Sửa doc của `Cancel`/`Wait`/`PurgeEnded`; README bỏ uuid; doc của `idem.ErrAborted`.
+      - otelflows: span workflow task có `flows.compensation`.
+      - Tài liệu EN/VI cập nhật theo các thay đổi trên.
+    - **Kiểm tra:**
+      - `make test`, `make lint` (4 module), chaos và `benchgate` đều đạt.
+      - `BenchmarkActivityRun` khoảng 1240 alloc (trước khoảng 1226, ±6%, trong mức nhiễu).
+    - **Review các bản sửa:**
+      - Lần 1 không đạt: purge quét cả bảng và chi phí bậc hai; queue lặp làm claim co lại; claim tách 2 round trip nên không atomic; một lần khựng đã park luôn.
+      - Lần 2 đạt.
+    - **Đĩa:** trong lúc làm, đĩa máy dev đầy 100%. Đã dọn go build cache (23 GB) và các bản sao review.
+    - **Còn mở:**
+      - Mục tiêu ≤ 80 alloc (thiết kế lại SQL của store).
+      - Đếm stuck theo từng worker: với N engine có thể tới N+1 lần thử, mỗi lần để lại goroutine.
+      - Chu trình deadlock hiếm (child kết thúc ↔ cha lấy lock), được Postgres phát hiện và retry.
+      - Comment của migration `00005` sai (đã áp dụng nên không sửa).
+      - Thỉnh thoảng có một run benchmark mất khoảng 1.5 s (có từ trước).
+      - Claim lock dư tới `$3` dòng mỗi queue trong lúc chạy câu lệnh.
 
 ## File và hàm tái sử dụng
 

@@ -38,8 +38,16 @@ func newDueTimes(grain, horizon time.Duration) *dueTimes {
 // add records that work falls due at at. It signals changed only when at
 // became the earliest time, to shorten a longer sleep.
 func (d *dueTimes) add(at time.Time) {
-	if time.Until(at) > d.horizon {
+	now := time.Now()
+	if at.Sub(now) > d.horizon {
 		return
+	}
+	// Due already (its commit took longer than its delay): a claim that
+	// started before now may have missed the work (not yet committed),
+	// and would drop an earlier time as covered. Due now instead: only a
+	// claim started after the commit covers it.
+	if at.Before(now) {
+		at = now
 	}
 	off := int64(at.Sub(d.epoch))
 	if r := off % int64(d.grain); r != 0 {

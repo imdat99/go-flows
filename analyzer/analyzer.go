@@ -236,13 +236,32 @@ var forbidden = map[string]map[string]string{
 		"Sleep": "use flows.Sleep", "After": "use flows.NewTimer", "AfterFunc": "use flows.NewTimer",
 		"NewTimer": "use flows.NewTimer", "NewTicker": "use flows.NewTimer", "Tick": "use flows.NewTimer",
 	},
-	"math/rand":    nil, // every function: use flows.Rand
+	"math/rand":    nil, // every function but the constructors (randomConstructors): use flows.Rand
 	"math/rand/v2": nil,
 	"crypto/rand":  nil,
 	"os": {
 		"Getenv": "read configuration in an activity or pass it as input", "LookupEnv": "read configuration in an activity or pass it as input",
+		"Environ":  "read configuration in an activity or pass it as input",
+		"Hostname": "read it in an activity or pass it as input", "Getpid": "read it in an activity or pass it as input",
+		"Getwd": "read it in an activity or pass it as input",
+	},
+	"context": {
+		"WithTimeout":  "deadlines use the wall clock: use flows.NewTimer with flows.Select",
+		"WithDeadline": "deadlines use the wall clock: use flows.NewTimer with flows.Select",
+	},
+	// Random ids (the name-based NewMD5/NewSHA1 derive from their input).
+	"github.com/google/uuid": {
+		"New": idAdvice, "NewString": idAdvice, "NewRandom": idAdvice, "NewRandomFromReader": idAdvice,
+		"NewUUID": idAdvice, "NewV6": idAdvice, "NewV7": idAdvice, "NewV7FromReader": idAdvice,
+		"NewDCEGroup": idAdvice, "NewDCEPerson": idAdvice, "NewDCESecurity": idAdvice,
 	},
 }
+
+const idAdvice = "generate ids with flows.SideEffect (or in an activity)"
+
+// randomConstructors build a source or generator: deterministic given a
+// seed (their methods are reported).
+var randomConstructors = map[string]bool{"New": true, "NewSource": true, "NewPCG": true, "NewChaCha8": true, "NewZipf": true}
 
 // checkCall reports forbidden calls, and returns false for flows.SideEffect
 // (its function argument runs once, outside replay: no checks there).
@@ -279,33 +298,62 @@ func checkCall(pass *analysis.Pass, call *ast.CallExpr) bool {
 func forbiddenFunc(fn *types.Func) string {
 	path, name := fn.Pkg().Path(), fn.Name()
 	if sig, ok := fn.Type().(*types.Signature); ok && sig.Recv() != nil {
-		// Methods: those of a random source, wherever it was created, and
-		// the unordered iteration of a sync.Map.
-		recv := types.Unalias(sig.Recv().Type())
-		if p, ok := recv.(*types.Pointer); ok {
-			recv = types.Unalias(p.Elem())
-		}
-		named, ok := recv.(*types.Named)
-		if !ok || named.Obj().Pkg() == nil {
-			return ""
-		}
-		rp, rn := named.Obj().Pkg().Path(), named.Obj().Name()
-		switch {
-		case (rp == "math/rand" || rp == "math/rand/v2") && rn == "Rand":
-			return rp + ".Rand." + name + " is not deterministic in workflow code: use flows.Rand (or flows.SideEffect)"
-		case rp == "sync" && rn == "Map" && name == "Range":
-			return "sync.Map.Range iterates in no fixed order: not deterministic in workflow code"
-		}
-		return ""
+		return forbiddenMethod(sig, name)
 	}
 	advice, ok := forbidden[path]
 	switch {
 	case !ok:
 		return ""
+	case advice == nil && randomConstructors[name]:
+		return ""
 	case advice == nil:
 		return path + "." + name + " is not deterministic in workflow code: use flows.Rand (or flows.SideEffect)"
 	case advice[name] != "":
 		return path + "." + name + " is not deterministic in workflow code: " + advice[name]
+	}
+	return ""
+}
+
+// forbiddenMethod returns the report for a method: those of a random
+// source (wherever it was created), the unordered iteration of a sync.Map,
+// sync primitives and errgroup.
+func forbiddenMethod(sig *types.Signature, name string) string {
+	recv := types.Unalias(sig.Recv().Type())
+	if p, ok := recv.(*types.Pointer); ok {
+		recv = types.Unalias(p.Elem())
+	}
+	named, ok := recv.(*types.Named)
+	if !ok || named.Obj().Pkg() == nil {
+		return ""
+	}
+	rp, rn := named.Obj().Pkg().Path(), named.Obj().Name()
+	switch rp {
+	case "math/rand", "math/rand/v2":
+		if rn == "Rand" {
+			return rp + ".Rand." + name + " is not deterministic in workflow code: use flows.Rand (or flows.SideEffect)"
+		}
+	case "sync":
+		return syncMethod(rn, name)
+	case "golang.org/x/sync/errgroup":
+		if rn == "Group" && (name == "Go" || name == "TryGo") {
+			return "errgroup.Group." + name + " starts a goroutine: use flows.Go with flows.WaitGroup in workflow code"
+		}
+	}
+	return ""
+}
+
+// syncMethod reports the methods of sync types, wherever the value lives (a
+// struct field is not a definition checkDefs sees).
+func syncMethod(typ, name string) string {
+	switch typ {
+	case "Map":
+		if name == "Range" {
+			return "sync.Map.Range iterates in no fixed order: not deterministic in workflow code"
+		}
+	case "WaitGroup":
+		return "sync.WaitGroup." + name + " in workflow code: use flows.WaitGroup (and flows.Go)"
+	case "Mutex", "RWMutex", "Cond", "Once":
+		return "sync." + typ + "." + name + " in workflow code: not needed (coroutines never run in parallel) and can block it"
 	}
 	return ""
 }

@@ -70,6 +70,7 @@ defer engine.Stop(shutdownCtx)
 | `PollMax` | 1s | Khoảng poll dài nhất khi rảnh. Notification và thời điểm đến hạn cục bộ đánh thức poller sớm hơn. |
 | `StickyFor`, `CacheSize` | 10s, 1000 | Giữ execution đã replay trong bộ nhớ, cùng với task kế tiếp của nó trên engine này. `CacheSize: -1` tắt cache (task nào cũng replay). |
 | `DisableEager` | false | Chạy mọi activity qua queue thay vì chạy ngay trong engine đã lên lịch nó. |
+| `StuckTimeout` | 10s | Code workflow được chạy bao lâu mà không nhường. Một lần: trả lại; hai lần ở cùng chỗ: park (`ErrStuck`). Tăng lên nếu code workflow thật sự cần tính toán lâu. |
 | `EagerWindow` | 200ms | Execution chờ các activity eager của nó bao lâu trước khi cho signal và timer vào. |
 
 Chi phí đo được và nguyên nhân nằm trong [benchmarks.md](../benchmarks.md).
@@ -106,8 +107,9 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // kết thúc hơn 30 n
 
 - **Cái bị xoá.** Việc xoá lan sang history, pending event, activity task và
   lock.
-- **Cái được giữ.** Child của một cha còn hoạt động (đang chạy, đang
-  compensate hoặc bị park) được giữ lại, vì cha có thể hoàn tác chúng.
+- **Cái được giữ.** Hậu duệ của một execution còn hoạt động (đang chạy, đang
+  compensate hoặc bị park), cả child lẫn cháu, được giữ lại, vì compensation
+  có thể chạm tới chúng.
 - **Id.** Instance id đã bị xoá có thể dùng để start lại. Trước khi bị xoá,
   `Workflow.Start` với id đó trả về execution cũ.
 - **Bảng `idem`.** Xoá bằng `idem.Purge`, với độ tuổi lớn hơn hẳn khoảng
@@ -156,7 +158,7 @@ ghi qua API của engine.
 | Triệu chứng | Nguyên nhân | Cách xử lý |
 | --- | --- | --- |
 | `needs_attention`, `err_kinds` có `compensation_failed` | Một compensator bỏ cuộc sau khi hết retry. | Sửa nguyên nhân (dữ liệu, hệ thống phía sau), rồi gọi `engine.RetryCompensation(ctx, id)`. Compensator thất bại chạy lại, rồi tới các compensator còn lại. |
-| `needs_attention` do non-determinism (`err_kinds` có `non_deterministic`; lỗi của `Handle.Wait` khớp `ErrNonDeterministic`) | Code đã deploy không còn khớp với history, thường do sửa workflow mà không tăng version. | Khôi phục code cũ dưới version cũ để không còn execution nào bị park thêm. Execution đã park không mở lại được: `Terminate` nó (không có compensation nào chạy, nên hoàn tác thủ công các hiệu ứng đã xong nếu cần) rồi bắt đầu instance mới. |
+| `needs_attention` do code sai (`err_kinds` có `non_deterministic` hoặc `stuck`; lỗi của `Handle.Wait` khớp `ErrNonDeterministic` hoặc `ErrStuck`) | Code đã deploy không còn khớp với history (thường do sửa workflow mà không tăng version), hoặc bị chặn mà không nhường. | Deploy code khớp với history (code cũ dưới version cũ), hoặc có nhường, rồi gọi `engine.Resume(ctx, id)`: nó replay và chạy tiếp (bị park lại nếu vẫn không khớp). Goroutine của lần chạy bị kẹt chạy tới khi process thoát: hãy khởi động lại các process. `Terminate` là lựa chọn khác; nó không chạy compensation. |
 | Execution ở mãi `compensating` | Nó chờ một activity phớt lờ context, chạy trên queue không engine nào phục vụ, hoặc retry rất lâu. | Xem `flows.activity_task` của execution đó. `Terminate` kết thúc nó mà không hoàn tác. |
 | Execution ở mãi `running` mà không có gì đang chạy | Nó chờ signal, timer hoặc child, đúng như thiết kế. | Gửi signal, hoặc `Cancel` nó: workflow được dọn dẹp và hoàn tác. |
 | Việc chạy tiếp chậm sau crash | Lease của engine đã chết còn hiệu lực tới hết `LeaseTTL`. | Giảm `LeaseTTL` nếu thời gian khôi phục quan trọng hơn lưu lượng gia hạn. |

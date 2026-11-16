@@ -3,6 +3,7 @@ package flows_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -386,5 +387,44 @@ func TestPostgresNestedCompensation(t *testing.T) {
 		if !slices.Equal(got, []string{want}) {
 			t.Fatalf("%s undone %v", id, got)
 		}
+	}
+}
+
+// T8.4 review: a canceled workflow's error is stored like a failure's
+// (sanitized, bounded): a NUL byte or invalid UTF-8 in its text must not
+// make Postgres refuse the end forever.
+var cancelDirty = flows.DefineWorkflow("pgtest.cancel-dirty", 1, func(c flows.Ctx, _ int) (int, error) {
+	_, err := flows.Await[int](c, "never", 0)
+	return 0, fmt.Errorf("cleanup of a\x00b\xff: %w", err)
+})
+
+func TestCanceledErrorTextIsStorable(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	if err := flows.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	e, err := flows.New(pool, flows.Options{InstanceID: "pg-cancel-dirty", PollMax: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Stop(ctx) })
+	h, err := cancelDirty.Start(ctx, e, "dirty", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := e.Cancel(ctx, "dirty"); err != nil {
+		t.Fatal(err)
+	}
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err = h.Wait(wctx)
+	var re *flows.RunError
+	if !errors.As(err, &re) || re.Status != flows.StatusCanceled || !errors.Is(err, flows.ErrCanceled) {
+		t.Fatalf("got %v", err)
 	}
 }

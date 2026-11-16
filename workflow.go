@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/imdat99/go-flows/internal/coro"
@@ -23,6 +24,7 @@ type workflowConfig struct{ queue string }
 
 // WithWorkflowQueue runs the workflow's tasks on queue.
 func WithWorkflowQueue(queue string) WorkflowOption {
+	mustQueue(queue)
 	return func(c *workflowConfig) { c.queue = queue }
 }
 
@@ -41,6 +43,9 @@ type Workflow[I, O any] struct {
 // instance that does not know an execution's version hands it back to one
 // that does). Define workflows at package level.
 func DefineWorkflow[I, O any](name string, version int, fn WorkflowFunc[I, O], opts ...WorkflowOption) *Workflow[I, O] {
+	if version < 1 || version > math.MaxInt32 { // checked before the int32 conversion truncates it
+		panic(fmt.Sprintf("flows: workflow %q: version %d out of range [1, %d]", name, version, math.MaxInt32))
+	}
 	cfg := workflowConfig{queue: DefaultQueue}
 	for _, o := range opts {
 		o(&cfg)
@@ -119,7 +124,7 @@ func (w *Workflow[I, O]) Run(ctx context.Context, e *Engine, instanceID string, 
 
 // Handle returns a handle on the executions of instance id instanceID.
 func (w *Workflow[I, O]) Handle(e *Engine, instanceID string) *Handle[O] {
-	return &Handle[O]{e: e, id: instanceID, out: w.out}
+	return &Handle[O]{e: e, id: instanceID, wf: w.name, out: w.out}
 }
 
 // Child starts the workflow as a child of the running workflow, with
@@ -179,6 +184,7 @@ const (
 type Handle[O any] struct {
 	e   *Engine
 	id  string
+	wf  string // the workflow the handle decodes outputs of
 	out codec[O]
 }
 
@@ -195,9 +201,10 @@ func (h *Handle[O]) Status(ctx context.Context) (Status, error) {
 // its output, or a *RunError for any other end (errors.Is matches the
 // recorded kinds, and ErrCanceled, ErrTerminated or ErrCompensated for the
 // way it ended). A failed or canceled workflow is compensated before it
-// ends. An execution parked as needs_attention (its reason: errors.Is
-// ErrNonDeterministic, or ErrCompensationFailed) ends the wait with a
-// *RunError too, although it can still resume once fixed.
+// ends. An execution parked as needs_attention ends the wait with a
+// *RunError too, although it can resume once fixed: errors.Is
+// ErrNonDeterministic or ErrStuck (wrong workflow code: Engine.Resume), or
+// ErrCompensationFailed (Engine.RetryCompensation).
 func (h *Handle[O]) Wait(ctx context.Context) (O, error) {
 	var zero O
 	delay := 5 * time.Millisecond
@@ -205,6 +212,9 @@ func (h *Handle[O]) Wait(ctx context.Context) (O, error) {
 		e, err := h.e.st.GetExecution(ctx, h.id)
 		if err != nil {
 			return zero, err
+		}
+		if e.Workflow != h.wf { // its output is not an O
+			return zero, fmt.Errorf("%w: instance %s runs workflow %s, not %s", ErrInstanceConflict, h.id, e.Workflow, h.wf)
 		}
 		switch {
 		case e.Status == store.StatusCompleted:

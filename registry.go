@@ -35,6 +35,13 @@ type wfKey struct {
 	version int32
 }
 
+// mustQueue panics on an invalid queue name (an empty one would never run).
+func mustQueue(queue string) {
+	if err := text.CheckName(ErrInvalidArgument, "queue name", queue); err != nil {
+		panic(err)
+	}
+}
+
 // checkDefinedName panics on an invalid name or a name defined twice: a
 // definition is program structure, and a duplicate would make the engine
 // run the wrong function for recorded history (GW-12: go-workflows derived

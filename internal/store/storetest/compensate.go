@@ -143,6 +143,55 @@ func testReopenCompensation(t *testing.T, h Harness) {
 	}
 }
 
+// T8.4: ReopenParked resumes only an execution parked for wrong code
+// (non-determinism or code that did not yield), once; it is claimable at
+// once, even with nothing pending (the park consumed what it delivered, or
+// was the resume of a kept lease).
+func testReopenParked(t *testing.T, h Harness) {
+	s := h.New(t)
+	if err := s.ReopenParked(ctx, "missing"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown: %v", err)
+	}
+	for _, kind := range []string{store.KindNonDeterministic, "x," + store.KindStuck} {
+		id := "i-" + kind
+		mustCreate(t, s, id)
+		task := claimOne(t, s, owner, h.TTL)
+		if err := s.ReopenParked(ctx, id); !errors.Is(err, store.ErrNotActive) {
+			t.Fatalf("reopen while running: %v", err)
+		}
+		started(t, s, task, &store.Completion{Status: store.StatusNeedsAttention, Err: "wrong code", ErrKinds: kind})
+		if got := claim(t, s, owner, h.TTL); len(got) != 0 {
+			t.Fatalf("parked execution claimed: %+v", got)
+		}
+		if err := s.ReopenParked(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ReopenParked(ctx, id); !errors.Is(err, store.ErrNotActive) {
+			t.Fatalf("reopen twice: %v", err)
+		}
+		e, _ := s.GetExecution(ctx, id)
+		if e.Status != store.StatusRunning || e.Err != "" || e.ErrKinds != "" {
+			t.Fatalf("reopened %+v", e)
+		}
+		task = claimOne(t, s, owner, h.TTL)
+		if task.Execution.InstanceID != id || len(task.Pending) != 0 {
+			t.Fatalf("reopened task %+v", task)
+		}
+		if _, err := s.CompleteWorkflowTask(ctx, task.Lease, &store.Completion{
+			History: []history.Event{{Seq: task.LastSeq + 1, Type: history.ExecutionCompleted}}, Status: store.StatusCompleted,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A failed compensation is not reopened this way.
+	mustCreate(t, s, "comp")
+	task := claimOne(t, s, owner, h.TTL)
+	started(t, s, task, &store.Completion{Status: store.StatusNeedsAttention, Err: "x", ErrKinds: store.KindCompensationFailed})
+	if err := s.ReopenParked(ctx, "comp"); !errors.Is(err, store.ErrNotActive) {
+		t.Fatalf("reopen of a compensation park: %v", err)
+	}
+}
+
 // T6.3: a compensating parent reopens its completed child for
 // compensation; the child's end answers the parent with
 // CompensationCompleted. A child that did not complete answers at once.

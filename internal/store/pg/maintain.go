@@ -157,20 +157,31 @@ func readRenewal(br pgx.BatchResults, ids []int64) (lost, busy, canceled []int64
 	return lost, busy, canceled, nil
 }
 
+// purgeEnded deletes up to $2 executions ended before now - $1 µs, oldest
+// first, but not the descendants of an active execution: compensation
+// reaches them (a reopened child compensates its own children). Each
+// candidate walks up its ancestors (a few primary key lookups), so a call
+// reads about as many rows as it deletes (execution_ended_idx order).
+const purgeEnded = `
+	DELETE FROM flows.execution WHERE id = ANY(ARRAY( -- IN (...) may scan the table (a semi join)
+		SELECT x.id FROM flows.execution x
+		WHERE x.ended_at < now() - $1 * interval '1 microsecond'
+		  AND NOT EXISTS (
+			WITH RECURSIVE anc AS (
+				SELECT a.id, a.parent_id, a.status FROM flows.execution a WHERE a.id = x.parent_id
+				UNION ALL
+				SELECT a.id, a.parent_id, a.status FROM anc JOIN flows.execution a ON a.id = anc.parent_id
+			)
+			SELECT 1 FROM anc WHERE anc.status IN ` + activeStatuses + `)
+		ORDER BY x.ended_at
+		LIMIT $2
+		FOR UPDATE OF x SKIP LOCKED))`
+
 // PurgeEnded implements store.Store. The foreign keys cascade to history,
 // pending events and activity tasks (GW-4). limit bounds executions, not
 // history rows: keep it modest when histories are long.
 func (s *Store) PurgeEnded(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
-	tag, err := s.pool.Exec(ctx, `
-		DELETE FROM flows.execution WHERE id IN (
-			SELECT id FROM flows.execution
-			WHERE ended_at < now() - $1 * interval '1 microsecond'
-			  -- a child of an active parent may still have to compensate
-			  AND NOT EXISTS (SELECT 1 FROM flows.execution p
-			                  WHERE p.id = flows.execution.parent_id AND p.status IN `+activeStatuses+`)
-			ORDER BY ended_at
-			LIMIT $2
-			FOR UPDATE SKIP LOCKED)`, micros(olderThan), limit)
+	tag, err := s.pool.Exec(ctx, purgeEnded, micros(olderThan), limit)
 	if err != nil {
 		return 0, fmt.Errorf("purge ended executions: %w", err)
 	}
@@ -220,6 +231,35 @@ const reopenCompensation = `
 		SELECT id, now(), ` + typeRetryCompensation + ` FROM e
 	)
 	SELECT ` + notifyW + "queue)" + ` FROM e`
+
+// reopenParked makes the latest execution of $1, parked because its code
+// was wrong, running and ready again.
+const reopenParked = `
+	UPDATE flows.execution SET status = 'running', err = '', err_kinds = '', ready_at = now()
+	WHERE id = ` + latestOf + `
+	  AND status = 'needs_attention'
+	  AND string_to_array(err_kinds, ',') && ARRAY['` + store.KindNonDeterministic + `', '` + store.KindStuck + `']
+	RETURNING ` + notifyW + "queue)"
+
+// ReopenParked implements store.Store.
+func (s *Store) ReopenParked(ctx context.Context, instanceID string) error {
+	var tag pgconn.CommandTag
+	err := retry(ctx, func() error {
+		var err error
+		tag, err = s.pool.Exec(ctx, reopenParked, instanceID)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("reopen parked: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	if _, err := s.GetExecution(ctx, instanceID); err != nil {
+		return err
+	}
+	return store.ErrNotActive
+}
 
 // Unstick implements store.Store.
 func (s *Store) Unstick(ctx context.Context, owner string) error {

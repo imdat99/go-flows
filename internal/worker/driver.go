@@ -68,13 +68,9 @@ type eagerResult struct {
 // runWorkflowTask runs a claimed workflow task and everything it leads to.
 func (w *Worker) runWorkflowTask(pollCtx context.Context, task *store.WorkflowTask, claimed time.Time) {
 	tctx, untrack := w.hb.track(w.taskCtx(), false, task.Lease, claimed)
-	d := &driver{
-		w: w, ctx: tctx, lease: task.Lease, held: true, untrack: untrack,
-		// Buffered for every activity that can run at once: an activity
-		// never blocks on a driver that stopped reading (panic, hand-over).
-		results: make(chan eagerResult, w.opts.MaxActivities),
-		running: map[int32]int64{},
-	}
+	// results and running are made by the first eager launch: most tasks
+	// launch none (a channel of MaxActivities results is ~24 KiB).
+	d := &driver{w: w, ctx: tctx, lease: task.Lease, held: true, untrack: untrack}
 	defer func() {
 		if r := recover(); r != nil {
 			w.log.LogAttrs(pollCtx, slog.LevelError, "flows: panic in workflow task", slog.Any("panic", r))
@@ -151,7 +147,7 @@ func (d *driver) detach() {
 		for range n {
 			r := <-results
 			if _, _, err := w.record(context.WithoutCancel(w.taskCtx()), &r.task, r.outcome, nil); err != nil {
-				w.log.LogAttrs(w.taskCtx(), slog.LevelWarn, "flows: record activity outcome",
+				w.log.LogAttrs(w.taskCtx(), slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
 					slog.String("activity", r.task.Name), slog.Any("error", err))
 			}
 			r.untrack()
@@ -185,7 +181,7 @@ func (d *driver) recordResult(r eagerResult, resume bool) *store.WorkflowTask {
 	}
 	next, resumeLost, err := d.w.record(context.WithoutCancel(d.ctx), &r.task, r.outcome, lease)
 	if err != nil {
-		d.w.log.LogAttrs(d.ctx, slog.LevelWarn, "flows: record activity outcome",
+		d.w.log.LogAttrs(d.ctx, slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
 			slog.String("activity", r.task.Name), slog.Any("error", err))
 	}
 	if resumeLost {
@@ -372,6 +368,12 @@ func (d *driver) completed(task *store.WorkflowTask, c *store.Completion, eager 
 			w.hb.cancel(true, id, ErrActivityCanceled)
 		}
 	}
+	if len(leases) < len(eager) { // a store bug: never index past them
+		w.log.LogAttrs(d.ctx, slog.LevelError, "flows: fewer eager leases than eager activities",
+			slog.Int("leases", len(leases)), slog.Int("eager", len(eager)))
+		release(w.actSlots, len(eager)-len(leases)) // the activities left are claimed by polls
+		eager = eager[:len(leases)]
+	}
 	for i, idx := range eager {
 		a := c.Activities[idx]
 		d.launch(store.ActivityTask{
@@ -406,6 +408,12 @@ func (d *driver) eager(c *store.Completion, stopping bool) []int {
 func (d *driver) launch(t store.ActivityTask, claimed time.Time) {
 	w := d.w
 	actx, untrack := w.hb.track(w.taskCtx(), true, t.Lease, claimed)
+	if d.results == nil {
+		// Buffered for every activity that can run at once: an activity
+		// never blocks on a driver that stopped reading (panic, hand-over).
+		d.results = make(chan eagerResult, w.opts.MaxActivities)
+		d.running = map[int32]int64{}
+	}
 	d.inflight++
 	d.running[t.ScheduleID] = t.Lease.ID
 	results := d.results
@@ -457,15 +465,23 @@ func (d *driver) build(task *store.WorkflowTask) bool {
 	return true
 }
 
-// fail handles an executor error: non-determinism parks the execution for
-// an operator (GW-11: never fail it); a stuck or broken executor hands the
-// execution back.
+// fail handles an executor error. Wrong workflow code parks the execution
+// for an operator (GW-11: never fail it): non-determinism, or code that did
+// not yield twice at the same point of its history (once may be a stall of
+// the process: it is handed back; every further attempt would leak a
+// spinning goroutine). Any other error (an unknown event type, a broken
+// executor) hands the execution back.
 func (d *driver) fail(task *store.WorkflowTask, err error) {
 	w := d.w
-	d.taskErr = err
 	d.evict()
-	if errors.Is(err, executor.ErrNonDeterministic) {
-		w.log.LogAttrs(d.ctx, slog.LevelError, "flows: non-deterministic workflow, parking",
+	park := errors.Is(err, executor.ErrNonDeterministic)
+	if errors.Is(err, coro.ErrStuck) {
+		err = fmt.Errorf("workflow code did not yield (blocking call or busy loop?): %w", err)
+		park = w.stuckAgain(task.Execution.ID, task.LastSeq)
+	}
+	d.taskErr = err
+	if park {
+		w.log.LogAttrs(d.ctx, slog.LevelError, "flows: workflow code is wrong, parking",
 			slog.String("instance", task.Execution.InstanceID), slog.Any("error", err))
 		c := &store.Completion{Status: store.StatusNeedsAttention, Err: w.opts.Errors.Text(err), ErrKinds: w.opts.Errors.Kinds(err)}
 		_, cerr := w.st.CompleteWorkflowTask(d.ctx, d.lease, c)
@@ -481,9 +497,6 @@ func (d *driver) fail(task *store.WorkflowTask, err error) {
 			w.ended(&task.Execution, c.Status, c.Err, c.ErrKinds)
 		}
 		return
-	}
-	if errors.Is(err, coro.ErrStuck) {
-		err = fmt.Errorf("workflow code did not yield (blocking call?): %w", err)
 	}
 	w.log.LogAttrs(d.ctx, slog.LevelError, "flows: workflow task failed, handing back",
 		slog.String("instance", task.Execution.InstanceID), slog.Any("error", err))

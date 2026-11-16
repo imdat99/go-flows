@@ -177,12 +177,8 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 			fb.Ints(len(c.CanceledActivities), func(i int) int64 { return int64(c.CanceledActivities[i]) })
 		})
 	}
-	for _, sched := range c.CompensateChildren {
-		fb.stmt(compensateChild, nCompChild, func() {
-			fb.Int(l.ID)
-			fb.Int(int64(sched))
-		})
-	}
+	// Same order as the pgx path (queueCompletion): the pending events
+	// these create are numbered, and delivered, in this order.
 	locks := sortedLocks(c.Locks)
 	for i := range locks {
 		k := &locks[i]
@@ -191,6 +187,12 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 			fb.Str(k.Key)
 			fb.Int(int64(k.ScheduleID))
 			fb.Int(micros(k.TTL))
+		})
+	}
+	for _, sched := range c.CompensateChildren {
+		fb.stmt(compensateChild, nCompChild, func() {
+			fb.Int(l.ID)
+			fb.Int(int64(sched))
 		})
 	}
 	s.endFast(fb, l, c, ending, lastSeq)

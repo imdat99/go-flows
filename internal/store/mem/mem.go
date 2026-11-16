@@ -7,11 +7,13 @@ package mem
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/imdat99/go-flows/internal/history"
 	"github.com/imdat99/go-flows/internal/store"
@@ -107,6 +109,9 @@ type execution struct {
 	// compRequested: a completed child reopened by its parent's
 	// compensation; its end answers the parent with CompensationCompleted.
 	compRequested bool
+	// forceReady: reopened (ReopenParked), claimable even with nothing
+	// pending, until claimed.
+	forceReady bool
 }
 
 type pending struct {
@@ -229,6 +234,9 @@ func (e *execution) task(now time.Time) store.WorkflowTask {
 func (e *execution) readyAt(now time.Time) (time.Time, bool) {
 	var at time.Time
 	found := false
+	if e.forceReady {
+		at, found = now, true
+	}
 	for _, p := range e.pending {
 		if p.visibleAt.After(now) {
 			continue
@@ -260,13 +268,18 @@ func (s *Store) Wake(owner string, queues []string) (ready bool, next time.Time,
 		}
 	}
 	for _, e := range s.executions {
-		if !claimable(e.Status) || len(e.pending) == 0 || !contains(queues, e.Queue) {
+		if !claimable(e.Status) || len(e.pending) == 0 && !e.forceReady || !contains(queues, e.Queue) {
 			continue
 		}
-		earliest := e.pending[0].visibleAt
-		for _, p := range e.pending[1:] {
-			if p.visibleAt.Before(earliest) {
-				earliest = p.visibleAt
+		var earliest time.Time
+		if e.forceReady {
+			earliest = now
+		} else {
+			earliest = e.pending[0].visibleAt
+			for _, p := range e.pending[1:] {
+				if p.visibleAt.Before(earliest) {
+					earliest = p.visibleAt
+				}
 			}
 		}
 		at := latest(earliest, e.lockedUntil, e.notBefore)
@@ -330,7 +343,7 @@ func (s *Store) ClaimWorkflowTasks(_ context.Context, owner string, queues []str
 		}
 		e := c.e
 		e.lease = store.Lease{ID: e.ID, Owner: owner, Version: e.lease.Version + 1}
-		e.lockedUntil = now.Add(ttl)
+		e.lockedUntil, e.forceReady = now.Add(ttl), false
 		s.extendLocks(e.ID, now)
 		out = append(out, e.task(now))
 	}
@@ -445,10 +458,29 @@ func (s *Store) cancelRequests(e *execution, c *store.Completion, now time.Time)
 
 // validate checks c before anything changes: a completion applies
 // atomically.
+// storableText refuses the text Postgres refuses (a NUL, invalid UTF-8),
+// so that tests on this store meet the failure a deployment would: the
+// engine must sanitize what it stores.
+func storableText(c *store.Completion) error {
+	bad := func(v string) bool { return !utf8.ValidString(v) || strings.IndexByte(v, 0) >= 0 }
+	if bad(c.Err) || bad(c.ErrKinds) {
+		return errors.New("mem: unstorable text in the completion's error (NUL or invalid UTF-8)")
+	}
+	for i := range c.History {
+		if ev := &c.History[i]; bad(ev.Err) || bad(ev.ErrKinds) || bad(ev.Name) {
+			return fmt.Errorf("mem: unstorable text in event %d (NUL or invalid UTF-8)", ev.Seq)
+		}
+	}
+	return nil
+}
+
 func (s *Store) validate(e *execution, c *store.Completion) error {
 	last := int64(0)
 	if n := len(e.history); n > 0 {
 		last = e.history[n-1].Seq
+	}
+	if err := storableText(c); err != nil {
+		return err
 	}
 	if !store.ValidShape(c) || len(c.History) > 0 && c.History[0].Seq != last+1 {
 		return store.ErrInvalidCompletion
@@ -857,6 +889,26 @@ func (s *Store) ReopenCompensation(_ context.Context, instanceID string) error {
 	return nil
 }
 
+// ReopenParked implements store.Store.
+func (s *Store) ReopenParked(_ context.Context, instanceID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.latest[instanceID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	e := s.executions[id]
+	kinds := strings.Split(e.ErrKinds, ",")
+	if e.Status != store.StatusNeedsAttention ||
+		!slices.Contains(kinds, store.KindNonDeterministic) && !slices.Contains(kinds, store.KindStuck) {
+		return store.ErrNotActive
+	}
+	e.Status, e.Err, e.ErrKinds = store.StatusRunning, "", ""
+	e.forceReady = true
+	s.hint(store.WorkflowWork, e.Queue)
+	return nil
+}
+
 func (s *Store) deliver(instanceID string, ev history.Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -920,6 +972,17 @@ func (s *Store) RenewLeases(_ context.Context, owner string, workflows, activiti
 	return r, nil
 }
 
+// activeAncestor reports whether an ancestor of e is active: compensation
+// reaches e through it (a reopened child compensates its own children).
+func (s *Store) activeAncestor(e *execution) bool {
+	for p, ok := s.executions[e.ParentID]; ok; p, ok = s.executions[p.ParentID] {
+		if p.Status.Active() {
+			return true
+		}
+	}
+	return false
+}
+
 // PurgeEnded implements store.Store.
 func (s *Store) PurgeEnded(_ context.Context, olderThan time.Duration, limit int) (int, error) {
 	s.mu.Lock()
@@ -927,10 +990,7 @@ func (s *Store) PurgeEnded(_ context.Context, olderThan time.Duration, limit int
 	cutoff := s.clock.Now().Add(-olderThan)
 	var ids []int64
 	for id, e := range s.executions {
-		if !e.EndedAt.IsZero() && e.EndedAt.Before(cutoff) {
-			if p, ok := s.executions[e.ParentID]; ok && p.Status.Active() {
-				continue // a child of an active parent may still have to compensate
-			}
+		if !e.EndedAt.IsZero() && e.EndedAt.Before(cutoff) && !s.activeAncestor(e) {
 			ids = append(ids, id)
 		}
 	}

@@ -222,7 +222,7 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 	}
 	o := w.attempt(tctx, a, t)
 	if _, _, err := w.record(context.WithoutCancel(tctx), t, o, nil); err != nil {
-		w.log.LogAttrs(ctx, slog.LevelWarn, "flows: record activity outcome",
+		w.log.LogAttrs(ctx, slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
 			slog.String("activity", t.Name), slog.Any("error", err))
 	}
 }

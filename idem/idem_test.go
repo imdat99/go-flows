@@ -257,3 +257,41 @@ func TestAbortWaitsForInFlightAttempt(t *testing.T) {
 		t.Fatalf("abort = %d, %v; want the committed result", v, processed)
 	}
 }
+
+// T8.4 review: a result jsonb cannot hold (a NUL) fails Do with
+// ErrUnstorable and undoes fn's change; a result with invalid UTF-8 comes
+// back the same from the first Do and from a duplicate.
+func TestDoUnstorableAndInvalidUTF8Results(t *testing.T) {
+	pool, tbl := setup(t)
+	ctx := context.Background()
+	do := func(key, result string) (string, error) {
+		var out string
+		err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+			var err error
+			out, err = idem.Do(ctx, tx, tbl, key, func(ctx context.Context) (string, error) {
+				_, err := tx.Exec(ctx, `UPDATE inventory.stock SET reserved = reserved + 1 WHERE sku = 'sku-1'`)
+				return result, err
+			})
+			return err
+		})
+		return out, err
+	}
+	if _, err := do("k-nul", "a\x00b"); !errors.Is(err, idem.ErrUnstorable) {
+		t.Fatalf("NUL: %v", err)
+	}
+	var reserved int
+	if err := pool.QueryRow(ctx, `SELECT reserved FROM inventory.stock`).Scan(&reserved); err != nil || reserved != 0 {
+		t.Fatalf("the change of a refused result stayed: %d %v", reserved, err)
+	}
+	if got, err := do("k-text", `a\u0000b`); err != nil || got != `a\u0000b` {
+		t.Fatalf("a literal backslash-u text: %q %v", got, err)
+	}
+	first, err := do("k-utf8", "a\xffb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dup, err := do("k-utf8", "other")
+	if err != nil || dup != first {
+		t.Fatalf("first %q, duplicate %q (%v)", first, dup, err)
+	}
+}

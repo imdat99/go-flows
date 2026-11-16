@@ -19,12 +19,14 @@ package idem
 // Ported from saga/idem (same author).
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -87,8 +89,15 @@ func (t *Table) CreateTable(ctx context.Context, db Execer) error {
 }
 
 // ErrAborted means the key was fenced off with Abort: the request must not
-// take effect any more.
+// take effect any more. Retrying cannot help: an activity should return it
+// wrapped with flows.Permanent.
 var ErrAborted = errors.New("idem: request aborted")
+
+// ErrUnstorable means fn's result cannot be stored (its JSON holds a NUL
+// character, which Postgres' jsonb refuses): Do undoes fn's change and
+// fails. Retrying cannot help: return such results as bytes, or wrap the
+// error with flows.Permanent.
+var ErrUnstorable = errors.New("idem: result cannot be stored (NUL character)")
 
 // Do runs fn once per key. tx must be the transaction fn writes in. The key is
 // claimed first, so a concurrent Do with the same key blocks until tx ends,
@@ -156,10 +165,43 @@ func do[T any](
 	if err != nil {
 		return zero, fmt.Errorf("idem: encode result of %s: %w", key, err)
 	}
+	if hasNUL(raw) {
+		return zero, fmt.Errorf("%w: %s", ErrUnstorable, key)
+	}
 	if _, err := tx.Exec(ctx, `UPDATE `+t.name+` SET result = $2 WHERE key = $1`, key, raw); err != nil {
 		return zero, fmt.Errorf("idem: store result of %s: %w", key, err)
 	}
+	if bytes.ContainsRune(raw, utf8.RuneError) {
+		// JSON encoding replaced invalid UTF-8 with U+FFFD (or the value
+		// had one): return what a duplicate will get (the stored value),
+		// not the original.
+		var stored T
+		if err := json.Unmarshal(raw, &stored); err != nil {
+			return zero, fmt.Errorf("idem: decode result of %s: %w", key, err)
+		}
+		return stored, nil
+	}
 	return v, nil
+}
+
+// hasNUL reports an escaped NUL (\u0000, not preceded by an escaping
+// backslash) in JSON text.
+func hasNUL(raw []byte) bool {
+	for i := 0; ; {
+		j := bytes.Index(raw[i:], []byte(`\u0000`))
+		if j < 0 {
+			return false
+		}
+		j += i
+		n := 0 // backslashes before the one starting the escape
+		for k := j - 1; k >= 0 && raw[k] == '\\'; k-- {
+			n++
+		}
+		if n%2 == 0 {
+			return true
+		}
+		i = j + 1
+	}
 }
 
 type recordState int

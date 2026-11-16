@@ -73,6 +73,8 @@ func (t tracer) StartActivity(ctx context.Context, a flows.ActivityInfo) (contex
 func (t tracer) StartWorkflowTask(ctx context.Context, w flows.WorkflowTaskInfo) func(flows.Status, error) {
 	_, span := t.t.Start(ctx, "flows.workflow_task "+w.Workflow, trace.WithAttributes(
 		AttrInstanceID.String(w.InstanceID), AttrWorkflow.String(w.Workflow), AttrVersion.Int(w.Version),
+		// A task of a compensating execution plans compensation steps.
+		AttrCompensation.Bool(w.Status == flows.StatusCompensating),
 	))
 	return func(s flows.Status, err error) {
 		if s != "" {
