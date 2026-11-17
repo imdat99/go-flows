@@ -207,7 +207,10 @@ func (f *Future[T]) Ready() bool {
 // repeated request, or one after the child ended, does nothing; so does a
 // request on a future that failed before the child was started. A child
 // that completes after the request keeps its compensations: it is
-// compensated with its parent as any completed child. RequestCancel on the
+// compensated with its parent as any completed child. A child that
+// continues as new after the request starts its next run uncanceled (the
+// request is not carried over): the parent waits for the whole chain.
+// RequestCancel on the
 // future of an activity or a timer panics, failing the workflow
 // (ErrInvalidArgument).
 func (f *Future[T]) RequestCancel(c Ctx) {

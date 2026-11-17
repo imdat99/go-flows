@@ -142,7 +142,8 @@ func (w *Workflow[I, O]) Handle(e *Engine, instanceID string) *Handle[O] {
 // as new, only the last execution is compensated; activities a child
 // started without awaiting them are not. A child still running is canceled
 // (and compensates itself), and the parent waits for it; a child that
-// ignores the cancel and completes afterwards is not compensated.
+// ignores the cancel and completes meanwhile is compensated with the
+// parent, as any completed child.
 func (w *Workflow[I, O]) Child(c Ctx, instanceID string, in I) *Future[O] {
 	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
 		return &Future[O]{err: Permanent(err)}

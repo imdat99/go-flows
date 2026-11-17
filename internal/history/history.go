@@ -77,7 +77,8 @@ const (
 	ChildCompleted
 	// ChildFailed carries the error of a child (Err, ErrKinds).
 	ChildFailed
-	// ChildCancelRequested records that the parent canceled the child's context.
+	// ChildCancelRequested records that the parent asked the child to cancel:
+	// it canceled the child's context, or called Future.RequestCancel.
 	ChildCancelRequested
 
 	// CompensationScheduled starts the compensation of the activity of
