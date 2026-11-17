@@ -361,6 +361,14 @@ Những gì go-flows làm khó ở đây, và cách ví dụ xoay xở:
   pivot) là một vòng lặp trong workflow quanh một retry policy hữu hạn
   với giấc ngủ durable (`untilDone` trong `shipping/shipping.go`); các
   attempt lỗi tới observer.
+  History của nó tăng vài event mỗi vòng (khoảng 600 mỗi ngày): ổn với sự
+  cố kéo dài vài giờ hay vài ngày; lâu hơn thì kết thúc vòng lặp bằng
+  `ContinueAsNew`, hoặc cảnh báo và sửa tay.
+- **Hai khe hẹp làm sai cam kết 202 của pickup.** Nếu `CreateLabel` đã
+  commit dòng rồi hết số lần thử trong khi carrier xác nhận giữa chừng,
+  hoặc operator terminate shipment còn ở `label_created` trước khi xác
+  nhận tới, carrier đã nhận 202 nhưng đơn hàng bị hoàn tác. Hãy theo dõi
+  các shipment có dòng `pickup_confirmed` mà đơn hàng đã được bù.
 - **Thứ tự outbox theo sequence, không theo commit.** Xem
   `internal/platform/outbox`: ổn với một event mỗi key mỗi transaction,
   không ổn với nhiều producer đồng thời cho cùng một key.

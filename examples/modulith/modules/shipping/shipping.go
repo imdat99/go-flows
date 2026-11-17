@@ -147,7 +147,9 @@ func InstanceID(orderID string) string { return "shipping-" + orderID }
 
 // ConfirmPickup records the carrier's pickup of an order's shipment. nil
 // means the pickup is recorded for good: the shipment will complete, and
-// the order will not be undone. A repeated confirmation is nil too.
+// the order will not be undone. A repeated confirmation is nil too. Any
+// other error may follow a recorded pickup (the wake-up signal failed):
+// retrying is always safe.
 //
 // ErrPickupRefused: the shipment was canceled first (409, return the
 // parcel). ErrNoShipment: no label yet (retry later).
@@ -158,8 +160,10 @@ func ConfirmPickup(ctx context.Context, e *flows.Engine, orderID, tracking strin
 	// Wake the workflow. If this fails (a crash here), the workflow still
 	// finds the confirmed row when its timeout fires.
 	err := e.Signal(ctx, InstanceID(orderID), SignalPickedUp, Pickup{Tracking: tracking})
-	if errors.Is(err, flows.ErrNotActive) {
-		return nil // a repeated confirmation of a shipment that has completed
+	if errors.Is(err, flows.ErrNotActive) || errors.Is(err, flows.ErrNotFound) {
+		// A repeated confirmation of a shipment that has completed (and
+		// perhaps been purged by retention): the pickup is recorded.
+		return nil
 	}
 	return err
 }
@@ -176,7 +180,7 @@ func confirmPickup(ctx context.Context, orderID, tracking string) error {
 	// the statement's snapshot, older than the row the UPDATE waited for.)
 	var state string
 	err = pgx.BeginFunc(ctx, c.DB, func(tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, `SELECT state FROM shipping.shipments WHERE order_id = $1 FOR UPDATE`,
+		if err := tx.QueryRow(ctx, `SELECT state FROM shipping.shipments WHERE order_id = $1 AND order_id <> '' FOR UPDATE`,
 			orderID).Scan(&state); err != nil {
 			return err
 		}

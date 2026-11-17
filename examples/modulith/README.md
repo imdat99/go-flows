@@ -370,6 +370,15 @@ What go-flows made hard here, and how the example works around it:
   is a workflow loop over a finite retry policy with a durable sleep
   (`untilDone` in `shipping/shipping.go`); its failed attempts reach the
   observer.
+  Its history grows by a few events per round (about 600 a day): fine for
+  outages of hours or days; for longer ones, end the loop with
+  `ContinueAsNew` or alert and repair by hand.
+- **Two narrow windows break the 202 of a pickup.** If `CreateLabel`
+  commits its row and then exhausts its attempts while a carrier confirms
+  in between, or an operator terminates a shipment still at
+  `label_created` before a confirmation arrives, the carrier got 202 but
+  the order is undone. Watch for shipments whose row says
+  `pickup_confirmed` while their order is compensated.
 - **Outbox order is by sequence, not commit.** See
   `internal/platform/outbox`: fine for one event per key per
   transaction, not for concurrent producers of one key.
