@@ -777,8 +777,10 @@ const lapseSlack = 100 * time.Millisecond
 // it, so it lapses no sooner than ttl - ttl/3 after it.
 //
 // It is the pause's start, or the start of one of the process's
-// blackholes (holes: its connections frozen both ways, so nothing is
-// claimed nor renewed during one) after which the lease cannot have been
+// blackholes (holes: its connections frozen both ways; a renewal sent
+// during one may still commit at the thaw, extending the lease to the
+// thaw + ttl, which only delays another engine's claim: the database
+// refuses it until then) after which the lease cannot have been
 // renewed nor claimed: one that began before the pause, ended after the
 // attempt started (the attempt's lease was not claimed after it), and
 // either was still on when the pause began (within lapseSlack) or lasted
