@@ -1,4 +1,4 @@
-.PHONY: up down test race race10 chaos test-chaos lint lint-fix fmt modcheck bench bench-goworkflows benchcmp benchgate
+.PHONY: up down test race race10 chaos test-chaos upgrade lint lint-fix fmt modcheck bench bench-goworkflows benchcmp benchgate
 
 BENCH ?= .
 BENCHPKG ?= ./...
@@ -29,6 +29,12 @@ chaos:
 	else echo "chaos: test/chaos does not exist yet (task T8.1)"; fi
 
 test-chaos: chaos
+
+# Upgrade test (build tag upgrade, T11.6): builds a driver from the tag
+# v0.1.0 (git archive), runs workflows to mid-points with it, then migrates
+# and finishes them with HEAD. Needs git and Postgres (make up).
+upgrade:
+	go test -race -count=1 -tags upgrade -timeout 15m -v ./test/upgrade/...
 
 lint:
 	golangci-lint run ./...

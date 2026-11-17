@@ -5,6 +5,7 @@ run:
   tests: true
   build-tags:
     - chaos
+    - upgrade
 
 issues:
   max-issues-per-linter: 0
