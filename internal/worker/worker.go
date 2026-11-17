@@ -304,7 +304,12 @@ func (w *Worker) Busy() bool {
 
 // New returns a stopped worker.
 func New(st store.Store, wfs Workflows, acts Activities, opts Options) (*Worker, error) {
+	asked := opts.PollMax
 	opts.defaults()
+	if asked > opts.PollMax {
+		opts.Logger.LogAttrs(context.Background(), slog.LevelInfo, "flows: PollMax lowered to LeaseTTL/3 (recovery of a crashed engine's work)",
+			slog.Duration("poll_max", asked), slog.Duration("used", opts.PollMax), slog.Duration("lease_ttl", opts.LeaseTTL))
+	}
 	if opts.Owner == "" || len(opts.Queues) == 0 {
 		return nil, errors.New("worker: Owner and Queues are required")
 	}
