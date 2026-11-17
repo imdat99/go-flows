@@ -265,7 +265,22 @@ type Worker struct {
 	// detached counts the recorders of detached eager outcomes (driver
 	// detach): the only tasks that hold no slot (Busy).
 	detached atomic.Int64
-	started  bool
+	// eagerStats counts eager launches and misses (T10.21).
+	eagerStats eagerStats
+	started    bool
+}
+
+// eagerStats counts, per worker, the activities run eagerly and those that
+// could have been but found no free activity slot (they go through the
+// queue: a NOTIFY and a claim more); missedInClaim counts the misses while
+// an activity claim held slots (it takes every free slot but a spare for
+// its round trip). Atomic adds only: no allocation. Read by tests and
+// benchmarks (export_test.go).
+type eagerStats struct {
+	launched, missed, missedInClaim atomic.Int64
+	// claiming is set while an activity claim is in flight (its poller
+	// holds the slots it took).
+	claiming atomic.Bool
 }
 
 // SetDroppedHook sets a function told, when an execution of a workflow
@@ -482,16 +497,19 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// acquire takes up to n free slots without blocking, and at least one,
-// blocking until one is free; it returns 0 when ctx is done.
-func acquire(ctx context.Context, slots chan struct{}) int {
+// acquire takes the free slots without blocking but spare of them, and at
+// least one, blocking until one is free; it returns 0 when ctx is done.
+// The activity claims keep a spare slot (T10.21): they hold their slots for
+// a round trip, and an eager launch meanwhile would find none, its activity
+// going through the queue (a NOTIFY waking every poller, a claim more).
+func acquire(ctx context.Context, slots chan struct{}, spare int) int {
 	select {
 	case slots <- struct{}{}:
 	case <-ctx.Done():
 		return 0
 	}
 	n := 1
-	for n < cap(slots) {
+	for n < cap(slots) && len(slots) < cap(slots)-spare {
 		select {
 		case slots <- struct{}{}:
 			n++
@@ -508,6 +526,15 @@ func release(slots chan struct{}, n int) {
 	}
 }
 
+// eagerSpare is the number of activity slots a claim leaves free for eager
+// launches: one when the worker runs activities eagerly.
+func eagerSpare(eager bool) int {
+	if eager {
+		return 1
+	}
+	return 0
+}
+
 // tryAcquire takes one slot if free.
 func tryAcquire(slots chan struct{}) bool {
 	select {
@@ -518,14 +545,15 @@ func tryAcquire(slots chan struct{}) bool {
 	}
 }
 
-// poll is the claim loop shared by both task kinds.
-func (w *Worker) poll(ctx context.Context, slots, hint chan struct{}, due *dueTimes, claim func(n int) (int, error)) {
+// poll is the claim loop shared by both task kinds; each claim leaves
+// spare free slots when more are free (acquire).
+func (w *Worker) poll(ctx context.Context, slots chan struct{}, spare int, hint chan struct{}, due *dueTimes, claim func(n int) (int, error)) {
 	idle := w.opts.PollMin
 	t := time.NewTimer(idle)
 	defer t.Stop()
 	timedPoll := false // this claim follows a backoff timeout
 	for {
-		n := acquire(ctx, slots)
+		n := acquire(ctx, slots, spare)
 		if n == 0 {
 			return
 		}
@@ -600,7 +628,7 @@ func (w *Worker) pollWorkflows(ctx context.Context) {
 	// learned at the next claim, PollMin later at most.
 	wantDue := true
 	cctx := w.claimCtx()
-	w.poll(ctx, w.wfSlots, w.wfHint, w.wfDue, func(n int) (int, error) {
+	w.poll(ctx, w.wfSlots, 0, w.wfHint, w.wfDue, func(n int) (int, error) {
 		at := time.Now()
 		var tasks []store.WorkflowTask
 		var next time.Duration
@@ -623,16 +651,18 @@ func (w *Worker) pollActivities(ctx context.Context) {
 	dc, _ := w.st.(store.DueClaimer)
 	wantDue := true // as in pollWorkflows
 	cctx := w.claimCtx()
-	w.poll(ctx, w.actSlots, w.actHint, w.actDue, func(n int) (int, error) {
+	w.poll(ctx, w.actSlots, eagerSpare(w.opts.Eager), w.actHint, w.actDue, func(n int) (int, error) {
 		at := time.Now()
 		var tasks []store.ActivityTask
 		var next time.Duration
 		var err error
+		w.eagerStats.claiming.Store(true)
 		if dc != nil && wantDue {
 			tasks, next, err = dc.ClaimActivityTasksDue(cctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
 		} else {
 			tasks, err = w.st.ClaimActivityTasks(cctx, w.opts.Owner, w.opts.Queues, n, w.opts.LeaseTTL)
 		}
+		w.eagerStats.claiming.Store(false)
 		for i := range tasks {
 			t := tasks[i]
 			w.tasks.Go(func() {

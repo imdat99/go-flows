@@ -548,9 +548,17 @@ func (d *driver) eager(c *store.Completion, stopping bool) []int {
 		a := &c.Activities[i]
 		// Only activities of a queue this worker runs (WithQueue routes
 		// them to other engines), with a free slot.
-		if _, ok := w.acts.Activity(a.Name, a.Compensate); !ok || !w.runsQueue(a.Queue) || !tryAcquire(w.actSlots) {
+		if _, ok := w.acts.Activity(a.Name, a.Compensate); !ok || !w.runsQueue(a.Queue) {
 			continue
 		}
+		if !tryAcquire(w.actSlots) {
+			w.eagerStats.missed.Add(1)
+			if w.eagerStats.claiming.Load() {
+				w.eagerStats.missedInClaim.Add(1)
+			}
+			continue
+		}
+		w.eagerStats.launched.Add(1)
 		a.ClaimFor = w.opts.LeaseTTL
 		idx = append(idx, i)
 	}

@@ -134,6 +134,19 @@ polls then, so a backed-off poller does not run it up to `PollMax` late
   index (`execution_due_idx`, T10.2), so the `ready_at` lookup reads one
   entry per queue however many kept leases fall due before the first timer.
 
+An activity claim holds the free activity slots it takes for its round
+trip; before T10.21 it took all of them, so an eager launch meanwhile found
+none and its activity went through the queue: a NOTIFY waking every
+engine's poller, which all claim (one finds it), and so more claims holding
+the slots. `BenchmarkEagerMisses` (internal/worker; 4 concurrent
+10-activity workflows per engine, 20 batches per sample, `-count 6`)
+counts it: with 3 engines 2.9% of the activities missed their eager
+launch, every one during a claim, with 0.094 activity claims per activity.
+The claim now leaves one slot free when more than one is (a single free
+slot is still taken): 0.06% missed, 0.012 claims per activity (-87%),
+allocations unchanged (1270 to 1159 per batch, p=0.09). With one engine
+the misses were ~0.4% (timed polls only) and stay about that.
+
 Runs that take 0.5 to 1.7 s instead of ~0.15 s appear now and then on the
 development machine. A trace of store calls showed every statement of
 such runs taking 50 to 80 ms instead of ~5 ms, with the engine's flow
