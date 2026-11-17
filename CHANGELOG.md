@@ -136,7 +136,8 @@ must take care of.
 - **History events 31-33** (`SignalSent`, `SignalDelivered`,
   `SignalFailed`, T12.1) are unknown to earlier binaries: deploy the new
   binary everywhere before workflow code calls `flows.SignalWorkflow`
-  (an earlier engine replaying such a history would park it).
+  (an earlier engine does not know these events, so it must not replay
+  such a history).
 - **`00017` (T11.3)** adds two integer columns with a constant default:
   metadata only, no table rewrite and no long lock.
 - Activity tasks inserted by earlier binaries (and by binaries that do not
