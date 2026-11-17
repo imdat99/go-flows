@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -45,8 +46,24 @@ func newTester(t *testing.T) (*flowtest.Tester, *undoLog) {
 	}))
 	undo := &undoLog{}
 
-	flowtest.OnActivity(tst, record, func(context.Context, flows.Key, Order) (struct{}, struct{}, error) {
+	flowtest.OnActivity(tst, record, func(ctx context.Context, _ flows.Key, o Order) (struct{}, struct{}, error) {
+		if o.Email == "cancel-early@example.com" {
+			// The customer cancels while the order is being recorded.
+			if err := tst.Engine().Signal(ctx, InstanceID(o.ID), SignalCancel, CancelRequest{Reason: "early"}); err != nil {
+				return struct{}{}, struct{}{}, err
+			}
+		}
 		return struct{}{}, struct{}{}, nil
+	})
+	// The real forwardCancel signals through the configured engine: here,
+	// the tester's.
+	flowtest.OnActivity(tst, forwardCancel, func(ctx context.Context, _ flows.Key, f ForwardedCancel) (struct{}, struct{}, error) {
+		undo.add("forward cancel")
+		err := shipping.Cancel(ctx, tst.Engine(), f.OrderID, f.Reason)
+		if errors.Is(err, flows.ErrNotActive) {
+			err = nil
+		}
+		return struct{}{}, struct{}{}, err
 	})
 	flowtest.OnActivity(tst, payments.Authorize,
 		func(_ context.Context, _ flows.Key, r payments.AuthorizeRequest) (payments.Authorization, string, error) {
@@ -80,7 +97,15 @@ func newTester(t *testing.T) (*flowtest.Tester, *undoLog) {
 		undo.add("cancel label " + id)
 		return nil
 	})
-	flowtest.OnActivity(tst, shipping.MarkPickedUp, func(context.Context, flows.Key, shipping.PickupUpdate) (struct{}, struct{}, error) {
+	flowtest.OnActivity(tst, shipping.MarkPickedUp, func(ctx context.Context, _ flows.Key, u shipping.PickupUpdate) (struct{}, struct{}, error) {
+		if u.Tracking == "TRK-RACE" {
+			// The customer cancels just after the pickup reached the
+			// shipment, while the order still waits for it.
+			if err := tst.Engine().Signal(ctx, InstanceID(strings.TrimPrefix(u.ShipmentID, "shp_")), SignalCancel,
+				CancelRequest{Reason: "too late"}); err != nil {
+				return struct{}{}, struct{}{}, err
+			}
+		}
 		return struct{}{}, struct{}{}, nil
 	})
 	return tst, undo
@@ -119,9 +144,10 @@ func TestFulfilCanceledByCustomer(t *testing.T) {
 	if !errors.Is(err, ErrCanceledByCustomer) || !errors.Is(err, flows.ErrCompensated) {
 		t.Fatalf("err = %v, want canceled by the customer and compensated", err)
 	}
-	// Shipping cancels its own label when the parent cancels it; then the
-	// fulfilment undoes its steps, latest first, each in its module.
-	want := []string{"cancel label shp_o2", "refund pay_o2", "release 2", "void pay_o2"}
+	// The fulfilment forwards the cancel to the shipment, which cancels its
+	// own label and fails; then the fulfilment undoes its steps, latest
+	// first, each in its module.
+	want := []string{"forward cancel", "cancel label shp_o2", "refund pay_o2", "release 2", "void pay_o2"}
 	if got := undo.get(); !slices.Equal(got, want) {
 		t.Fatalf("compensations %v, want %v", got, want)
 	}
@@ -159,5 +185,46 @@ func TestFulfilOutOfStock(t *testing.T) {
 	want := []string{"release 3", "void pay_o4"}
 	if got := undo.get(); !slices.Equal(got, want) {
 		t.Fatalf("compensations %v, want %v", got, want)
+	}
+}
+
+// The carrier's pickup reaches the shipment, then the customer's cancel
+// reaches the order while it still waits for the shipment: the parcel is
+// with the carrier, so the order completes and nothing is refunded.
+func TestFulfilCancelAfterPickup(t *testing.T) {
+	tst, undo := newTester(t)
+	tst.SignalAfter(time.Hour, shipping.InstanceID("o6"), shipping.SignalPickedUp, shipping.Pickup{Tracking: "TRK-RACE"})
+
+	res, err := flowtest.Run(tst, fulfil, InstanceID("o6"), order("o6"))
+	if err != nil {
+		t.Fatalf("err = %v, want the order completed (the pickup came first)", err)
+	}
+	if res.Tracking != "TRK-RACE" {
+		t.Fatalf("result %+v", res)
+	}
+	// The cancel was forwarded (the race happened), and the shipment, which
+	// had the pickup, refused it: nothing was compensated.
+	if got := undo.get(); !slices.Equal(got, []string{"forward cancel"}) {
+		t.Fatalf("steps %v, want only the forwarded cancel", got)
+	}
+}
+
+// A cancel that arrives before the shipment starts stops the order before
+// the capture: no shipment, no capture to refund.
+func TestFulfilCancelBeforeShipping(t *testing.T) {
+	tst, undo := newTester(t)
+	o := order("o7")
+	o.Email = "cancel-early@example.com"
+
+	_, err := flowtest.Run(tst, fulfil, InstanceID("o7"), o)
+	if !errors.Is(err, ErrCanceledByCustomer) {
+		t.Fatalf("err = %v, want canceled by the customer", err)
+	}
+	want := []string{"release 2", "void pay_o7"}
+	if got := undo.get(); !slices.Equal(got, want) {
+		t.Fatalf("compensations %v, want %v", got, want)
+	}
+	if types := tst.EventTypes(shipping.InstanceID("o7")); len(types) != 0 {
+		t.Fatalf("a shipment was started: %v", types)
 	}
 }

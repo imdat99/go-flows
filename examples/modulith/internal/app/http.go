@@ -1,10 +1,13 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -18,6 +21,12 @@ import (
 // maxBody bounds request bodies: the engine stores inputs and signals as
 // they are, so the API is where their size is limited.
 const maxBody = 64 << 10
+
+// adjustWait bounds how long POST /inventory/{sku}/adjust waits for the
+// adjustment (it may queue behind a replenishment cycle). Past it the
+// client gets 504 and retries with the same request_id. Keep it below the
+// server's WriteTimeout.
+const adjustWait = 15 * time.Second
 
 // Handler returns the HTTP API. It works in any process, whatever modules
 // it runs: it only starts workflows, sends signals and reads.
@@ -136,7 +145,13 @@ func (a *App) adjustStock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sku := r.PathValue("sku")
-	n, err := inventory.Adjust(r.Context(), a.engine, req.RequestID, sku, req.Delta, req.Reason)
+	ctx, cancel := context.WithTimeout(r.Context(), adjustWait)
+	defer cancel()
+	n, err := inventory.Adjust(ctx, a.engine, req.RequestID, sku, req.Delta, req.Reason)
+	if errors.Is(err, context.DeadlineExceeded) {
+		a.reply(w, http.StatusGatewayTimeout, map[string]string{"error": "still running: retry with the same request_id"})
+		return
+	}
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -144,8 +159,15 @@ func (a *App) adjustStock(w http.ResponseWriter, r *http.Request) {
 	a.reply(w, http.StatusOK, stockView{SKU: sku, Available: n})
 }
 
+// decode reads one JSON object with known fields only, and nothing after it.
 func (a *App) decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody)).Decode(v); err != nil {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+	dec.DisallowUnknownFields()
+	err := dec.Decode(v)
+	if err == nil && dec.Decode(&struct{}{}) != io.EOF {
+		err = errors.New("unexpected data after the JSON object")
+	}
+	if err != nil {
 		a.reply(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body: " + err.Error()})
 		return false
 	}
@@ -169,12 +191,16 @@ func (a *App) fail(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, flows.ErrNotFound), errors.Is(err, inventory.ErrUnknownSKU):
 		status = http.StatusNotFound
 	case errors.Is(err, flows.ErrNotActive), errors.Is(err, flows.ErrInstanceConflict),
-		errors.Is(err, inventory.ErrOutOfStock):
+		errors.Is(err, inventory.ErrOutOfStock), errors.Is(err, orders.ErrOrderConflict),
+		errors.Is(err, inventory.ErrRequestConflict):
 		status = http.StatusConflict
 	}
+	msg := err.Error()
 	if status == http.StatusInternalServerError {
+		// Details go to the log, not to the client.
 		a.log.LogAttrs(r.Context(), slog.LevelError, "modulith: request failed",
 			slog.String("path", r.URL.Path), slog.Any("error", err))
+		msg = "internal error"
 	}
-	a.reply(w, status, map[string]string{"error": err.Error()})
+	a.reply(w, status, map[string]string{"error": msg})
 }

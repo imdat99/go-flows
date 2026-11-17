@@ -22,32 +22,51 @@ import (
 	"github.com/imdat99/go-flows/internal/testdb"
 )
 
-// activityLog records the activities (and compensators) an engine ran.
-type activityLog struct {
-	mu    sync.Mutex
-	names map[string]bool
+// engineLog records the activities (and compensators) an engine ran, and
+// the workflows whose end it recorded (the engine that runs the last task).
+type engineLog struct {
+	mu         sync.Mutex
+	activities map[string]bool
+	workflows  map[string]bool
 }
 
-func (l *activityLog) ActivityAttempt(a flows.ActivityAttempt) {
+func (l *engineLog) ActivityAttempt(a flows.ActivityAttempt) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.names == nil {
-		l.names = map[string]bool{}
+	if l.activities == nil {
+		l.activities = map[string]bool{}
 	}
-	l.names[a.Activity] = true
+	l.activities[a.Activity] = true
 }
 
-func (*activityLog) RunEnded(flows.RunInfo) {}
-
-func (l *activityLog) list() []string {
+func (l *engineLog) RunEnded(r flows.RunInfo) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	out := make([]string, 0, len(l.names))
-	for n := range l.names {
+	if l.workflows == nil {
+		l.workflows = map[string]bool{}
+	}
+	l.workflows[r.Workflow] = true
+}
+
+func sorted(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for n := range m {
 		out = append(out, n)
 	}
 	slices.Sort(out)
 	return out
+}
+
+func (l *engineLog) list() (activities, workflows []string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return sorted(l.activities), sorted(l.workflows)
+}
+
+// frontModule reports whether name (an activity or a workflow) belongs to a
+// module of the front deployment.
+func frontModule(name string) bool {
+	return strings.HasPrefix(name, "orders.") || strings.HasPrefix(name, "notifications.")
 }
 
 func startApp(t *testing.T, pool *pgxpool.Pool, cfg Config) *App {
@@ -120,7 +139,7 @@ func TestSplitDeployment(t *testing.T) {
 
 	// Logs are discarded: the engines may log after the test has ended.
 	quiet := slog.New(slog.DiscardHandler)
-	var frontLog, backLog activityLog
+	var frontLog, backLog engineLog
 	front := startApp(t, pool, Config{
 		Modules: []string{"orders", "notifications"}, EngineID: "front", Observer: &frontLog, Logger: quiet,
 	})
@@ -135,24 +154,60 @@ func TestSplitDeployment(t *testing.T) {
 	if code != http.StatusOK || stock.Available != 10 {
 		t.Fatalf("adjust: %d %+v", code, stock)
 	}
+	// The same request again: applied once. The same id with another delta:
+	// refused. Unknown fields: refused.
+	code = call(t, s.api, "POST", "/inventory/sku-t/adjust",
+		adjustRequest{RequestID: "seed-1", Delta: 10, Reason: "receipt"}, &stock)
+	if code != http.StatusOK || stock.Available != 10 {
+		t.Fatalf("adjust again: %d %+v", code, stock)
+	}
+	code = call(t, s.api, "POST", "/inventory/sku-t/adjust",
+		adjustRequest{RequestID: "seed-1", Delta: 11, Reason: "receipt"}, nil)
+	if code != http.StatusConflict {
+		t.Fatalf("adjust with a reused request id: %d, want 409", code)
+	}
+	code = call(t, s.api, "POST", "/inventory/sku-t/adjust", map[string]any{"request_id": "x", "delta": 1, "oops": 1}, nil)
+	if code != http.StatusBadRequest {
+		t.Fatalf("unknown field: %d, want 400", code)
+	}
 
 	t.Run("shipped", s.shipped)
 	t.Run("canceled", s.canceled)
 	t.Run("out of stock", s.outOfStock)
+	t.Run("cancel after pickup", s.cancelAfterPickup)
 
-	// The split held: each engine ran only its modules' activities.
-	for _, n := range frontLog.list() {
-		if !strings.HasPrefix(n, "orders.") && !strings.HasPrefix(n, "notifications.") {
+	// The split held: each engine ran only its modules' activities and
+	// recorded the ends of its modules' workflows.
+	frontActs, frontWfs := frontLog.list()
+	backActs, backWfs := backLog.list()
+	for _, n := range slices.Concat(frontActs, frontWfs) {
+		if !frontModule(n) {
 			t.Errorf("front ran %s", n)
 		}
 	}
-	for _, n := range backLog.list() {
-		if strings.HasPrefix(n, "orders.") || strings.HasPrefix(n, "notifications.") {
+	for _, n := range slices.Concat(backActs, backWfs) {
+		if frontModule(n) {
 			t.Errorf("back ran %s", n)
 		}
 	}
-	if !slices.Contains(backLog.list(), "payments.capture") || !slices.Contains(frontLog.list(), "notifications.deliver") {
-		t.Errorf("front ran %v, back ran %v", frontLog.list(), backLog.list())
+	for _, want := range []struct {
+		got  []string
+		name string
+	}{
+		{backActs, "payments.capture"},
+		{backActs, "inventory.reserve-line"},
+		{backActs, "shipping.create-label"},
+		{backWfs, "inventory.reserve"},
+		{backWfs, "shipping.ship"},
+		{backWfs, "inventory.adjust"},
+		{frontActs, "notifications.deliver"},
+		{frontActs, "orders.forward-cancel"},
+		{frontWfs, "orders.fulfil"},
+		{frontWfs, "notifications.send"},
+	} {
+		if !slices.Contains(want.got, want.name) {
+			t.Errorf("%s did not run where expected: front %v %v, back %v %v", want.name, frontActs, frontWfs, backActs, backWfs)
+		}
 	}
 }
 
@@ -214,8 +269,13 @@ func (s split) shipped(t *testing.T) {
 	}
 	s.sent(t, "o-ship", "order_completed")
 
-	// Placing it again is a no-op; canceling it now is refused.
+	// Placing it again is a no-op, other contents under its id are refused,
+	// canceling it now is refused.
 	s.place(t, "o-ship", 2)
+	other := orders.PlaceRequest{ID: "o-ship", Email: "x@example.com", Address: "Hue", Amount: 1, Lines: []orders.Line{{SKU: "sku-t", Qty: 1}}}
+	if code := call(t, s.api, "POST", "/orders", other, nil); code != http.StatusConflict {
+		t.Fatalf("place other contents: %d, want 409", code)
+	}
 	code = call(t, s.api, "POST", "/orders/o-ship/cancel", orders.CancelRequest{Reason: "late"}, nil)
 	if code != http.StatusConflict {
 		t.Fatalf("cancel after the end: %d, want 409", code)
@@ -252,4 +312,28 @@ func (s split) outOfStock(t *testing.T) {
 		t.Fatalf("order %+v", v)
 	}
 	s.sent(t, "o-big", "order_failed")
+}
+
+// The carrier confirms the pickup, then the customer cancels at once: the
+// pickup reached the shipment first, so the order completes, captured.
+func (s split) cancelAfterPickup(t *testing.T) {
+	s.place(t, "o-race", 1)
+	eventually(t, "the label", func() bool { return s.view(t, "o-race").Shipment == "label_created" })
+	if code := call(t, s.api, "POST", "/shipments/o-race/pickup", shipping.Pickup{Tracking: "TRK2"}, nil); code != http.StatusAccepted {
+		t.Fatalf("pickup: %d", code)
+	}
+	// 202 (the order still runs: the cancel is forwarded and refused) or
+	// 409 (it has completed already).
+	code := call(t, s.api, "POST", "/orders/o-race/cancel", orders.CancelRequest{Reason: "too late"}, nil)
+	if code != http.StatusAccepted && code != http.StatusConflict {
+		t.Fatalf("cancel: %d", code)
+	}
+	eventually(t, "the end", func() bool { return s.view(t, "o-race").State != "processing" })
+	if v := s.view(t, "o-race"); v.State != "completed" || v.Payment != "captured" || v.Shipment != "picked_up" {
+		t.Fatalf("order %+v, want completed and captured", v)
+	}
+	if n := s.level(t); n != 7 {
+		t.Fatalf("stock %d, want 7", n)
+	}
+	s.sent(t, "o-race", "order_completed")
 }

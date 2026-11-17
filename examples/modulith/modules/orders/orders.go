@@ -16,6 +16,7 @@ package orders
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -41,18 +42,26 @@ var ErrCanceledByCustomer = errors.New("orders: canceled by the customer")
 // ErrInvalidOrder is the error of Place for an order it refuses.
 var ErrInvalidOrder = errors.New("orders: invalid order")
 
+// ErrOrderConflict is the error of an order id already used for an order
+// with other contents.
+var ErrOrderConflict = errors.New("orders: order id already used")
+
 // kindCanceledByCustomer is the stored kind of ErrCanceledByCustomer; the
 // hook reads it from RunInfo.ErrorKinds.
 const kindCanceledByCustomer = "orders_canceled_by_customer"
 
 func init() {
 	flows.RegisterErrorKind(kindCanceledByCustomer, ErrCanceledByCustomer)
+	flows.RegisterErrorKind("orders_order_conflict", ErrOrderConflict)
 }
 
 // Config holds the module's dependencies and settings.
 type Config struct {
 	DB     *pgxpool.Pool
 	Logger *slog.Logger
+	// Engine is used by the activity that forwards a cancel to the
+	// shipment (any engine on the database works).
+	Engine *flows.Engine
 	// PickupWithin is how long an order waits for the carrier (default
 	// 48h). Place copies it into the workflow's input.
 	PickupWithin time.Duration
@@ -62,11 +71,18 @@ var cfg = deps.New[Config]("orders")
 
 // Configure sets the module's dependencies. Call it before the engine
 // starts, in every process that runs the module or calls its functions.
-func Configure(c Config) {
+func Configure(c Config) error {
+	if c.DB == nil || c.Engine == nil {
+		return errors.New("orders: Configure: DB and Engine are required")
+	}
+	if c.Logger == nil {
+		c.Logger = slog.Default()
+	}
 	if c.PickupWithin <= 0 {
 		c.PickupWithin = 48 * time.Hour
 	}
 	cfg.Set(c)
+	return nil
 }
 
 //go:embed migrations/*.sql
@@ -85,7 +101,7 @@ type Line struct {
 
 // PlaceRequest is an order as the API takes it.
 type PlaceRequest struct {
-	ID      string `json:"id"` // the client's order id: placing it again is a no-op
+	ID      string `json:"id"` // the client's order id: the idempotency key
 	Email   string `json:"email"`
 	Address string `json:"address"`
 	Amount  int64  `json:"amount"` // cents
@@ -114,7 +130,14 @@ type View struct {
 func InstanceID(orderID string) string { return "orders-" + orderID }
 
 // Place starts the fulfilment of an order. The order id is the idempotency
-// key: placing the same id again starts nothing.
+// key: placing the same order again starts nothing, placing other contents
+// under a used id fails with ErrOrderConflict.
+//
+// The engine's own idempotency (Start returns the existing execution) lasts
+// only until retention purges the execution, so Place checks the orders
+// table first, which keeps orders for good. Two different orders racing
+// for a new id both get nil here; the second one's contents are dropped
+// (its Start finds the first execution).
 func Place(ctx context.Context, e *flows.Engine, r PlaceRequest) error {
 	c, err := cfg.Get()
 	if err != nil {
@@ -122,6 +145,22 @@ func Place(ctx context.Context, e *flows.Engine, r PlaceRequest) error {
 	}
 	if err := validate(r); err != nil {
 		return err
+	}
+	lines, err := json.Marshal(r.Lines)
+	if err != nil {
+		return fmt.Errorf("place %s: %w", r.ID, err)
+	}
+	var same bool
+	err = c.DB.QueryRow(ctx, `
+		SELECT email = $2 AND address = $3 AND amount = $4 AND lines = $5::jsonb
+		FROM orders.orders WHERE id = $1`, r.ID, r.Email, r.Address, r.Amount, lines).Scan(&same)
+	switch {
+	case err == nil && same:
+		return nil // placed already
+	case err == nil:
+		return fmt.Errorf("%w: %s", ErrOrderConflict, r.ID)
+	case !errors.Is(err, pgx.ErrNoRows):
+		return fmt.Errorf("place %s: %w", r.ID, err)
 	}
 	_, err = fulfil.Start(ctx, e, InstanceID(r.ID), Order{
 		ID: r.ID, Email: r.Email, Address: r.Address, Amount: r.Amount, Lines: r.Lines,
@@ -153,8 +192,11 @@ func validate(r PlaceRequest) error {
 }
 
 // Cancel asks for the cancellation of an order. It is honored until the
-// carrier picks the parcel up; after that the order completes anyway. It
-// fails with flows.ErrNotActive once the order has ended.
+// carrier picks the parcel up; after that the order completes anyway (the
+// fulfilment forwards the cancel to the shipment, which decides). It fails
+// with flows.ErrNotActive once the order has ended. Use it, not
+// Engine.Cancel, for customers: Engine.Cancel is an operator's tool that
+// cancels the shipment without waiting for its outcome.
 func Cancel(ctx context.Context, e *flows.Engine, orderID, reason string) error {
 	return e.Signal(ctx, InstanceID(orderID), SignalCancel, CancelRequest{Reason: reason})
 }

@@ -15,6 +15,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -41,8 +42,17 @@ type Config struct {
 var cfg = deps.New[Config]("notifications")
 
 // Configure sets the module's dependencies. Call it before the engine
-// starts, in every process that runs the module.
-func Configure(c Config) { cfg.Set(c) }
+// starts, in every process that runs the module or calls its functions.
+func Configure(c Config) error {
+	if c.DB == nil {
+		return errors.New("notifications: Configure: DB is required")
+	}
+	if c.Logger == nil {
+		c.Logger = slog.Default()
+	}
+	cfg.Set(c)
+	return nil
+}
 
 //go:embed migrations/*.sql
 var migrations embed.FS

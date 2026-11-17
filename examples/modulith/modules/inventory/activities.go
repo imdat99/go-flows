@@ -23,9 +23,10 @@ type LineRequest struct {
 
 // Adjustment is the input of the adjust workflow and its activity.
 type Adjustment struct {
-	SKU    string `json:"sku"`
-	Delta  int    `json:"delta"`
-	Reason string `json:"reason"`
+	RequestID string `json:"request_id"`
+	SKU       string `json:"sku"`
+	Delta     int    `json:"delta"`
+	Reason    string `json:"reason"`
 }
 
 // PurchaseOrder is the input of placePurchaseOrder.
@@ -197,8 +198,11 @@ func applyAdjustmentFn(ctx context.Context, k flows.Key, a Adjustment) (int, str
 			if err != nil {
 				return 0, err
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO inventory.adjustments (sku, delta, reason) VALUES ($1, $2, $3)`,
-				a.SKU, a.Delta, a.Reason); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO inventory.adjustments (request_id, sku, delta, reason) VALUES ($1, $2, $3, $4)`,
+				a.RequestID, a.SKU, a.Delta, a.Reason); err != nil {
+				if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation: the request id was used
+					return 0, flows.Permanent(fmt.Errorf("%w: %s", ErrRequestConflict, a.RequestID))
+				}
 				return 0, err
 			}
 			c.Logger.LogAttrs(ctx, slog.LevelInfo, "inventory: adjusted",

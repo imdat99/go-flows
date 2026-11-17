@@ -57,8 +57,18 @@ type Config struct {
 var cfg = deps.New[Config]("payments")
 
 // Configure sets the module's dependencies. Call it before the engine
-// starts, in every process that runs the module's activities.
-func Configure(c Config) { cfg.Set(c) }
+// starts, in every process that runs the module or calls its functions
+// (Find).
+func Configure(c Config) error {
+	if c.DB == nil {
+		return errors.New("payments: Configure: DB is required")
+	}
+	if c.Logger == nil {
+		c.Logger = slog.Default()
+	}
+	cfg.Set(c)
+	return nil
+}
 
 //go:embed migrations/*.sql
 var migrations embed.FS
@@ -135,10 +145,18 @@ func authorize(ctx context.Context, k flows.Key, r AuthorizeRequest) (Authorizat
 	return Authorization{PaymentID: id}, id, nil
 }
 
-// void undoes Authorize. It works by key, so it needs no compensation data
-// and also handles an uncertain authorization (one that timed out, maybe
-// after it landed): if no row exists yet it writes a voided tombstone, and
-// a late attempt then fails with errFenced instead of holding money.
+// void undoes Authorize, and with it everything the authorization allowed.
+// It works by key, so it needs no compensation data and also handles an
+// uncertain authorization (one that timed out, maybe after it landed): if
+// no row exists yet it writes a voided tombstone, and a late attempt then
+// fails with errFenced instead of holding money.
+//
+// It also refunds a captured payment. Compensators run latest first, so
+// refund (the capture's undo) ran before; but when the capture was
+// uncertain, refund found nothing, and a capture attempt still running
+// elsewhere (it outlived its lease) can commit after refund. void closes
+// that window: it refunds such a capture, and once the row is voided or
+// refunded a later capture attempt finds it not authorized and fails.
 func void(ctx context.Context, k flows.Key, paymentID string) error {
 	c, err := cfg.Get()
 	if err != nil {
@@ -146,8 +164,9 @@ func void(ctx context.Context, k flows.Key, paymentID string) error {
 	}
 	tag, err := c.DB.Exec(ctx, `
 		INSERT INTO payments.payments (auth_key, state) VALUES ($1, 'voided')
-		ON CONFLICT (auth_key) DO UPDATE SET state = 'voided', updated_at = now()
-		WHERE payments.state = 'authorized'`, string(k))
+		ON CONFLICT (auth_key) DO UPDATE
+		SET state = CASE payments.state WHEN 'captured' THEN 'refunded' ELSE 'voided' END, updated_at = now()
+		WHERE payments.state IN ('authorized', 'captured')`, string(k))
 	if err != nil {
 		return fmt.Errorf("void %s: %w", paymentID, err)
 	}
@@ -188,8 +207,9 @@ func capture(ctx context.Context, k flows.Key, paymentID string) (string, string
 }
 
 // refund undoes Capture, by key: nothing to do if the capture never landed
-// (uncertain), and a late capture cannot land afterwards, because void, the
-// next compensator, moves the payment out of authorized.
+// (uncertain). A late capture landing after it is refunded by void, the
+// authorization's compensator, which always runs after it (latest first);
+// after void, a capture finds the payment voided or refunded and fails.
 func refund(ctx context.Context, k flows.Key, paymentID string) error {
 	c, err := cfg.Get()
 	if err != nil {

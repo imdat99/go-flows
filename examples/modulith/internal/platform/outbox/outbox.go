@@ -143,7 +143,14 @@ func (r *Relay) batch(ctx context.Context, n int) (int, error) {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	// An event is skipped while an earlier unsent event of its key exists:
-	// per-key order.
+	// per-key order, by id. Limit: ids come from a sequence, taken at insert
+	// time, not at commit. Two transactions staging events of one key at
+	// the same time can commit in the other order, and the relay may then
+	// publish the later id before the earlier one is visible. Here each key
+	// (an order) gets one event, from the transaction that ends its
+	// workflow, so it cannot happen. A producer that stages several events
+	// of a key concurrently must serialize them (lock a row of the key in
+	// the staging transaction) or give consumers a version to reorder by.
 	rows, err := tx.Query(ctx, `
 		SELECT id, event_id::text, topic, key, payload, attempts
 		FROM outbox.events e

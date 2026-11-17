@@ -47,7 +47,7 @@ nó; mọi thứ khác, kể cả các bảng, là riêng tư.
 | orders | `orders` | `orders` | `Place`, `Cancel`, `Get`, `Hook`, event `TopicCompleted`/`TopicCanceled`/`TopicFailed` + `Event` |
 | payments | `payments` | `payments` | activity `Authorize`, `Capture`; `Find`, `ErrDeclined` |
 | inventory | `inventory` | `inventory` | workflow `Reserve` (+ `ReserveID`), `Adjust`, `Level`, `StartReplenishment`, `StopReplenishment` |
-| shipping | `shipping` | `shipping` | workflow `Ship` (+ `InstanceID`), `ConfirmPickup`, `Find`, `ErrPickupTimeout` |
+| shipping | `shipping` | `shipping` | workflow `Ship` (+ `InstanceID`), `ConfirmPickup`, `Cancel`, `Find`, `ErrPickupTimeout`, `ErrCanceled` |
 | notifications | `notifications` | `notifications` | `Subscribe`, `Sent` |
 
 Module nào cũng export thêm `Queue`, `Configure` và `Migrate`.
@@ -61,8 +61,9 @@ HTTP POST /orders ──> orders.Place ──> workflow orders.fulfil (queue ord
    3. inventory.Reserve            child         inventory      hoàn tác: release (từng dòng)
    4. payments.Capture             activity      payments       hoàn tác: refund
    5. shipping.Ship                child         shipping       hoàn tác: huỷ nhãn
-        tạo nhãn, rồi Await(shipping.picked-up, PickupWithin)
-        Select { giao hàng xong | signal orders.cancel }
+        tạo nhãn, rồi Select { signal picked-up | signal shipping.cancel | timer PickupWithin }
+      đơn hàng: Select { giao hàng xong | signal orders.cancel -> chuyển tiếp cho shipment }
+                rồi chờ kết quả thật của shipment
  kết thúc ──> RunHook (cùng transaction): orders.orders.state + event outbox
           ──> relay ──> bus ──> consumer notifications ──> workflow notifications.send
 ```
@@ -74,12 +75,25 @@ HTTP POST /orders ──> orders.Place ──> workflow orders.fulfil (queue ord
   chạy trên queue của module nó, tức là trên các process chạy module đó.
   Không cần đến hàm `fulfil`.
 - **Điểm không quay lại (pivot).** Khi hãng đã nhận hàng thì không hoàn
-  tác gì nữa: `MarkPickedUp` không có compensator, và lệnh huỷ đến sau lúc
-  nhận hàng bị bỏ qua. Khi đơn đã kết thúc, `orders.Cancel` trả về
-  `ErrNotActive` (HTTP 409).
-- **Signal huỷ không bao giờ mất.** Gửi trong bước 1 đến 4 thì nó chờ
-  trong channel; workflow kiểm tra trước khi capture và lần nữa khi chờ
-  hãng vận chuyển.
+  tác gì nữa: `MarkPickedUp` không có compensator và chạy trên
+  `flows.Disconnected`, nên không gì huỷ được nó. Khi đơn đã kết thúc,
+  `orders.Cancel` trả về `ErrNotActive` (HTTP 409).
+- **Ai quyết định việc huỷ.** `orders.Cancel` gửi signal cho đơn hàng.
+  Gửi trong bước 1 đến 4 thì signal chờ trong channel và đơn tự dừng trước
+  khi capture hoặc trước khi khởi shipment. Trong bước 5 chỉ shipment biết
+  việc lấy hàng có đến trước hay không, nên đơn không huỷ child (trong
+  go-flows, huỷ một child làm future của nó trả về `ErrCanceled` ngay,
+  không có kết quả thật). Đơn chuyển tiếp lệnh huỷ cho shipment (một
+  activity gọi `shipping.Cancel`, vì workflow không gửi signal cho workflow
+  khác được) và chờ kết quả của shipment: bị huỷ thì đơn được hoàn tác;
+  đã lấy hàng thì đơn hoàn tất và lệnh huỷ bị bỏ qua. Khi cả hai signal
+  cùng đang chờ, shipment chọn việc lấy hàng. Test:
+  `TestFulfilCancelAfterPickup`, `TestFulfilCancelBeforeShipping`,
+  `TestShipPickupBeatsCancel`, và trường hợp "cancel after pickup" của
+  test tích hợp.
+- **`Engine.Cancel` là công cụ của người vận hành, không phải lệnh huỷ
+  của khách.** Nó huỷ context của đơn, kéo theo context của shipment, mà
+  không chờ kết quả của shipment.
 
 Các tính năng khác, nằm ở đâu:
 
@@ -88,8 +102,8 @@ Các tính năng khác, nằm ở đâu:
 | Activity có compensator, idempotent theo `flows.Key` (cột key unique, fence bằng tombstone) | `payments/payments.go`, `shipping/shipping.go` |
 | Hiệu ứng đúng một lần với `idem.Do`, hoàn tác không chắc chắn với `idem.Abort` | `inventory/activities.go` |
 | Child workflow giữa các module, được compensate bằng cách mở lại | `orders/fulfil.go`, `inventory/workflows.go` (`Reserve`), `shipping/shipping.go` (`Ship`) |
-| Signal có timer timeout (`Await`) | `shipping/shipping.go` |
-| `Select` giữa child và signal, huỷ child (`WithCancel`) | `orders/fulfil.go` |
+| `Select` giữa hai signal và một timer timeout; một bước không huỷ được (`Disconnected`) | `shipping/shipping.go` |
+| `Select` giữa child và signal; chuyển tiếp signal cho child qua một activity | `orders/fulfil.go` |
 | Vòng lặp dài hạn với `ContinueAsNew` và signal dừng | `inventory/workflows.go` (`replenishCycle`) |
 | `flows.Lock` với `LockWait` trên khoá nghiệp vụ | `inventory/workflows.go` (`checkAndOrder`, `adjustStock`) |
 | RunHook cập nhật read model và đặt event trong transaction kết thúc | `orders/hook.go` |
@@ -163,9 +177,13 @@ ghi bởi engine chạy task cuối cùng.
 
 Activity ở cấp package nên không nhận tham số constructor. Mỗi module giữ
 dependency trong một `deps.Ref`, được `Configure` gán từ composition root
-trước khi engine chạy. Activity của module chưa được cấu hình sẽ fail vĩnh
-viễn với `deps.ErrNotConfigured`. Cấu hình mọi module trong mọi process:
-API Go của chúng cần điều đó kể cả ở nơi không phục vụ queue của chúng.
+trước khi engine chạy. `Configure` kiểm tra những gì nó nhận và `app.New`
+từ chối khởi động nếu có lỗi: lỗi nối dây hỏng ngay lúc khởi động.
+Activity vẫn chạy khi chưa cấu hình sẽ fail với `deps.ErrNotConfigured`,
+lỗi được retry chứ không vĩnh viễn: một replica cấu hình sai chỉ làm chậm
+việc, không làm fail (và compensate) đơn hàng thật. Cấu hình mọi module
+trong mọi process: API Go của chúng (`orders.Get`, `payments.Find`...)
+được HTTP API của process nào cũng dùng.
 
 ### Queue và tách deployment
 
@@ -218,8 +236,11 @@ var (
 2. Activity đổi kiểu input hoặc output thì lấy tên mới
    (`payments.capture.v2`); giữ định nghĩa cũ khi version 1 còn có thể gọi
    hoặc compensate nó.
-3. Retry policy, timeout và phần cài đặt activity (cùng kiểu, cùng ý
-   nghĩa) đổi thoải mái: chúng không nằm trong history.
+3. Timeout và phần cài đặt activity (cùng kiểu, cùng ý nghĩa) đổi thoải
+   mái: chúng không nằm trong history. Retry policy cũng vậy, trừ một
+   điểm: giới hạn số attempt của activity được ghi vào task khi nó được
+   lên lịch, nên giới hạn mới chỉ áp dụng cho activity lên lịch sau khi
+   deploy, không cho những activity đang chờ hay đang retry.
 4. Xoá version 1 khi không còn gì chạy nó:
 
    ```sql
@@ -242,7 +263,9 @@ var (
 - Cảnh báo khi có execution `needs_attention` (observer log ở mức error),
   khi số `compensating` tăng, và khi dòng outbox có `attempts` cao.
 - Job định kỳ trên một process: `engine.PurgeEnded`, `idem.Purge` cho
-  `inventory.processed_requests`, xoá dòng outbox đã gửi lâu.
+  `inventory.processed_requests`, xoá dòng outbox đã gửi lâu. Purge giải
+  phóng các instance id nó xoá: thứ gì phải giữ idempotent sau đó thì được
+  kiểm tra trong bảng của module (xem "Điểm vướng của API").
 - Giới hạn kích thước request ở API (`maxBody`): engine lưu input và
   signal nguyên như nhận.
 - Execution bị park: sửa nguyên nhân, rồi `engine.Resume` (code) hoặc
@@ -250,14 +273,66 @@ var (
 - Xem [docs/vi/van-hanh.md](../../docs/vi/van-hanh.md) về tinh chỉnh,
   pooler, autovacuum và sự cố.
 
-## Giới hạn của ví dụ
+## Điểm vướng của API và giới hạn đã biết
+
+Những gì go-flows làm khó ở đây, và cách ví dụ xoay xở:
+
+- **Không có "huỷ child và nhận kết quả thật của nó".** Huỷ context của
+  child làm future của nó trả về `ErrCanceled` ngay; child có thể vẫn đã
+  hoàn tất (ở đây: đã được lấy hàng). Gửi lệnh huỷ cho child dưới dạng
+  signal và để child quyết định (`orders/fulfil.go`).
+- **Không có signal từ workflow sang workflow.** Workflow không gọi được
+  `Engine.Signal`. Đơn hàng chuyển tiếp lệnh huỷ bằng một activity
+  (`orders.forward-cancel`), activity này cần một engine trong dependency
+  của module và chạy ít nhất một lần (shipment bỏ qua các bản lặp).
+- **Idempotency theo instance id hết hạn khi retention xoá.** `Start` với
+  id đã dùng chỉ trả về execution cũ cho đến khi `PurgeEnded` xoá nó; sau
+  đó cùng id sẽ khởi execution mới. Giữ idempotency lâu dài trong bảng
+  của module: `orders.Place` kiểm tra `orders.orders` (nội dung khác dưới
+  id đã dùng: `ErrOrderConflict`, 409), `inventory.Adjust` kiểm tra
+  `inventory.adjustments.request_id` (`ErrRequestConflict`), và SKU ngừng
+  kinh doanh là một cột, nên vòng bổ sung hàng của nó không bị khởi lại
+  sau purge. Hai đơn khác nhau tranh cùng một id mới đều nhận 202; nội
+  dung của đơn thứ hai bị bỏ.
+- **`idem.CreateTable` không hợp với migration SQL.** Nó chạy DDL ngoài
+  goose và lock của goose (`CREATE TABLE` đồng thời có thể lỗi trên
+  `pg_type`). Module inventory tạo bảng trong migration đầu tiên:
+
+  ```sql
+  CREATE TABLE inventory.processed_requests (
+  	key        text PRIMARY KEY,
+  	result     jsonb,
+  	aborted    boolean NOT NULL DEFAULT false,
+  	created_at timestamptz NOT NULL DEFAULT now()
+  );
+  CREATE INDEX processed_requests_created_idx ON inventory.processed_requests (created_at);
+  ```
+
+- **Định nghĩa là toàn cục.** Activity không nhận dependency được
+  (`deps.Ref`), và hai engine trong một process dùng chung chúng.
+- **flowtest không mock được child workflow.** Test `orders.fulfil` phải
+  mock activity của child inventory và shipping, nên các module đó export
+  chúng chỉ vì lý do này.
+- **`Workflow.Start` không tham gia transaction của bên gọi được.** Dòng
+  đơn hàng được activity đầu tiên của workflow ghi, không phải `Place`.
+- **Mỗi engine một `RunHook`, và `RunInfo` không có input hay output.**
+  Composition root nối hook của các module; hook của orders đọc bảng của
+  nó, và nhận ra lệnh huỷ của khách bằng cách tách `RunInfo.ErrorKinds`.
+- **Signal gửi trước khi instance tồn tại sẽ lỗi** (`ErrNotFound`): xác
+  nhận lấy hàng đến trước khi shipment khởi động nhận 404, webhook của
+  hãng phải retry. Xác nhận sau khi shipment đã kết thúc nhận 409 (hàng
+  phải được trả lại).
+- **Thứ tự outbox theo sequence, không theo commit.** Xem
+  `internal/platform/outbox`: ổn với một event mỗi key mỗi transaction,
+  không ổn với nhiều producer đồng thời cho cùng một key.
+
+Giới hạn của chính ví dụ:
 
 - Gateway, hãng vận chuyển, nhà cung cấp và mail server là bản giả nằm
   trong bảng của chính module.
-- Xác nhận lấy hàng đến trước khi workflow shipping tồn tại sẽ nhận 404:
-  webhook handler thật nên retry, hoặc lưu lại để workflow đọc.
 - Test tích hợp chạy cả hai deployment trong một process nên `Configure`
   của module dùng chung; điều nó chứng minh là việc tách queue (mỗi engine
-  chỉ chạy activity của module mình).
-- Test tích hợp import `internal/testdb` của repository này; bản chép
-  blueprint cần helper database test riêng.
+  chỉ chạy activity của module mình và ghi kết thúc của workflow thuộc
+  module mình).
+- Test import `internal/testdb` của repository này; bản chép blueprint cần
+  helper database test riêng.

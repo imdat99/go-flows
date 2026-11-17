@@ -48,7 +48,7 @@ everything else, its tables included, is private.
 | orders | `orders` | `orders` | `Place`, `Cancel`, `Get`, `Hook`, events `TopicCompleted`/`TopicCanceled`/`TopicFailed` + `Event` |
 | payments | `payments` | `payments` | activities `Authorize`, `Capture`; `Find`, `ErrDeclined` |
 | inventory | `inventory` | `inventory` | workflow `Reserve` (+ `ReserveID`), `Adjust`, `Level`, `StartReplenishment`, `StopReplenishment` |
-| shipping | `shipping` | `shipping` | workflow `Ship` (+ `InstanceID`), `ConfirmPickup`, `Find`, `ErrPickupTimeout` |
+| shipping | `shipping` | `shipping` | workflow `Ship` (+ `InstanceID`), `ConfirmPickup`, `Cancel`, `Find`, `ErrPickupTimeout`, `ErrCanceled` |
 | notifications | `notifications` | `notifications` | `Subscribe`, `Sent` |
 
 Every module also exports `Queue`, `Configure` and `Migrate`.
@@ -62,8 +62,9 @@ HTTP POST /orders ──> orders.Place ──> workflow orders.fulfil (queue ord
    3. inventory.Reserve            child         inventory      undo: release (per line)
    4. payments.Capture             activity      payments       undo: refund
    5. shipping.Ship                child         shipping       undo: cancel label
-        label, then Await(shipping.picked-up, PickupWithin)
-        Select { shipment done | signal orders.cancel }
+        label, then Select { signal picked-up | signal shipping.cancel | timer PickupWithin }
+      the order: Select { shipment done | signal orders.cancel -> forward to the shipment }
+                 then wait for the shipment's real outcome
  end ──> RunHook (same transaction): orders.orders.state + outbox event
      ──> relay ──> bus ──> notifications consumer ──> workflow notifications.send
 ```
@@ -75,12 +76,25 @@ HTTP POST /orders ──> orders.Place ──> workflow orders.fulfil (queue ord
   authorization. Each compensator runs on its module's queue, so on the
   processes running that module. Nothing needs the `fulfil` function.
 - **The pivot.** Once the carrier has the parcel, nothing is undone:
-  `MarkPickedUp` has no compensator, and a cancel arriving after the
-  pickup is ignored. Once the order has ended, `orders.Cancel` returns
+  `MarkPickedUp` has no compensator and runs on `flows.Disconnected`, so
+  nothing cancels it. Once the order has ended, `orders.Cancel` returns
   `ErrNotActive` (HTTP 409).
-- **A cancel signal is never lost.** Sent during steps 1 to 4, it waits in
-  the channel; the workflow checks it before capturing and again while it
-  waits for the carrier.
+- **Who decides on a cancel.** `orders.Cancel` signals the order. Sent
+  during steps 1 to 4, the signal waits in the channel and the order stops
+  itself before the capture or before starting the shipment. During step 5
+  only the shipment knows whether the pickup came first, so the order does
+  not cancel the child (in go-flows, canceling a child resolves its future
+  at once with `ErrCanceled`, without its real outcome). It forwards the
+  cancel to the shipment (an activity calling `shipping.Cancel`, because a
+  workflow cannot signal another one) and waits for the shipment's
+  outcome: canceled, the order is undone; picked up, the order completes
+  and the cancel is ignored. When both signals are waiting, the shipment
+  takes the pickup. Tests: `TestFulfilCancelAfterPickup`,
+  `TestFulfilCancelBeforeShipping`, `TestShipPickupBeatsCancel`, and the
+  "cancel after pickup" case of the integration test.
+- **`Engine.Cancel` is an operator's tool, not a customer cancel.** It
+  cancels the order's context, and with it the shipment's, without
+  waiting for the shipment's outcome.
 
 Other features, where to find them:
 
@@ -89,8 +103,8 @@ Other features, where to find them:
 | Activities with compensators, idempotent by `flows.Key` (unique key column, tombstone fencing) | `payments/payments.go`, `shipping/shipping.go` |
 | Exactly-once effects with `idem.Do`, uncertain undo with `idem.Abort` | `inventory/activities.go` |
 | Child workflows across modules, compensated by reopening | `orders/fulfil.go`, `inventory/workflows.go` (`Reserve`), `shipping/shipping.go` (`Ship`) |
-| Signal with a timeout timer (`Await`) | `shipping/shipping.go` |
-| `Select` over a child and a signal, cancelling the child (`WithCancel`) | `orders/fulfil.go` |
+| `Select` over two signals and a timeout timer; a step that cannot be canceled (`Disconnected`) | `shipping/shipping.go` |
+| `Select` over a child and a signal; forwarding a signal to a child through an activity | `orders/fulfil.go` |
 | Long-running loop with `ContinueAsNew` and a stop signal | `inventory/workflows.go` (`replenishCycle`) |
 | `flows.Lock` with `LockWait` on a business key | `inventory/workflows.go` (`checkAndOrder`, `adjustStock`) |
 | RunHook updating a read model and staging an event in the end's transaction | `orders/hook.go` |
@@ -164,10 +178,14 @@ recorded by whichever engine runs the last task.
 
 Activities are package-level, so they cannot take constructor arguments.
 Each module keeps its dependencies in a `deps.Ref`, set by `Configure`
-from the composition root before the engine starts. An activity of a
-module that was not configured fails permanently with
-`deps.ErrNotConfigured`. Configure every module in every process: their
-Go APIs need it even where their queues are not served.
+from the composition root before the engine starts. `Configure` checks
+what it is given and `app.New` refuses to start on an error: a wiring
+mistake fails at startup. An activity that still runs unconfigured fails
+with `deps.ErrNotConfigured`, which is retried, not permanent: a
+misconfigured replica delays work instead of failing (and compensating)
+real orders. Configure every module in every process: their Go APIs
+(`orders.Get`, `payments.Find`...) are used by the HTTP API of any
+process.
 
 ### Queues and splitting the deployment
 
@@ -222,8 +240,11 @@ var (
 2. An activity whose input or output type changes gets a new name
    (`payments.capture.v2`); keep the old definition while version 1 can
    still call or compensate it.
-3. Retry policies, timeouts, and activity implementations (same types,
-   same meaning) can change freely: they are not in the history.
+3. Timeouts and activity implementations (same types, same meaning) can
+   change freely: they are not in the history. Retry policies too, with
+   one catch: the attempt limit of an activity is recorded on its task
+   when it is scheduled, so a new limit applies to activities scheduled
+   after the deploy, not to those already waiting or retrying.
 4. Remove version 1 once nothing runs it:
 
    ```sql
@@ -247,7 +268,9 @@ var (
   level), on a growing number of `compensating` ones, and on outbox rows
   with high `attempts`.
 - Periodic jobs on one process: `engine.PurgeEnded`, `idem.Purge` for
-  `inventory.processed_requests`, deletion of old sent outbox rows.
+  `inventory.processed_requests`, deletion of old sent outbox rows. A
+  purge frees the instance ids it deletes: whatever must stay idempotent
+  after it is checked in the module's tables (see "API friction").
 - Bound request sizes at the API (`maxBody`): the engine stores inputs and
   signals as given.
 - A parked execution: fix the cause, then `engine.Resume` (code) or
@@ -255,15 +278,66 @@ var (
 - See [docs/operations.md](../../docs/operations.md) for tuning, poolers,
   autovacuum and incidents.
 
-## Limits of the example
+## API friction and known limits
+
+What go-flows made hard here, and how the example works around it:
+
+- **No "cancel a child and get its real outcome".** Canceling a child's
+  context resolves its future at once with `ErrCanceled`; the child may
+  still have completed (here: been picked up). Route the cancel to the
+  child as a signal and let it decide (`orders/fulfil.go`).
+- **No workflow-to-workflow signal.** A workflow cannot call
+  `Engine.Signal`. The order forwards a cancel with an activity
+  (`orders.forward-cancel`), which needs an engine in the module's
+  dependencies and runs at least once (the shipment ignores repeats).
+- **Instance-id idempotency ends at retention.** `Start` with a used id
+  returns the existing execution only until `PurgeEnded` deletes it; then
+  the same id starts a new execution. Keep idempotency that must last in
+  the module's tables: `orders.Place` checks `orders.orders` (other
+  contents under a used id: `ErrOrderConflict`, 409), `inventory.Adjust`
+  checks `inventory.adjustments.request_id` (`ErrRequestConflict`), and a
+  discontinued SKU is a column, so its replenishment loop is not started
+  again after a purge. Two different orders racing for a new id both get
+  202; the second one's contents are dropped.
+- **`idem.CreateTable` does not fit SQL migrations.** It runs DDL outside
+  goose and its lock (concurrent `CREATE TABLE` can fail on `pg_type`).
+  The inventory module creates the table in its first migration instead:
+
+  ```sql
+  CREATE TABLE inventory.processed_requests (
+  	key        text PRIMARY KEY,
+  	result     jsonb,
+  	aborted    boolean NOT NULL DEFAULT false,
+  	created_at timestamptz NOT NULL DEFAULT now()
+  );
+  CREATE INDEX processed_requests_created_idx ON inventory.processed_requests (created_at);
+  ```
+
+- **Definitions are global.** Activities cannot take dependencies
+  (`deps.Ref`), and two engines in one process share them.
+- **flowtest cannot mock a child workflow.** Testing `orders.fulfil`
+  means mocking the activities of the inventory and shipping children,
+  which those modules export for that reason only.
+- **`Workflow.Start` cannot join the caller's transaction.** The order
+  row is recorded by the workflow's first activity, not by `Place`.
+- **One `RunHook` per engine, and `RunInfo` has no input or output.** The
+  composition root chains the modules' hooks; the orders hook reads its
+  table, and tells a customer cancel by parsing `RunInfo.ErrorKinds`.
+- **A signal before the instance exists fails** (`ErrNotFound`): a pickup
+  confirmation that arrives before the shipment starts gets 404, and the
+  carrier's webhook must retry. A pickup after the shipment ended gets
+  409 (the parcel must go back).
+- **Outbox order is by sequence, not commit.** See
+  `internal/platform/outbox`: fine for one event per key per
+  transaction, not for concurrent producers of one key.
+
+Limits of the example itself:
 
 - The gateway, carrier, supplier and mail server are stubs in the modules'
   own tables.
-- A pickup confirmation arriving before the shipping workflow exists gets
-  404: a real webhook handler should retry, or record it for the workflow
-  to read.
 - The integration test runs both deployments in one process, so the
-  modules' `Configure` is shared; the queue split is what it proves (each
-  engine runs only its modules' activities).
-- The integration test imports `internal/testdb` of this repository; a
-  copy of the blueprint needs its own test database helper.
+  modules' `Configure` is shared; what it proves is the queue split (each
+  engine runs only its modules' activities and records the ends of its
+  modules' workflows).
+- The tests import `internal/testdb` of this repository; a copy of the
+  blueprint needs its own test database helper.

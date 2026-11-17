@@ -1,9 +1,10 @@
 // Package shipping is the shipping module: labels and carrier pickups.
 //
 // Public API: the workflow Ship, which other modules start as a child
-// (InstanceID), ConfirmPickup for the carrier's webhook (a signal to that
-// workflow), Find, Queue, Configure, Migrate, ErrUnserviceable and
-// ErrPickupTimeout. The schema shipping is private to the module.
+// (InstanceID); ConfirmPickup for the carrier's webhook and Cancel for the
+// caller that wants the shipment stopped (both signals to that workflow);
+// Find, Queue, Configure, Migrate, ErrUnserviceable, ErrPickupTimeout and
+// ErrCanceled. The schema shipping is private to the module.
 package shipping
 
 import (
@@ -25,9 +26,13 @@ import (
 // Queue is the queue of the module's workflows and activities.
 const Queue = "shipping"
 
-// SignalPickedUp is the signal the carrier's pickup confirmation sends to
-// the Ship workflow (ConfirmPickup).
-const SignalPickedUp = "shipping.picked-up"
+// Signals of the Ship workflow.
+const (
+	// SignalPickedUp is the carrier's pickup confirmation (ConfirmPickup).
+	SignalPickedUp = "shipping.picked-up"
+	// SignalCancel asks for the shipment to be stopped (Cancel).
+	SignalCancel = "shipping.cancel"
+)
 
 var (
 	// ErrUnserviceable is the error of a shipment to an address no carrier
@@ -36,11 +41,15 @@ var (
 	// ErrPickupTimeout is the error of a shipment the carrier did not pick
 	// up in time.
 	ErrPickupTimeout = errors.New("shipping: carrier did not pick up in time")
+	// ErrCanceled is the error of a shipment stopped by Cancel before the
+	// carrier picked it up.
+	ErrCanceled = errors.New("shipping: canceled before pickup")
 )
 
 func init() {
 	flows.RegisterErrorKind("shipping_unserviceable", ErrUnserviceable)
 	flows.RegisterErrorKind("shipping_pickup_timeout", ErrPickupTimeout)
+	flows.RegisterErrorKind("shipping_canceled", ErrCanceled)
 }
 
 // Config holds the module's dependencies.
@@ -53,7 +62,16 @@ var cfg = deps.New[Config]("shipping")
 
 // Configure sets the module's dependencies. Call it before the engine
 // starts, in every process that runs the module or calls its functions.
-func Configure(c Config) { cfg.Set(c) }
+func Configure(c Config) error {
+	if c.DB == nil {
+		return errors.New("shipping: Configure: DB is required")
+	}
+	if c.Logger == nil {
+		c.Logger = slog.Default()
+	}
+	cfg.Set(c)
+	return nil
+}
 
 //go:embed migrations/*.sql
 var migrations embed.FS
@@ -84,14 +102,28 @@ type Pickup struct {
 	Tracking string `json:"tracking"`
 }
 
+// CancelRequest is the payload of SignalCancel.
+type CancelRequest struct {
+	Reason string `json:"reason"`
+}
+
 // InstanceID is the instance id of the shipment of an order.
 func InstanceID(orderID string) string { return "shipping-" + orderID }
 
 // ConfirmPickup records the carrier's pickup of an order's shipment. It
 // fails with flows.ErrNotActive once the shipment has ended (picked up
-// already, timed out, canceled).
+// already, timed out, canceled: the carrier must then return the parcel),
+// and with flows.ErrNotFound before the shipment exists.
 func ConfirmPickup(ctx context.Context, e *flows.Engine, orderID, tracking string) error {
 	return e.Signal(ctx, InstanceID(orderID), SignalPickedUp, Pickup{Tracking: tracking})
+}
+
+// Cancel asks the shipment of an order to stop. The shipment decides: if
+// the carrier's pickup reached it first, it completes anyway (the caller
+// sees that in its outcome); otherwise it cancels its label and fails with
+// ErrCanceled. flows.ErrNotActive once the shipment has ended.
+func Cancel(ctx context.Context, e *flows.Engine, orderID, reason string) error {
+	return e.Signal(ctx, InstanceID(orderID), SignalCancel, CancelRequest{Reason: reason})
 }
 
 // Find returns the state of the latest shipment of an order, pgx.ErrNoRows
@@ -124,32 +156,66 @@ var (
 	// tests can mock it (flowtest.OnActivity) when Ship runs as their child.
 	CreateLabel = flows.DefineActivity("shipping.create-label", createLabel, cancelLabel, activityOpts...)
 	// MarkPickedUp records the pickup; exported for tests, as CreateLabel.
-	MarkPickedUp = flows.DefineActivity("shipping.mark-picked-up", markPickedUp, nil, activityOpts...)
+	// It retries for long: after a pickup there is no way back.
+	MarkPickedUp = flows.DefineActivity("shipping.mark-picked-up", markPickedUp, nil,
+		flows.WithQueue(Queue), flows.WithTimeout(10*time.Second),
+		flows.WithRetry(flows.Exponential(50, time.Second, time.Minute)))
 
-	// Ship creates a label, then waits for the carrier's pickup (a signal)
-	// at most PickupWithin. Without a pickup it fails with ErrPickupTimeout
-	// and cancels the label; a canceled parent cancels it the same way.
+	// Ship creates a label, then waits for the first of: the carrier's
+	// pickup, a cancel, or PickupWithin. Pickup: it completes (nothing is
+	// undone after it). Cancel: it cancels the label and fails with
+	// ErrCanceled. Timeout: the same with ErrPickupTimeout.
 	Ship = flows.DefineWorkflow("shipping.ship", 1, ship, flows.WithWorkflowQueue(Queue))
 )
 
 func ship(c flows.Ctx, r Request) (Shipment, error) {
+	// Listen first: a signal sent before the workflow listens is kept.
+	pickups := flows.Signals[Pickup](c, SignalPickedUp)
+	cancels := flows.Signals[CancelRequest](c, SignalCancel)
+
 	id, err := CreateLabel.Run(c, r)
 	if err != nil {
 		return Shipment{}, err
 	}
-	p, err := flows.Await[Pickup](c, SignalPickedUp, r.PickupWithin)
-	if errors.Is(err, flows.ErrAwaitTimeout) {
-		return Shipment{}, ErrPickupTimeout // cancels the label
+
+	tc, stopTimer := flows.WithCancel(c)
+	defer stopTimer()
+	timeout := flows.NewTimer(tc, r.PickupWithin)
+	var (
+		pickup   Pickup
+		pickedUp bool
+		endErr   error
+	)
+	// Cases are tried in order: a pickup that is already here wins over a
+	// cancel that is already here (the carrier has the parcel).
+	flows.Select(c,
+		flows.OnSignal(pickups, func(_ flows.Ctx, p Pickup, err error) { pickup, pickedUp, endErr = p, err == nil, err }),
+		flows.OnSignal(cancels, func(_ flows.Ctx, _ CancelRequest, err error) { endErr = orElse(err, ErrCanceled) }),
+		flows.OnFuture(timeout, func(_ flows.Ctx, _ struct{}, err error) { endErr = orElse(err, ErrPickupTimeout) }),
+	)
+	// An error from a case itself is flows.ErrCanceled: the workflow was
+	// canceled (Engine.Cancel of the order): it ends canceled.
+	if !pickedUp {
+		return Shipment{}, endErr // cancels the label
 	}
-	if err != nil {
-		return Shipment{}, err // canceled by the parent: cancels the label
-	}
-	// The pivot: once the carrier has the parcel nothing is undone, so
-	// MarkPickedUp has no compensator.
-	if _, err := MarkPickedUp.Run(c, PickupUpdate{ShipmentID: id, Tracking: p.Tracking}); err != nil {
+
+	// The pivot: the carrier has the parcel, nothing is undone from here
+	// (MarkPickedUp has no compensator). Record it even if the workflow is
+	// canceled meanwhile (Engine.Cancel of the order): Disconnected.
+	dc, done := flows.Disconnected(c)
+	defer done()
+	if _, err := MarkPickedUp.Run(dc, PickupUpdate{ShipmentID: id, Tracking: pickup.Tracking}); err != nil {
 		return Shipment{}, err
 	}
-	return Shipment{ID: id, Tracking: p.Tracking}, nil
+	return Shipment{ID: id, Tracking: pickup.Tracking}, nil
+}
+
+// orElse returns err, or def when err is nil.
+func orElse(err, def error) error {
+	if err != nil {
+		return err
+	}
+	return def
 }
 
 // PickupUpdate is the input of MarkPickedUp.
@@ -184,7 +250,8 @@ func createLabel(ctx context.Context, k flows.Key, r Request) (string, string, e
 }
 
 // cancelLabel undoes createLabel by key (a tombstone if the label never
-// landed), so it also handles an uncertain attempt.
+// landed), so it also handles an uncertain attempt. A picked-up shipment is
+// never canceled.
 func cancelLabel(ctx context.Context, k flows.Key, shipmentID string) error {
 	c, err := cfg.Get()
 	if err != nil {
@@ -200,16 +267,31 @@ func cancelLabel(ctx context.Context, k flows.Key, shipmentID string) error {
 	return nil
 }
 
+// errNotPickable: the shipment is not in a state a pickup can be recorded
+// in (its label was canceled). It cannot happen in this workflow, which
+// cancels the label only when it fails; it is reported rather than hidden.
+var errNotPickable = errors.New("shipping: shipment cannot be picked up")
+
 func markPickedUp(ctx context.Context, _ flows.Key, u PickupUpdate) (struct{}, struct{}, error) {
 	c, err := cfg.Get()
 	if err != nil {
 		return struct{}{}, struct{}{}, err
 	}
 	// Idempotent: setting the same state twice changes nothing.
-	if _, err := c.DB.Exec(ctx, `
-		UPDATE shipping.shipments SET state = 'picked_up', tracking = $2, updated_at = now()
-		WHERE id = $1 AND state IN ('label_created', 'picked_up')`, u.ShipmentID, u.Tracking); err != nil {
+	var state string
+	err = c.DB.QueryRow(ctx, `
+		WITH upd AS (
+			UPDATE shipping.shipments SET state = 'picked_up', tracking = $2, updated_at = now()
+			WHERE id = $1 AND state IN ('label_created', 'picked_up')
+			RETURNING state)
+		SELECT coalesce((SELECT state FROM upd), (SELECT state FROM shipping.shipments WHERE id = $1), 'missing')`,
+		u.ShipmentID, u.Tracking).Scan(&state)
+	if err != nil {
 		return struct{}{}, struct{}{}, fmt.Errorf("mark %s picked up: %w", u.ShipmentID, err)
 	}
+	if state != "picked_up" {
+		return struct{}{}, struct{}{}, flows.Permanent(fmt.Errorf("%w: %s is %s", errNotPickable, u.ShipmentID, state))
+	}
+	c.Logger.LogAttrs(ctx, slog.LevelInfo, "shipping: picked up", slog.String("shipment_id", u.ShipmentID))
 	return struct{}{}, struct{}{}, nil
 }

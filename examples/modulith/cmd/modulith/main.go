@@ -75,13 +75,22 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	if err := a.Start(ctx); err != nil {
-		return err
+		// The engine may have started before the failure: drain it.
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+		defer cancel()
+		return errors.Join(err, a.Stop(sctx))
 	}
 
 	var srv *http.Server
 	srvErr := make(chan error, 1)
 	if *addr != "" {
-		srv = &http.Server{Addr: *addr, Handler: a.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		srv = &http.Server{
+			Addr: *addr, Handler: a.Handler(),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      30 * time.Second, // above the API's longest wait (adjustWait)
+			IdleTimeout:       time.Minute,
+		}
 		go func() { srvErr <- srv.ListenAndServe() }()
 		log.LogAttrs(ctx, slog.LevelInfo, "modulith: listening", slog.String("addr", *addr))
 	}

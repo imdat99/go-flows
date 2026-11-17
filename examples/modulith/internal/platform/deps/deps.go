@@ -11,12 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
-
-	"github.com/imdat99/go-flows/flows"
 )
 
-// ErrNotConfigured is the error of an activity of a module that was not
-// configured. It is permanent: retrying cannot help.
+// ErrNotConfigured is the error of a module used before its Configure.
+//
+// It is not permanent: an activity failing with it is retried, so a replica
+// started with a wiring mistake delays work instead of failing (and
+// compensating) real orders. The composition root checks every module's
+// configuration at startup and refuses to start without it.
 var ErrNotConfigured = errors.New("module not configured")
 
 // Ref holds the dependencies of one module.
@@ -31,10 +33,10 @@ func New[T any](module string) *Ref[T] { return &Ref[T]{module: module} }
 // Set stores v.
 func (r *Ref[T]) Set(v T) { r.p.Store(&v) }
 
-// Get returns the stored dependencies, or a permanent ErrNotConfigured.
+// Get returns the stored dependencies, or ErrNotConfigured.
 func (r *Ref[T]) Get() (*T, error) {
 	if v := r.p.Load(); v != nil {
 		return v, nil
 	}
-	return nil, flows.Permanent(fmt.Errorf("%s: %w (call Configure before starting the engine)", r.module, ErrNotConfigured))
+	return nil, fmt.Errorf("%s: %w (call Configure before starting the engine)", r.module, ErrNotConfigured)
 }

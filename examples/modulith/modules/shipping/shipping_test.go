@@ -68,3 +68,34 @@ func TestShipUnserviceable(t *testing.T) {
 		t.Fatalf("err = %v, %d label(s) canceled: nothing should be compensated", err, canceled.Load())
 	}
 }
+
+func TestShipCanceled(t *testing.T) {
+	tst, canceled := newTester(t)
+	tst.SignalAfter(time.Hour, InstanceID("o4"), SignalCancel, CancelRequest{Reason: "customer"})
+	_, err := flowtest.Run(tst, Ship, InstanceID("o4"), Request{OrderID: "o4", Address: "Hue", PickupWithin: 48 * time.Hour})
+	if !errors.Is(err, ErrCanceled) || !errors.Is(err, flows.ErrCompensated) {
+		t.Fatalf("err = %v, want canceled, compensated", err)
+	}
+	if canceled.Load() != 1 {
+		t.Fatalf("%d label(s) canceled, want 1", canceled.Load())
+	}
+}
+
+// A pickup and a cancel both waiting when the shipment looks: the pickup
+// wins, the carrier has the parcel.
+func TestShipPickupBeatsCancel(t *testing.T) {
+	tst, canceled := newTester(t)
+	// Both arrive while the label is being created, so both are waiting
+	// when the workflow selects.
+	flowtest.OnActivity(tst, CreateLabel, func(ctx context.Context, _ flows.Key, r Request) (string, string, error) {
+		e := tst.Engine()
+		if err := ConfirmPickup(ctx, e, r.OrderID, "TRK5"); err != nil {
+			return "", "", err
+		}
+		return "shp_1", "shp_1", Cancel(ctx, e, r.OrderID, "customer")
+	})
+	s, err := flowtest.Run(tst, Ship, InstanceID("o5"), Request{OrderID: "o5", Address: "Hue", PickupWithin: 48 * time.Hour})
+	if err != nil || s.Tracking != "TRK5" || canceled.Load() != 0 {
+		t.Fatalf("shipment %+v, err %v, %d label(s) canceled; want picked up", s, err, canceled.Load())
+	}
+}

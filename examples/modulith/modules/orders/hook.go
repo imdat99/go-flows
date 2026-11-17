@@ -57,10 +57,17 @@ func (endHook) RunEnded(ctx context.Context, tx pgx.Tx, r flows.RunInfo) error {
 	}
 	orderID := strings.TrimPrefix(r.InstanceID, InstanceID(""))
 	ev := Event{OrderID: orderID, State: state, Reason: r.Error}
+	// Only a row this execution recorded and that is still processing: no
+	// row means the record step never ran (nothing to tell the customer);
+	// an ended row belongs to an earlier order with this id (the record
+	// step refused this one).
 	err := tx.QueryRow(ctx, `
 		UPDATE orders.orders SET state = $2, reason = $3, updated_at = now()
-		WHERE id = $1 RETURNING email`, orderID, state, r.Error).Scan(&ev.Email)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) { // no row: the record step never ran
+		WHERE id = $1 AND state = 'processing' RETURNING email`, orderID, state, r.Error).Scan(&ev.Email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("orders: end of %s: %w", orderID, err)
 	}
 	return outbox.Stage(ctx, tx, topic, orderID, ev)

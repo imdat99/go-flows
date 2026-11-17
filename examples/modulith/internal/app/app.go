@@ -12,6 +12,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -79,6 +80,7 @@ type App struct {
 	engine *flows.Engine
 	log    *slog.Logger
 
+	started   bool
 	stopRelay context.CancelFunc
 	relayDone chan struct{}
 }
@@ -114,14 +116,6 @@ func New(ctx context.Context, pool *pgxpool.Pool, cfg Config) (*App, error) {
 		}
 	}
 
-	// Every module is configured, run here or not: its Go API (orders.Get,
-	// inventory.Adjust...) may be called by the HTTP API of any process.
-	orders.Configure(orders.Config{DB: pool, Logger: log, PickupWithin: cfg.PickupWithin})
-	payments.Configure(payments.Config{DB: pool, Logger: log})
-	inventory.Configure(inventory.Config{DB: pool, Logger: log, ReplenishEvery: cfg.ReplenishEvery})
-	shipping.Configure(shipping.Config{DB: pool, Logger: log})
-	notifications.Configure(notifications.Config{DB: pool, Logger: log})
-
 	var obs flows.Observer = logObserver{log}
 	if cfg.Observer != nil {
 		obs = observers{obs, cfg.Observer}
@@ -138,6 +132,21 @@ func New(ctx context.Context, pool *pgxpool.Pool, cfg Config) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("new engine: %w", err)
 	}
+
+	// Every module is configured, run here or not: its Go API (orders.Get,
+	// payments.Find, inventory.Adjust...) may be called by the HTTP API of
+	// any process. A wiring mistake fails here, at startup, rather than as
+	// activities retrying ErrNotConfigured on a live replica.
+	err = errors.Join(
+		orders.Configure(orders.Config{DB: pool, Logger: log, Engine: engine, PickupWithin: cfg.PickupWithin}),
+		payments.Configure(payments.Config{DB: pool, Logger: log}),
+		inventory.Configure(inventory.Config{DB: pool, Logger: log, ReplenishEvery: cfg.ReplenishEvery}),
+		shipping.Configure(shipping.Config{DB: pool, Logger: log}),
+		notifications.Configure(notifications.Config{DB: pool, Logger: log}),
+	)
+	if err != nil {
+		return nil, err
+	}
 	return &App{cfg: cfg, pool: pool, engine: engine, log: log}, nil
 }
 
@@ -147,12 +156,13 @@ func (a *App) Engine() *flows.Engine { return a.engine }
 func (a *App) runs(name string) bool { return slices.Contains(a.cfg.Modules, name) }
 
 // Start starts the engine and the background work of the modules this
-// process runs.
+// process runs. If it fails, call Stop: the engine may have started.
 func (a *App) Start(ctx context.Context) error {
 	if len(a.cfg.Modules) > 0 {
 		if err := a.engine.Start(ctx); err != nil {
 			return fmt.Errorf("start engine: %w", err)
 		}
+		a.started = true
 	}
 	if a.runs("inventory") {
 		if err := inventory.StartReplenishment(ctx, a.engine); err != nil {
@@ -184,6 +194,9 @@ func (a *App) Stop(ctx context.Context) error {
 	if a.stopRelay != nil {
 		a.stopRelay()
 		<-a.relayDone
+	}
+	if !a.started {
+		return nil
 	}
 	if err := a.engine.Stop(ctx); err != nil {
 		return fmt.Errorf("stop engine: %w", err)
