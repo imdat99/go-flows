@@ -119,7 +119,7 @@ version or a later one. Compatible versions:
 | go-flows | otelflows | analyzer |
 | --- | --- | --- |
 | v0.1.0 | none: the `otelflows` of v0.1.0 required an unpublished go-flows `v0.0.0` and cannot be installed | any |
-| v0.1.1, v0.1.2 | the first `otelflows` tag (requires go-flows v0.1.2; the `flows.Tracer` interface changed in v0.1.1) | any |
+| v0.1.2 or later | the first `otelflows` tag (requires go-flows v0.1.2; the `flows.Tracer` interface changed in v0.1.1) | any |
 
 The analyzer does not import go-flows: it recognizes the `flows` API by
 import path and name, so any analyzer version works with any go-flows

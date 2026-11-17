@@ -120,7 +120,7 @@ jobs:
             --notes-file "$RUNNER_TEMP/notes.md" --latest="$latest"
 
       - name: Summary
-        if: always() && steps.check.outputs.tag != ''
+        if: success() && steps.check.outputs.tag != ''
         env:
           TAG: ${{ steps.check.outputs.tag }}
           MODULE_PATH: ${{ steps.check.outputs.path }}

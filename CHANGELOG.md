@@ -15,6 +15,15 @@ must take care of.
 
 ## Unreleased
 
+### Changed
+
+- Releases are made by hand (release workflow, `workflow_dispatch` with an
+  explicit version checked against this file); pushing to main no longer
+  tags. Submodules are tagged `otelflows/vX.Y.Z` and `analyzer/vX.Y.Z`.
+- `otelflows` requires a released go-flows (v0.1.2) instead of `v0.0.0`
+  with a `replace`, so `go get github.com/imdat99/go-flows/otelflows`
+  works; local development uses `otelflows/go.work`.
+
 ## v0.1.2 (2026-11-17)
 
 A simplification of the v0.1.1 code (shared helpers, one `next_due`

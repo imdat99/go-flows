@@ -32,12 +32,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@v8
-        with:
-          version: v2.15.0
-          install-only: true # make lint runs it, on every module
+      - name: install golangci-lint (make lint runs it on every module)
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
       - name: lint (all modules)
         run: make lint
+      - name: Submodules build as consumers do (released go-flows)
+        run: make modcheck
 
   # Perf gate: allocation budgets (perf-budget.txt) are near deterministic
   # and machine independent; the time rules are loose ceilings.
