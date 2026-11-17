@@ -274,8 +274,8 @@ type Worker struct {
 // could have been but found no free activity slot (they go through the
 // queue: a NOTIFY and a claim more); missedInClaim counts the misses while
 // an activity claim held slots (it takes every free slot but a spare for
-// its round trip). Atomic adds only: no allocation. Read by tests and
-// benchmarks (export_test.go).
+// its round trip). A diagnostic, read only by tests and benchmarks
+// (export_test.go): atomic adds, no allocation, negligible cost.
 type eagerStats struct {
 	launched, missed, missedInClaim atomic.Int64
 	// claiming is set while an activity claim is in flight (its poller
@@ -527,7 +527,13 @@ func release(slots chan struct{}, n int) {
 }
 
 // eagerSpare is the number of activity slots a claim leaves free for eager
-// launches: one when the worker runs activities eagerly.
+// launches: one when the worker runs activities eagerly. Eager is on by
+// default, so a worker that only polls activities (no workflow of its own
+// scheduling them) keeps the spare too. Nothing starves: a claim that
+// fills every slot it took loops again at once, and a single free slot is
+// taken. But refilling two or more freed slots takes two round trips (the
+// second claim takes the spare), MaxActivities 2 always claims one row at a
+// time, and MaxActivities 1 is unchanged.
 func eagerSpare(eager bool) int {
 	if eager {
 		return 1

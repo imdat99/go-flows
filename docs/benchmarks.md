@@ -139,13 +139,20 @@ trip; before T10.21 it took all of them, so an eager launch meanwhile found
 none and its activity went through the queue: a NOTIFY waking every
 engine's poller, which all claim (one finds it), and so more claims holding
 the slots. `BenchmarkEagerMisses` (internal/worker; 4 concurrent
-10-activity workflows per engine, 20 batches per sample, `-count 6`)
-counts it: with 3 engines 2.9% of the activities missed their eager
-launch, every one during a claim, with 0.094 activity claims per activity.
-The claim now leaves one slot free when more than one is (a single free
-slot is still taken): 0.06% missed, 0.012 claims per activity (-87%),
-allocations unchanged (1270 to 1159 per batch, p=0.09). With one engine
-the misses were ~0.4% (timed polls only) and stay about that.
+10-activity workflows per engine, a fixed 20 batches per sample in `make
+bench`, `-count 6`) counts it. The claim now leaves one slot free when more
+than one is (a single free slot is still taken): roughly 80 to 85% fewer
+misses and activity claims with 3 engines, allocations unchanged. The
+spread between runs is wide; two measurements:
+
+| 3 engines | misses before | misses after | activity claims |
+| --- | --- | --- | --- |
+| T10.21 | 2.9% | 0.06% | 0.094 to 0.012 per activity (-87%) |
+| its review | 8.9% | 1.4% | -80% |
+
+Every miss came during a claim. Allocations per batch: 1270 to 1159
+(p=0.09). With one engine the misses were ~0.4% (timed polls only) and stay
+about that.
 
 Runs that take 0.5 to 1.7 s instead of ~0.15 s appear now and then on the
 development machine. A trace of store calls showed every statement of

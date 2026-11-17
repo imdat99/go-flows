@@ -51,11 +51,16 @@ fmt:
 # pollers swing their per-op allocations; the plan's target is for a warm,
 # steady engine.
 E2E = ActivityRun|ActivityRun20|PublicActivityRun
+# BenchmarkEagerMisses (T10.21: an op is a batch of concurrent workflows on
+# 1 or 3 engines, ~0.2-0.4 s) runs a fixed 20 batches per sample: with the
+# default timing a sample was 3 to 6 batches, its miss rate mostly warm-up.
+EAGER = EagerMisses
 # BENCH=... selects benchmarks and runs them with the default timing.
 bench:
 ifeq ($(BENCH),.)
-	go test -run "^$$" -bench . -skip "$(E2E)" -benchmem -count 6 $(BENCHPKG) | tee $(BENCHOUT)
+	go test -run "^$$" -bench . -skip "$(E2E)|$(EAGER)" -benchmem -count 6 $(BENCHPKG) | tee $(BENCHOUT)
 	go test -run "^$$" -bench "$(E2E)" -benchtime 50x -benchmem -count 6 $(BENCHPKG) | tee -a $(BENCHOUT)
+	go test -run "^$$" -bench "$(EAGER)" -benchtime 20x -benchmem -count 6 $(BENCHPKG) | tee -a $(BENCHOUT)
 else
 	go test -run "^$$" -bench "$(BENCH)" -benchmem -count 6 $(BENCHPKG) | tee $(BENCHOUT)
 endif

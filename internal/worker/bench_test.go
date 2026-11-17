@@ -113,7 +113,9 @@ func (s *endSignal) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *
 // (misses/activity), and how many of those while an activity claim held
 // the slots (claim-misses/activity): such an activity goes through the
 // queue (a NOTIFY waking every engine's poller, a claim more); and the
-// activity claims of all engines (claims/activity).
+// activity claims of all engines (claims/activity). Run it with a fixed
+// iteration count (make bench: -benchtime 20x): with the default timing a
+// sample is 3 to 6 batches and its rates are mostly warm-up.
 func BenchmarkEagerMisses(b *testing.B) {
 	for _, engines := range []int{1, 3} {
 		b.Run("engines="+strconv.Itoa(engines), func(b *testing.B) { benchEngines(b, engines, 4, 10) })
