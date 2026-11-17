@@ -24,16 +24,8 @@ must take care of.
   with a `replace`, so `go get github.com/imdat99/go-flows/otelflows`
   works; local development uses `otelflows/go.work`.
 
-## v0.1.2 (2026-11-17)
-
-A simplification of the v0.1.1 code (shared helpers, one `next_due`
-subquery in the statement that completes a workflow task). No API,
-schema or behaviour change, except:
-
 ### Fixed
 
-- The memory store's `Executions` (used by `flowtest`) returns a copy of
-  each execution's trace context instead of sharing it with the store.
 - `Engine.Stop(ctx)` honours ctx's deadline when the database stops
   answering (a failover, a partition without RST) (T11.2). Once ctx is
   done, Stop waits at most about 1 second more; tasks still blocked are
@@ -47,7 +39,19 @@ schema or behaviour change, except:
   activities that ignore their context's cancellation, where it used to
   wait for them indefinitely; such an activity may run again elsewhere
   while it still runs in the stopped process. Sticky executions are still
-  handed over at Stop (with a budget of their own, up to 5 seconds).
+  handed over at Stop (with a budget of their own, up to 5 seconds, which
+  may still run briefly after Stop returns).
+
+## v0.1.2 (2026-11-17)
+
+A simplification of the v0.1.1 code (shared helpers, one `next_due`
+subquery in the statement that completes a workflow task). No API,
+schema or behaviour change, except:
+
+### Fixed
+
+- The memory store's `Executions` (used by `flowtest`) returns a copy of
+  each execution's trace context instead of sharing it with the store.
 
 ### Migrations
 

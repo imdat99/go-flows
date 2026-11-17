@@ -521,9 +521,10 @@ const unstickWait = 250 * time.Millisecond
 // unstick hands the executions sticky to this worker over (Unstick), with
 // a budget of its own (min(5s, LeaseTTL)), detached from Stop's: tasks
 // abandoned at the deadline do not make it fail, and sticky executions are
-// not left waiting StickyFor. Stop waits for it until over is done, and
-// unstickWait more; on a store that does not answer, it goes on alone,
-// within its budget.
+// not left waiting StickyFor. Stop waits for it until over is done and at
+// least unstickWait from its start; on a store that does not answer, it
+// goes on alone after Stop returns, within its budget (pool.Close may wait
+// for it).
 func (w *Worker) unstick(ctx, over context.Context) {
 	done := make(chan struct{})
 	go func() {
