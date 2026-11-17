@@ -29,9 +29,11 @@ must take care of.
   checkpoint that records it, never sent again on replay; its future
   resolves with `nil`, or the new `ErrSignalTargetNotFound` or
   `ErrSignalTargetEnded` (kinds `signal_target_not_found`,
-  `signal_target_ended`). Mutual signals lock execution rows in id order
-  (no deadlock); signals to one target serialise the senders' checkpoints
-  on its row. No migration (T12.1).
+  `signal_target_ended`). Senders lock execution rows in id order, so
+  mutual signals do not deadlock each other (a cycle with a parent ending
+  the same children is detected by Postgres and retried); signals to one
+  target serialise the senders' checkpoints on its row. No migration
+  (T12.1).
 - `examples/modulith`: a modular monolith blueprint (five modules, cross-module sagas, split deployments by queue).
 - `flows.InstanceID(c)` and `flows.ExecutionID(c)`: workflow code reads
   its own instance id (kept by continue-as-new) and execution id;
@@ -131,6 +133,10 @@ must take care of.
 
 ### Upgrade notes
 
+- **History events 31-33** (`SignalSent`, `SignalDelivered`,
+  `SignalFailed`, T12.1) are unknown to earlier binaries: deploy the new
+  binary everywhere before workflow code calls `flows.SignalWorkflow`
+  (an earlier engine replaying such a history would park it).
 - **`00017` (T11.3)** adds two integer columns with a constant default:
   metadata only, no table rewrite and no long lock.
 - Activity tasks inserted by earlier binaries (and by binaries that do not

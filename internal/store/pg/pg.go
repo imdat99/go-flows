@@ -1300,7 +1300,13 @@ func latestExecOf(t string) string {
 // sendSignals out of order (a child started in the same checkpoint is this
 // transaction's own row): a cycle there is left to Postgres' detection
 // (retry); and one created after sendSignals' snapshot is not found, as an
-// Engine.Signal racing its Start.
+// Engine.Signal racing its Start. Other statements that lock several
+// execution rows in scan order (cancelChildren, cancelChildrenOf, purge)
+// can also cycle with these id-ordered locks, for example a parent ending
+// its children while a sender signals two of them: Postgres detects it and
+// the transaction is retried (latency, not a lost write). The children
+// branch locks every child row of the execution, ended ones included: its
+// cost grows with the parent's lifetime fan-out.
 var (
 	lockSignalsBefore = `
 		SELECT 1 FROM flows.execution
