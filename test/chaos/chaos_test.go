@@ -104,8 +104,9 @@ func defineStep(name string, stall bool) *flows.Activity[int, int, struct{}] {
 				// Frozen with SIGSTOP meanwhile, for longer than this sleep
 				// (until the takeover claims the task: at least the lease
 				// left, over two thirds of a TTL): on thaw the attempt
-				// returns at once and writes its outcome, before the
-				// heartbeat's renewal learns the lease is lost.
+				// returns at once and races the heartbeat's overdue
+				// expiry: it writes its stale outcome (fenced off by the
+				// store) or the lease is given up first (nothing written).
 				time.Sleep(childTTL / 2)
 				return v + 1000, struct{}{}, nil // told apart from the takeover's
 			}
@@ -204,6 +205,11 @@ func child(mode string) int {
 	if mode == "wf-pause" || mode == "wf-short" || mode == "tree" {
 		// Workflow code waits on the test (wf-*): never handed back as stuck.
 		opts.StuckTimeout = 5 * time.Minute
+		opts.Tracer = printTasks{}
+	}
+	if mode == "pause" {
+		// ACTEND ... lost=true when the attempt's lease was given up
+		// before its outcome was written (TestFrozenInstanceIsFencedOff).
 		opts.Tracer = printTasks{}
 	}
 	eng, err := flows.New(pool, opts)
@@ -465,10 +471,11 @@ func TestKilledInstanceIsRecovered(t *testing.T) {
 
 // B: an instance freezes past its leases (a GC pause); another takes the
 // activity over and holds it (its attempt waits on a gate). The frozen one
-// wakes while the takeover still runs, and writes its late outcome at once
-// (its heartbeat has not yet learned the lease is lost): the store's fence
-// (owner and lease version) rejects it, and the takeover's outcome is the
-// one recorded.
+// wakes while the takeover still runs: its attempt returns at once and
+// races its heartbeat's overdue expiry. Either it writes its late outcome
+// and the store's fence (owner and lease version) rejects it, or it gives
+// the lease up first and writes nothing. Either way the takeover's outcome
+// is the one recorded.
 func TestFrozenInstanceIsFencedOff(t *testing.T) {
 	pool := setup(t)
 	release := make(chan struct{})
@@ -491,12 +498,24 @@ func TestFrozenInstanceIsFencedOff(t *testing.T) {
 	if err := cmd.Process.Signal(syscall.SIGCONT); err != nil {
 		t.Fatal(err)
 	}
-	// The child reached the store write (an attempt is reported only when
-	// its worker did not see the lease lost first).
-	waitFor(t, "the thawed child to write its stale outcome", 15*time.Second, func() bool {
-		return strings.Contains(out.String(), "ATTEMPT chaos.reserve completed")
+	// On thaw two timers are overdue in the child: its attempt's sleep and
+	// its heartbeat's expiry (T11.1, which needs no renewal round trip). If
+	// the attempt returns first, the child writes its stale outcome and the
+	// store's fence rejects it (an attempt is reported only when its worker
+	// did not see the lease lost first); if the heartbeat fires first, the
+	// child gives the lease up and writes nothing. Both are safe; what must
+	// never happen is checked below either way.
+	var wrote bool
+	waitFor(t, "the thawed child to write its outcome or give its lease up", 15*time.Second, func() bool {
+		wrote = strings.Contains(out.String(), "ATTEMPT chaos.reserve completed")
+		return wrote || strings.Contains(out.String(), "ACTEND order-0 chaos.reserve lost=true")
 	})
-	time.Sleep(200 * time.Millisecond) // the write went to the store
+	if wrote {
+		time.Sleep(200 * time.Millisecond) // the write went to the store
+		t.Log("the thawed child wrote its stale outcome (fenced off)")
+	} else {
+		t.Log("the thawed child gave its lease up before writing")
+	}
 	if n := count(t, pool, `SELECT count(*) FROM flows.pending_event WHERE type = $1`, int(history.ActivityCompleted)); n != 0 {
 		t.Fatalf("a stale outcome was delivered (%d pending)", n)
 	}
