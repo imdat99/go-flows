@@ -463,7 +463,7 @@ var claimTail = `
 		UPDATE flows.execution e
 		SET owner_id = $2, lease_version = e.lease_version + 1,
 		    locked_until = now() + $4::bigint * interval '1 microsecond', not_before = NULL,
-		    -- Claims since the last completion or release (T11.3).
+		    -- Claims lost since the last completion (a release undoes its own, T11.3).
 		    claims = e.claims + 1
 		WHERE e.id = ANY(ARRAY(SELECT id FROM c)) -- a join may scan the table (generic plans)
 		RETURNING e.id, e.instance_id, e.workflow, e.version, e.queue, e.status, e.parent_id, e.parent_sched,
