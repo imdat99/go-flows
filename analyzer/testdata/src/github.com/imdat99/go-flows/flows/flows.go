@@ -24,3 +24,12 @@ func DefineWorkflow[I, O any](name string, version int, fn func(c Ctx, in I) (O,
 type Key string
 
 func DefineActivity[I, O, C any](name string, invoke func(ctx context.Context, k Key, in I) (O, C, error)) {}
+
+type Future[T any] struct{}
+
+func (f *Future[T]) Get(c Ctx) (T, error) {
+	var zero T
+	return zero, nil
+}
+
+func SignalWorkflow[T any](c Ctx, instanceID, name string, payload T) *Future[struct{}] { return nil }

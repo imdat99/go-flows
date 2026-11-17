@@ -138,8 +138,9 @@ type Executor struct {
 func (e *Executor) resetCompletion() *store.Completion {
 	c := &e.comp
 	clear(c.Activities)
-	consumed, acts, leases := c.Consumed[:0], c.Activities[:0], c.Leases[:0]
-	*c = store.Completion{Consumed: consumed, Activities: acts, Leases: leases}
+	clear(c.Signals)
+	consumed, acts, leases, sigs := c.Consumed[:0], c.Activities[:0], c.Leases[:0], c.Signals[:0]
+	*c = store.Completion{Consumed: consumed, Activities: acts, Leases: leases, Signals: sigs}
 	return c
 }
 
@@ -405,7 +406,8 @@ func (e *Executor) commit(c *store.Completion) error {
 		continued := st.end.status == store.StatusContinued
 		for _, issued := range st.calls {
 			cmd := issued.command()
-			if cmd.State != command.Pending || continued && cmd.Kind == command.Child {
+			// A signal is sent all the same: it leaves nothing behind.
+			if cmd.State != command.Pending || continued && cmd.Kind == command.Child || cmd.Kind == command.Signal {
 				continue
 			}
 			cmd.State = command.Dropped
@@ -459,6 +461,10 @@ func sideTables(c *store.Completion, ev *history.Event, cmd *command.Command) {
 		c.ChildCancels = append(c.ChildCancels, cmd.Ref)
 	case history.ActivityCancelRequested:
 		c.CanceledActivities = append(c.CanceledActivities, cmd.ID)
+	case history.SignalSent:
+		c.Signals = append(c.Signals, store.SignalRequest{
+			ScheduleID: cmd.ID, InstanceID: cmd.Ref, Name: cmd.Name, Payload: cmd.Payload,
+		})
 	case history.LockRequested:
 		us, _ := strconv.ParseInt(string(ev.Payload), 10, 64) // written by State.Lock
 		c.Locks = append(c.Locks, store.LockRequest{

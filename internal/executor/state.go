@@ -268,6 +268,39 @@ func (st *State) Lock(ctx coro.Context, key string, ttl, wait time.Duration) err
 	return err
 }
 
+// signalCall is a signal sent to an instance: the store answers it in the
+// same checkpoint.
+type signalCall struct {
+	cmd command.Command
+	f   coro.Future[Result]
+}
+
+func (c *signalCall) command() *command.Command { return &c.cmd }
+
+func (c *signalCall) resolve(ev *history.Event) error {
+	switch ev.Type {
+	case history.SignalDelivered:
+		c.f.Set(Result{}, nil)
+	case history.SignalFailed:
+		c.f.Set(Result{Err: recordedError(ev)}, nil)
+	default:
+		return fmt.Errorf("%w: %v for a signal", ErrNonDeterministic, ev.Type)
+	}
+	return nil
+}
+
+// SignalWorkflow sends signal name with payload to the active execution of
+// instance instanceID (this one included); the future resolves once the
+// store answered (in the checkpoint that records it): an empty Result, or
+// a *RecordedError with kind store.KindNotFound or store.KindNotActive.
+// Not cancelable. Sent in the task that ends the workflow, it is still
+// sent (its answer is not awaited).
+func (st *State) SignalWorkflow(instanceID, name string, payload []byte) *coro.Future[Result] {
+	c := &signalCall{cmd: command.Command{Kind: command.Signal, Name: name, Ref: instanceID, Payload: payload, ArgHash: history.HashArgs(payload)}}
+	st.issue(c)
+	return &c.f
+}
+
 // sideCall is a side effect: its value comes with its own event.
 type sideCall struct {
 	cmd command.Command

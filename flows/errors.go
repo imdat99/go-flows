@@ -148,6 +148,8 @@ var kinds = struct {
 	{"lock_lost", ErrLockLost},
 	{"attempts_exhausted", ErrAttemptsExhausted},
 	{store.KindCrashLoop, ErrCrashLoop},
+	{store.KindNotFound, ErrNotFound},
+	{store.KindNotActive, ErrNotActive},
 }}
 
 type errorKind struct {

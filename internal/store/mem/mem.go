@@ -583,6 +583,7 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 	leases := s.createActivities(e, l.Owner, c.Activities, now)
 	s.createChildren(e, c.Children, now)
 	s.cancelRequests(e, c, now)
+	s.sendSignals(e, c.Signals, now)
 	s.acquireLocks(e, c.Locks, now)
 	s.compensateChildren(e, c.CompensateChildren, now)
 
@@ -996,6 +997,27 @@ func (s *Store) Signal(_ context.Context, instanceID, name string, payload []byt
 // RequestCancel implements store.Store.
 func (s *Store) RequestCancel(_ context.Context, instanceID string) error {
 	return s.deliver(instanceID, history.Event{Type: history.ExecutionCancelRequested})
+}
+
+// sendSignals delivers the signals e sends, as Signal does, and answers
+// each to e (store.Completion.Signals).
+func (s *Store) sendSignals(e *execution, reqs []store.SignalRequest, now time.Time) {
+	for _, r := range reqs {
+		answer := history.Event{Type: history.SignalDelivered, ScheduleID: r.ScheduleID, Ref: r.InstanceID}
+		id, ok := s.latest[r.InstanceID]
+		switch target := s.executions[id]; {
+		case !ok:
+			answer.Type, answer.Err, answer.ErrKinds = history.SignalFailed, store.SignalNotFound, store.KindNotFound
+		case !target.Status.Active():
+			answer.Type, answer.Err, answer.ErrKinds = history.SignalFailed, store.SignalNotActive, store.KindNotActive
+		default:
+			s.addPending(target, history.Event{Type: history.SignalReceived, Name: r.Name, Payload: clone(r.Payload)}, now)
+			if target != e {
+				s.hint(store.WorkflowWork, target.Queue)
+			}
+		}
+		s.addPending(e, answer, now)
+	}
 }
 
 // acquireLocks answers the lock requests of e.

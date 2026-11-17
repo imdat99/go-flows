@@ -161,6 +161,10 @@ func Run(t *testing.T, h Harness) {
 		{"PurgedIDOfChain", testPurgedIDOfChain},
 		{"PurgedChildID", testPurgedChildID},
 		{"PurgeRacesCreate", testPurgeRacesCreate},
+		{"SignalWorkflow", testSignalWorkflow},
+		{"SignalWorkflowContinueAsNew", testSignalWorkflowContinueAsNew},
+		{"SignalWorkflowAtomic", testSignalWorkflowAtomic},
+		{"SignalWorkflowMutual", testSignalWorkflowMutual},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

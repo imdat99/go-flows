@@ -114,6 +114,19 @@ const (
 	// whose parent compensates) to compensate its activities and children.
 	ExecutionCompensationRequested
 
+	// SignalSent records a signal the workflow sends to another instance
+	// (or to itself): Ref (the target instance id), Name, Payload, ArgHash.
+	// The store delivers it in the checkpoint that records it and answers
+	// with a pending SignalDelivered or SignalFailed.
+	SignalSent
+	// SignalDelivered reports that the signal of ScheduleID reached the
+	// active execution of Ref.
+	SignalDelivered
+	// SignalFailed reports that the signal of ScheduleID was not delivered:
+	// Err and ErrKinds (the instance Ref is unknown, or its latest
+	// execution ended).
+	SignalFailed
+
 	typeCount // keep last
 )
 
@@ -148,6 +161,9 @@ var typeNames = [typeCount]string{
 	LockHeld:                       "LockHeld",
 	LockLost:                       "LockLost",
 	ExecutionCompensationRequested: "ExecutionCompensationRequested",
+	SignalSent:                     "SignalSent",
+	SignalDelivered:                "SignalDelivered",
+	SignalFailed:                   "SignalFailed",
 }
 
 func (t Type) String() string {
@@ -166,7 +182,7 @@ func (t Type) Valid() bool { return t > 0 && t < typeCount }
 func (t Type) IsCommand() bool {
 	switch t {
 	case ActivityScheduled, ActivityCancelRequested, TimerScheduled, TimerCanceled,
-		SideEffectResult, ChildScheduled, ChildCancelRequested, LockRequested:
+		SideEffectResult, ChildScheduled, ChildCancelRequested, LockRequested, SignalSent:
 		return true
 	}
 	return false
@@ -201,7 +217,8 @@ type Event struct {
 	Name string
 	// Version is the workflow version (ExecutionStarted, ChildScheduled).
 	Version int32
-	// Ref is the child instance id (ChildScheduled).
+	// Ref is the child instance id (ChildScheduled), or the target of a
+	// signal (SignalSent and its answer).
 	Ref string
 	// Queue is the queue of an activity, a child, or the execution.
 	Queue string

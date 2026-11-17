@@ -13,7 +13,8 @@
 // The executor derives the rest from the scheduling events Commit returns:
 //   - activity tasks (Name, Queue; policies come from the registry by Name);
 //   - the pending TimerFired (visible at At);
-//   - child instances (Ref, Queue, Payload).
+//   - child instances (Ref, Queue, Payload);
+//   - signals to deliver (Ref, Name, Payload).
 //
 // For a side effect, the value is the command's Payload when first executed
 // and the recorded event's Payload during replay.
@@ -41,6 +42,8 @@ const (
 	SideEffect
 	// Lock asks for a business lock (Name; Payload is its TTL).
 	Lock
+	// Signal sends signal Name with Payload to instance Ref.
+	Signal
 )
 
 func (k Kind) String() string {
@@ -55,11 +58,13 @@ func (k Kind) String() string {
 		return "side effect"
 	case Lock:
 		return "lock"
+	case Signal:
+		return "signal"
 	}
 	return fmt.Sprintf("Kind(%d)", uint8(k))
 }
 
-func (k Kind) valid() bool { return k >= Activity && k <= Lock }
+func (k Kind) valid() bool { return k >= Activity && k <= Signal }
 
 // State of a command.
 type State uint8
@@ -116,9 +121,9 @@ type Command struct {
 	Kind  Kind
 	State State
 
-	Name    string    // activity, workflow or timer name
+	Name    string    // activity, workflow, timer, lock or signal name
 	Version int32     // child workflow version
-	Ref     string    // child instance id
+	Ref     string    // child instance id, or a signal's target
 	Queue   string    // activity or child queue
 	Payload []byte    // encoded input (or the side effect value)
 	ArgHash uint64    // history.HashArgs(Payload) for activities and children
@@ -175,6 +180,9 @@ func (c *Command) scheduledEvent() history.Event {
 	case Lock:
 		ev.Type = history.LockRequested
 		ev.Payload, ev.ArgHash = c.Payload, c.ArgHash
+	case Signal:
+		ev.Type = history.SignalSent
+		ev.Ref, ev.Payload, ev.ArgHash = c.Ref, c.Payload, c.ArgHash
 	}
 	return ev
 }
@@ -187,13 +195,15 @@ func (c *Command) cancelType() history.Type {
 		return history.TimerCanceled
 	case Child:
 		return history.ChildCancelRequested
-	case SideEffect, Lock:
+	case SideEffect, Lock, Signal:
 	}
 	return 0
 }
 
 // Cancelable reports whether the kind can be canceled.
-func (c *Command) Cancelable() bool { return c.Kind != SideEffect && c.Kind != Lock && c.Kind.valid() }
+func (c *Command) Cancelable() bool {
+	return c.Kind != SideEffect && c.Kind != Lock && c.Kind != Signal && c.Kind.valid()
+}
 
 // Cancel cancels the command:
 //   - a pending command is dropped: nothing is written and no outcome
@@ -276,6 +286,8 @@ func (c *Command) match(ev *history.Event) error {
 		return c.mismatch(ev, "timer deadline")
 	case c.Kind == Child && (ev.Ref != want.Ref || ev.Version != want.Version):
 		return c.mismatch(ev, "child workflow")
+	case c.Kind == Signal && ev.Ref != want.Ref:
+		return c.mismatch(ev, "signal target")
 	}
 	return nil
 }

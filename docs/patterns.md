@@ -88,6 +88,15 @@ if errors.Is(err, flows.ErrAwaitTimeout) {
 The sender calls `engine.Signal(ctx, orderID, "approval", true)`, from any
 process. A signal sent early is kept until the workflow reads it.
 
+Another workflow sends it with `flows.SignalWorkflow`, durably and once
+(no activity needed):
+
+```go
+if _, err := flows.SignalWorkflow(c, orderID, "approval", true).Get(c); err != nil {
+	return err // ErrNotFound, or ErrNotActive: the order has ended
+}
+```
+
 To wait for several things at once, use a timer and a signal in `Select`:
 
 ```go

@@ -88,6 +88,15 @@ if errors.Is(err, flows.ErrAwaitTimeout) {
 Bên gửi gọi `engine.Signal(ctx, orderID, "approval", true)`, từ process
 nào cũng được. Signal gửi sớm được giữ cho tới khi workflow đọc.
 
+Workflow khác gửi bằng `flows.SignalWorkflow`, durable và đúng một lần
+(không cần activity):
+
+```go
+if _, err := flows.SignalWorkflow(c, orderID, "approval", true).Get(c); err != nil {
+	return err // ErrNotFound, hoặc ErrNotActive: đơn hàng đã kết thúc
+}
+```
+
 Để chờ nhiều thứ cùng lúc, dùng timer và signal trong `Select`:
 
 ```go

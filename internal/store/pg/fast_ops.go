@@ -23,6 +23,9 @@ var (
 	nInsertChild         = stmtName(insertChild)
 	nInsertChildKept     = stmtName(insertChildKept)
 	nCancelChildren      = stmtName(cancelChildren)
+	nLockSignalsBefore   = stmtName(lockSignalsBefore)
+	nLockSignalsAfter    = stmtName(lockSignalsAfter)
+	nSendSignals         = stmtName(sendSignals)
 	nCancelActs          = stmtName(cancelActivities)
 	nAcquireLock         = stmtName(acquireLock)
 	nCompChild           = stmtName(compensateChild)
@@ -101,9 +104,7 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 	fb := s.getFastBatch(ctx, pc.Conn())
 	defer fb.release()
 
-	if terminal {
-		fb.stmt(lockParent, nLockParent, func() { fb.Int(l.ID) }) // T9.5: parent row first
-	}
+	fb.lockFirst(l, c, terminal)
 	fb.stmt(fence, nFence, func() {
 		fb.Int(l.ID)
 		fb.Str(l.Owner)
@@ -117,6 +118,7 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 			fb.Ints(len(c.Consumed), func(i int) int64 { return c.Consumed[i] })
 		})
 	}
+	fb.lockSignalsAfter(l, c, terminal)
 	if len(c.History) > 0 {
 		fb.stmt(insertHistory, nInsertHistory, func() {
 			fb.Int(l.ID)
@@ -194,6 +196,7 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 			fb.Strs(len(c.ChildCancels), func(i int) string { return c.ChildCancels[i] })
 		})
 	}
+	fb.sendSignals(l, c.Signals)
 	if len(c.CanceledActivities) > 0 {
 		fb.stmt(cancelActivities, nCancelActs, func() {
 			fb.Int(l.ID)
@@ -242,6 +245,48 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 		return nil
 	})
 	return leases, err
+}
+
+// lockFirst encodes the statement before the fence: lockSignalsBefore
+// when c sends signals (T12.1: rows in id order, the parent's included),
+// else lockParent when c ends the execution (T9.5: parent row first).
+func (fb *fastBatch) lockFirst(l store.Lease, c *store.Completion, terminal bool) {
+	switch sigs := c.Signals; {
+	case len(sigs) > 0:
+		fb.stmt(lockSignalsBefore, nLockSignalsBefore, func() {
+			fb.Int(l.ID)
+			fb.Strs(len(sigs), func(i int) string { return sigs[i].InstanceID })
+			fb.Bool(terminal)
+		})
+	case terminal:
+		fb.stmt(lockParent, nLockParent, func() { fb.Int(l.ID) })
+	}
+}
+
+// lockSignalsAfter encodes lockSignalsAfter when c sends signals.
+func (fb *fastBatch) lockSignalsAfter(l store.Lease, c *store.Completion, terminal bool) {
+	if sigs := c.Signals; len(sigs) > 0 {
+		fb.stmt(lockSignalsAfter, nLockSignalsAfter, func() {
+			fb.Int(l.ID)
+			fb.Strs(len(sigs), func(i int) string { return sigs[i].InstanceID })
+			fb.Bool(writesChildren(c, terminal))
+		})
+	}
+}
+
+// sendSignals encodes sendSignals for sigs, if any.
+func (fb *fastBatch) sendSignals(l store.Lease, sigs []store.SignalRequest) {
+	n := len(sigs)
+	if n == 0 {
+		return
+	}
+	fb.stmt(sendSignals, nSendSignals, func() {
+		fb.Int(l.ID)
+		fb.Ints(n, func(i int) int64 { return int64(sigs[i].ScheduleID) })
+		fb.Strs(n, func(i int) string { return sigs[i].InstanceID })
+		fb.Strs(n, func(i int) string { return sigs[i].Name })
+		fb.Blobs(n, func(i int) []byte { return sigs[i].Payload })
+	})
 }
 
 // resumeAfter queues the resume of c's kept lease when c asks for it

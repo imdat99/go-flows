@@ -23,6 +23,12 @@ must take care of.
   cancel), instead of `ErrCanceled` at once as when the child's context is
   canceled (unchanged). Recorded in the history (replay checks it) and
   delivered to the child in the same checkpoint; no migration (T12.2).
+- `flows.SignalWorkflow(c, instanceID, name, payload)`: workflow code
+  signals another workflow (or itself) durably. The signal is a command
+  (`SignalSent` in the history) delivered in the transaction of the
+  checkpoint that records it, never sent again on replay; its future
+  resolves with `nil`, `ErrNotFound` or `ErrNotActive`. Mutual signals
+  lock execution rows in id order (no deadlock). No migration (T12.1).
 - `examples/modulith`: a modular monolith blueprint (five modules, cross-module sagas, split deployments by queue).
 - `flows.InstanceID(c)` and `flows.ExecutionID(c)`: workflow code reads
   its own instance id (kept by continue-as-new) and execution id;

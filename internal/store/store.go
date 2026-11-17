@@ -97,6 +97,17 @@ const (
 	// (WorkflowTask.Claims: its engines crashed or lost the lease mid-task,
 	// T11.3); ReopenParked resumes those too.
 	KindCrashLoop = "crash_loop"
+	// KindNotFound and KindNotActive are the kinds of a SignalFailed answer
+	// (Completion.Signals): the target instance is unknown (ErrNotFound),
+	// or its latest execution ended (ErrNotActive).
+	KindNotFound  = "not_found"
+	KindNotActive = "not_active"
+)
+
+// The messages of a SignalFailed answer (Completion.Signals).
+const (
+	SignalNotFound  = "signal not delivered: instance not found"
+	SignalNotActive = "signal not delivered: instance not active"
 )
 
 // Status of an execution. Values are stored: never change them.
@@ -286,6 +297,18 @@ type Completion struct {
 	// (continue-as-new included) or is terminated. A pending LockLost blocks
 	// a terminal completion like a signal (ErrPendingEvents).
 	Locks []LockRequest
+	// Signals are signals the workflow sends (SignalSent events), delivered
+	// in this checkpoint as Signal delivers them: a SignalReceived pending
+	// event for the active execution of the target instance id (this one
+	// included), made ready. Each gets a pending answer for this execution,
+	// visible at once, in order: SignalDelivered, or SignalFailed (Ref the
+	// target, Err SignalNotFound or SignalNotActive, ErrKinds KindNotFound
+	// or KindNotActive). An ending completion may send signals too (its
+	// answers are dropped with its other pending events; a signal to itself
+	// then moves to the next execution of a continue-as-new). The store
+	// locks the targets' execution rows and its own in id order, so that
+	// executions signalling each other at once do not deadlock.
+	Signals []SignalRequest
 	// KeepFor > 0 keeps the lease, extended to now + KeepFor, after a task
 	// that leaves the execution running or compensating: the owner runs the next task itself (eager execution) and gets
 	// its events from ResumeWorkflowTask or CompleteActivityTask. Otherwise
@@ -337,6 +360,14 @@ type LockRequest struct {
 	// nobody. A request without Wait leaves the queue.
 	Wait      bool
 	WaitRetry time.Duration
+}
+
+// SignalRequest is a signal a workflow sends (Completion.Signals).
+type SignalRequest struct {
+	ScheduleID int32
+	InstanceID string // the target
+	Name       string
+	Payload    []byte
 }
 
 // LockWaitTimer is the name of the timer a waiter for lock key sleeps on
@@ -455,7 +486,7 @@ func ValidShape(c *Completion) bool {
 // validEnding reports whether an ending completion creates nothing that
 // would be dropped at once: no activity, timer, lock or child compensation,
 // and children only with a continue-as-new (they run on, detached; others
-// would be canceled at once).
+// would be canceled at once). Signals are allowed: they are delivered.
 func validEnding(c *Completion) bool {
 	if c.Status == "" || c.Status.Active() {
 		return true

@@ -16,6 +16,7 @@ func TestTypeLiterals(t *testing.T) {
 		typeRetryCompensation:     history.CompensationRetryRequested,
 		typeCompensationCompleted: history.CompensationCompleted, typeCompensationRequested: history.ExecutionCompensationRequested,
 		typeLockAcquired: history.LockAcquired, typeLockHeld: history.LockHeld, typeLockLost: history.LockLost,
+		typeSignalDelivered: history.SignalDelivered, typeSignalFailed: history.SignalFailed,
 	} {
 		if lit != strconv.Itoa(int(typ)) {
 			t.Errorf("literal %s for %v (%d)", lit, typ, typ)

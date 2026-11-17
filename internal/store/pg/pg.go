@@ -923,7 +923,9 @@ func (s *Store) ResumeWorkflowTask(ctx context.Context, l store.Lease, ttl time.
 // cancelChildrenOf (no transaction holds a child's row while waiting for
 // its parent's task or lock rows); claims, renewals and acquireLock's
 // previous holder use SKIP LOCKED. parent_id never changes: reading it
-// unlocked is safe.
+// unlocked is safe. A completion that sends signals locks its targets'
+// rows too, all execution rows in id order (lockSignalsBefore, which
+// replaces this statement).
 const lockParent = `
 	SELECT 1 FROM flows.execution
 	WHERE id = (SELECT parent_id FROM flows.execution WHERE id = $1 AND parent_id <> 0)
@@ -1270,6 +1272,113 @@ func (s *Store) insertChildSQL() (sql, name string) {
 	return insertChild, nInsertChild
 }
 
+// latestExecOf is the id of the latest execution of instance id t (an SQL
+// expression).
+func latestExecOf(t string) string {
+	return `(SELECT e.id FROM flows.execution e WHERE e.instance_id = ` + t + ` ORDER BY e.id DESC LIMIT 1)`
+}
+
+// A completion that sends signals (store.Completion.Signals) locks the
+// execution rows it writes in id order, so that two executions signalling
+// each other at once cannot deadlock (T12.1). Id order agrees with
+// lockParent's ancestor-before-descendant order: a child is created after
+// its parent's execution. lockSignalsBefore, in place of lockParent (before
+// the fence), locks the targets' latest executions of a lower id than its
+// own $1 (targets $2), and its parent when it ends ($3). lockSignalsAfter,
+// right after the fence, locks those of a higher id with its children's
+// rows when it writes them ($3: child cancels, child compensation, or an
+// end), in one order. sendSignals then writes them. A target created or
+// continued as new after these statements ran is locked by sendSignals out
+// of order (a child started in the same checkpoint is this transaction's
+// own row): a cycle there is left to Postgres' detection (retry).
+var (
+	lockSignalsBefore = `
+		SELECT 1 FROM flows.execution
+		WHERE id < $1 AND id IN (
+			SELECT parent_id FROM flows.execution WHERE id = $1 AND parent_id <> 0 AND $3::boolean
+			UNION ALL
+			SELECT ` + latestExecOf("t") + ` FROM unnest($2::text[]) AS t)
+		ORDER BY id
+		FOR NO KEY UPDATE`
+	lockSignalsAfter = `
+		SELECT 1 FROM flows.execution
+		WHERE id > $1 AND id IN (
+			SELECT ` + latestExecOf("t") + ` FROM unnest($2::text[]) AS t
+			UNION ALL
+			SELECT id FROM flows.execution WHERE parent_id = $1 AND parent_id <> 0 AND $3::boolean)
+		ORDER BY id
+		FOR NO KEY UPDATE`
+)
+
+// sendSignals delivers the signals execution $1 sends (schedule ids $2,
+// targets $3, names $4, payloads $5) as deliver does, and answers each to
+// $1: SignalDelivered, or SignalFailed when the target is unknown or ended.
+// Pending events are inserted in the order of the signals, each signal
+// before its answer (the memory store's order).
+var sendSignals = `
+	WITH u AS (
+		SELECT * FROM unnest($2::int[], $3::text[], $4::text[], $5::bytea[]) WITH ORDINALITY AS u(sched, target, name, payload, ord)
+	), t AS (
+		UPDATE flows.execution x SET ready_at = least(coalesce(x.ready_at, now()), now())
+		WHERE x.id IN (SELECT ` + latestExecOf("u.target") + ` FROM u) AND x.status IN ` + activeStatuses + `
+		RETURNING x.id, x.instance_id, x.queue,
+		          x.status <> 'needs_attention' AND (x.locked_until IS NULL OR x.locked_until <= now()) AS free
+	), ins AS (
+		INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, name, ref, payload, err, err_kinds)
+		SELECT r.execution_id, now(), r.type, r.sched, r.name, r.ref, r.payload, r.err, r.kinds FROM (
+			SELECT t.id AS execution_id, ` + typeSignal + ` AS type, 0 AS sched, u.name, '' AS ref, u.payload,
+			       '' AS err, '' AS kinds, u.ord, 0 AS k
+			FROM u JOIN t ON t.instance_id = u.target
+			UNION ALL
+			SELECT $1, CASE WHEN t.id IS NULL THEN ` + typeSignalFailed + ` ELSE ` + typeSignalDelivered + ` END,
+			       u.sched, '', u.target, NULL,
+			       CASE WHEN t.id IS NOT NULL THEN ''
+			            WHEN EXISTS (SELECT 1 FROM flows.execution e WHERE e.instance_id = u.target)
+			            THEN '` + store.SignalNotActive + `' ELSE '` + store.SignalNotFound + `' END,
+			       CASE WHEN t.id IS NOT NULL THEN ''
+			            WHEN EXISTS (SELECT 1 FROM flows.execution e WHERE e.instance_id = u.target)
+			            THEN '` + store.KindNotActive + `' ELSE '` + store.KindNotFound + `' END,
+			       u.ord, 1
+			FROM u LEFT JOIN t ON t.instance_id = u.target
+		) r
+		ORDER BY r.ord, r.k
+	)
+	SELECT ` + notifyW + "queue) FROM t WHERE free"
+
+const (
+	typeSignalDelivered = "32" // history.SignalDelivered
+	typeSignalFailed    = "33" // history.SignalFailed
+)
+
+// signalTargets lists the targets of c's signals.
+func signalTargets(c *store.Completion) []string {
+	ts := make([]string, len(c.Signals))
+	for i := range c.Signals {
+		ts[i] = c.Signals[i].InstanceID
+	}
+	return ts
+}
+
+// queueSignals queues sendSignals for the signals sigs of execution id,
+// if any.
+func queueSignals(queue func(sql string, args ...any), id int64, sigs []store.SignalRequest) {
+	n := len(sigs)
+	if n == 0 {
+		return
+	}
+	scheds, targets, names, payloads := make([]int32, n), make([]string, n), make([]string, n), make([][]byte, n)
+	for i, r := range sigs {
+		scheds[i], targets[i], names[i], payloads[i] = r.ScheduleID, r.InstanceID, r.Name, r.Payload
+	}
+	queue(sendSignals, id, scheds, targets, names, payloads)
+}
+
+// writesChildren reports whether a completion writes rows of its children
+// (lockSignalsAfter).
+func writesChildren(c *store.Completion, terminal bool) bool {
+	return terminal || len(c.ChildCancels) > 0 || len(c.CompensateChildren) > 0
+}
+
 const cancelChildren = `
 	WITH t AS (
 		UPDATE flows.execution SET ready_at = least(coalesce(ready_at, now()), now())
@@ -1480,13 +1589,23 @@ func (s *Store) completeWithPgx(ctx context.Context, l store.Lease, c *store.Com
 ) (map[actKey]int64, error) {
 	c.Resumed = false // set again below on success (retry may run this twice)
 	b := &pgx.Batch{}
-	sh := completionShape{activityAt: -1, parentFirst: terminal}
-	if terminal {
+	signals := len(c.Signals) > 0
+	sh := completionShape{activityAt: -1, parentFirst: terminal || signals}
+	var targets []string
+	switch {
+	case signals:
+		targets = signalTargets(c)
+		b.Queue(lockSignalsBefore, l.ID, targets, terminal) // T12.1: in id order, lockParent included
+	case terminal:
 		b.Queue(lockParent, l.ID)
 	}
 	b.Queue(fence, l.ID, l.Owner, l.Version, prevSeq, len(c.History) > 0)
 	if terminal {
 		b.Queue(noUndelivered, l.ID, nonNil(c.Consumed)) // NULL would disable the check
+		sh.statements++
+	}
+	if signals {
+		b.Queue(lockSignalsAfter, l.ID, targets, writesChildren(c, terminal))
 		sh.statements++
 	}
 	s.queueCompletion(b, l, c, ending, lastSeq, &sh)
@@ -1554,7 +1673,7 @@ func resumes(c *store.Completion, ending bool) bool {
 // completionShape tells readCompletion which statements were queued after
 // the fence.
 type completionShape struct {
-	parentFirst bool // lockParent queued before the fence
+	parentFirst bool // lockParent (or lockSignalsBefore) queued before the fence
 	statements  int  // queued statements after the fence
 	activityAt  int  // index of the activity insert among them, -1 if none
 	childAt     int  // index of the first child insert, then one per child
@@ -1607,6 +1726,7 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 	if len(c.ChildCancels) > 0 {
 		queue(cancelChildren, l.ID, c.ChildCancels)
 	}
+	queueSignals(queue, l.ID, c.Signals)
 	if len(c.CanceledActivities) > 0 {
 		queue(cancelActivities, l.ID, c.CanceledActivities)
 	}

@@ -37,6 +37,7 @@ var order = fl.DefineWorkflow("order", 1, func(c fl.Ctx, items map[string]int) (
 	_ = mu
 	var ok fl.WaitGroup // fine
 	_ = ok
+	_, _ = fl.SignalWorkflow(c, "other", "go", keys).Get(c) // a durable command: fine
 	// The value of a side effect is recorded: anything goes in it.
 	id, _ := fl.SideEffect(c, func() int64 { return time.Now().UnixNano() + rand.Int64() })
 	_ = id

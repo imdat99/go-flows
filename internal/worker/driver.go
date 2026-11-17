@@ -342,10 +342,11 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		c.Locks[i].Hold = w.opts.LockHold
 	}
 	c.Resume = nil
+	answered := answeredAtOnce(c)
 	switch {
-	case (d.inflight+len(eager) > 0 || len(c.Locks) > 0) && !stopping:
+	case (d.inflight+len(eager) > 0 || answered) && !stopping:
 		c.KeepFor = w.opts.LeaseTTL
-		if len(c.Locks) > 0 {
+		if answered {
 			// The answers are pending as soon as it commits: the next task
 			// comes back with the completion (T9.7, one round trip).
 			c.Resume = d.nextResumeBuffer()
@@ -383,10 +384,10 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		w.wfDue.add(sent.Add(nextTimer.Sub(task.Now)))
 	}
 	// Read before completed: it may hand c's executor to the cache.
-	locks, next, resumed := len(c.Locks) > 0, c.Resume, c.Resumed
+	next, resumed := c.Resume, c.Resumed
 	c.Resume = nil
 	d.completed(task, c, eager, leases, sent)
-	if locks && d.held {
+	if answered && d.held {
 		// The answers are pending already: run the next task at once.
 		if resumed {
 			d.taskAt = sent
@@ -395,6 +396,13 @@ func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *
 		d.lost() // kept, yet not resumed: the lease moved on meanwhile
 	}
 	return nil
+}
+
+// answeredAtOnce reports whether completion c leaves the execution running
+// with answers the store makes pending as it commits: to its lock requests
+// or to its signals (T12.1).
+func answeredAtOnce(c *store.Completion) bool {
+	return len(c.Locks) > 0 || len(c.Signals) > 0 && (c.Status == "" || c.Status.Active())
 }
 
 // stickyTimer returns the execution's next timer (whoever committed it)

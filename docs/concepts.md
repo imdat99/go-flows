@@ -164,6 +164,13 @@ returned and its original `Key`:
   `flows.Await[T](c, name, timeout)` or `flows.Signals[T](c, name)`, in
   arrival order, with none dropped. A signal sent before the workflow listens
   is kept. Unread signals move to the next execution on `ContinueAsNew`.
+- **Workflows signal workflows.** `flows.SignalWorkflow(c, id, name,
+  payload)` sends a signal from workflow code to any instance (itself, its
+  parent or a child included). It is a command recorded in the history and
+  delivered in the transaction of the checkpoint that records it: sent
+  once, never again on replay. Its future resolves with `nil`, or an error
+  matching `ErrNotFound` (unknown instance) or `ErrNotActive` (its execution
+  ended). A signal sent as the workflow returns, not awaited, is still sent.
 - **Children are workflows started from a workflow.** `wf.Child(c, id, in)`
   returns a `Future`. Canceling the parent cancels its running children,
   and so does its end. Canceling the context a child was started with

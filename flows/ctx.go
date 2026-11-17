@@ -145,7 +145,8 @@ func Rand(c Ctx) (uint64, error) {
 	return binary.BigEndian.Uint64(raw), nil
 }
 
-// Future is the result of an activity, a child workflow or a timer.
+// Future is the result of an activity, a child workflow, a timer or a
+// signal sent (SignalWorkflow).
 type Future[T any] struct {
 	res   *coro.Future[executor.Result]
 	timer *coro.Future[struct{}]
@@ -360,6 +361,37 @@ func Await[T any](c Ctx, name string, timeout time.Duration) (T, error) {
 		}),
 	)
 	return v, err
+}
+
+// SignalWorkflow sends the signal name with payload (JSON-encoded) to the
+// running execution of instanceID from workflow code, as Engine.Signal does
+// from outside: the receiver reads it with Signals or Await. The target may
+// be any instance, this one, its parent or a child included.
+//
+// The signal is a durable command: it is recorded in the history and
+// delivered in the same transaction as the checkpoint that records it, so
+// it is sent exactly once, never again on replay. The future resolves
+// once the store answered, in the next workflow task (without a poll: the
+// engine resumes the execution at once): nil when delivered, an error
+// matching ErrNotFound when the instance is unknown, or ErrNotActive when
+// its latest execution has ended. Invalid arguments or a payload that
+// cannot be encoded fail the call with a permanent error (nothing is sent).
+//
+// Sent in the task that ends the workflow, without awaiting the future,
+// the signal is sent all the same. Replaying a different target, name or
+// payload than recorded parks the execution (non-determinism). A signal
+// cannot be canceled: RequestCancel on its future fails the workflow, as
+// on any future that is not a child workflow's.
+func SignalWorkflow[T any](c Ctx, instanceID, name string, payload T) *Future[struct{}] {
+	if err := errors.Join(text.CheckName(ErrInvalidArgument, "instance id", instanceID),
+		text.CheckName(ErrInvalidArgument, "signal name", name)); err != nil {
+		return &Future[struct{}]{err: Permanent(err)}
+	}
+	b, err := newCodec[T]().encode(payload)
+	if err != nil {
+		return &Future[struct{}]{err: Permanent(fmt.Errorf("flows: encode signal payload: %w", err))}
+	}
+	return &Future[struct{}]{res: c.state().SignalWorkflow(instanceID, name, b)}
 }
 
 // WaitGroup waits for coroutines started with Go, deterministically (a
