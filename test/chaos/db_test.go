@@ -31,14 +31,17 @@ func TestDBBlackhole(t *testing.T) {
 	a, b := cl.slots[0], cl.slots[1]
 	frozenProc := a.proc
 	pid := frozenProc.pid()
+	// Attempts in their work: past the random failure, decided at once
+	// after an attempt is recorded.
+	const working = `FROM soak_attempt WHERE pid = $1 AND step = 'soak.step' AND ended IS NULL
+		AND started < now() - interval '300 milliseconds'`
 	waitFor(t, "the engine to blackhole to run activities", 2*time.Minute, func() bool {
-		return count(t, cl.check, `SELECT count(*) FROM soak_attempt WHERE pid = $1 AND step = 'soak.step' AND ended IS NULL`, pid) >= 2
+		return count(t, cl.check, `SELECT count(*) `+working, pid) >= 2
 	})
 	a.proxy.Freeze()
 	frozen := time.Now()
 	var running []int64
-	if err := cl.check.QueryRow(context.Background(), `
-		SELECT coalesce(array_agg(id), '{}') FROM soak_attempt WHERE pid = $1 AND ended IS NULL`, pid).Scan(&running); err != nil {
+	if err := cl.check.QueryRow(context.Background(), `SELECT coalesce(array_agg(id), '{}') `+working, pid).Scan(&running); err != nil {
 		t.Fatal(err)
 	}
 	// Given up within the lease (ttl - ttl/3 after the last renewal): every
@@ -52,18 +55,21 @@ func TestDBBlackhole(t *testing.T) {
 	if lost == 0 {
 		t.Fatalf("none of the %d attempts running at the freeze was canceled with ErrLeaseLost", len(running))
 	}
-	// The other engine takes them over (once the leases expired).
+	// The other engine takes them over (once the leases expired): its
+	// attempts of their keys after them (not an earlier attempt it made of
+	// one of those keys, failed and retried by the frozen engine).
 	waitFor(t, "the other engine to take an activity over", time.Minute, func() bool {
 		return count(t, cl.check, `
 			SELECT count(*) FROM soak_attempt a JOIN soak_attempt l ON l.key = a.key
-			WHERE l.id = ANY($1) AND l.outcome = 'lease-lost' AND a.pid = $2`, running, b.proc.pid()) > 0
+			WHERE l.id = ANY($1) AND l.outcome = 'lease-lost' AND a.pid = $2 AND a.started > l.started`,
+			running, b.proc.pid()) > 0
 	})
 	// T11.3: the lost attempt counted toward the retry policy, the
 	// takeover's attempt number is higher.
 	var lostAt, takeoverAt int
 	if err := cl.check.QueryRow(context.Background(), `
 		SELECT l.attempt, a.attempt FROM soak_attempt a JOIN soak_attempt l ON l.key = a.key
-		WHERE l.id = ANY($1) AND l.outcome = 'lease-lost' AND a.pid = $2
+		WHERE l.id = ANY($1) AND l.outcome = 'lease-lost' AND a.pid = $2 AND a.started > l.started
 		ORDER BY a.started LIMIT 1`, running, b.proc.pid()).Scan(&lostAt, &takeoverAt); err != nil {
 		t.Fatal(err)
 	}

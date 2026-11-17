@@ -14,17 +14,19 @@ import (
 // makes it a blackhole (a failover, a partition without RST): it stops
 // forwarding in both directions without closing anything, so peers wait
 // on reads that never return. Thaw resumes forwarding (what was held is
-// delivered).
+// delivered). FreezeReplies holds the server's replies only: requests
+// still reach the server and run there, their replies arrive on Thaw.
 type Proxy struct {
 	l          net.Listener
 	targetHost string
 	targetPort uint16
 
-	mu     sync.Mutex
-	thawed chan struct{} // closed while forwarding; replaced by Freeze
-	conns  map[net.Conn]struct{}
-	closed bool
-	wg     sync.WaitGroup
+	mu      sync.Mutex
+	thawed  chan struct{} // closed while forwarding; replaced by Freeze
+	replies chan struct{} // closed while forwarding replies; replaced by FreezeReplies
+	conns   map[net.Conn]struct{}
+	closed  bool
+	wg      sync.WaitGroup
 }
 
 func newProxy(tb testing.TB, host string, port uint16) *Proxy {
@@ -34,8 +36,12 @@ func newProxy(tb testing.TB, host string, port uint16) *Proxy {
 	if err != nil {
 		tb.Fatalf("testdb: proxy listen: %v", err)
 	}
-	p := &Proxy{l: l, targetHost: host, targetPort: port, thawed: make(chan struct{}), conns: make(map[net.Conn]struct{})}
+	p := &Proxy{
+		l: l, targetHost: host, targetPort: port,
+		thawed: make(chan struct{}), replies: make(chan struct{}), conns: make(map[net.Conn]struct{}),
+	}
 	close(p.thawed)
+	close(p.replies)
 	p.wg.Go(p.accept)
 	return p
 }
@@ -66,23 +72,41 @@ func (p *Proxy) Freeze() {
 	}
 }
 
-// Thaw resumes forwarding (idempotent).
-func (p *Proxy) Thaw() {
+// FreezeReplies stops forwarding the server's replies (idempotent): what
+// clients send still reaches the server.
+func (p *Proxy) FreezeReplies() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	select {
-	case <-p.thawed:
+	case <-p.replies:
+		p.replies = make(chan struct{})
 	default:
-		close(p.thawed)
 	}
 }
 
-// gate returns once forwarding is allowed; false when the proxy closed.
-func (p *Proxy) gate() bool {
+// Thaw resumes forwarding, both ways (idempotent).
+func (p *Proxy) Thaw() {
 	p.mu.Lock()
-	ch := p.thawed
+	defer p.mu.Unlock()
+	for _, ch := range []chan struct{}{p.thawed, p.replies} {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+}
+
+// gate returns once forwarding is allowed (of replies: reply); false when
+// the proxy closed.
+func (p *Proxy) gate(reply bool) bool {
+	p.mu.Lock()
+	ch, rch := p.thawed, p.replies
 	p.mu.Unlock()
 	<-ch // Close thaws
+	if reply {
+		<-rch
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return !p.closed
@@ -129,7 +153,7 @@ func (p *Proxy) accept() {
 			return
 		}
 		p.wg.Go(func() {
-			if !p.gate() || !p.track(c) { // a frozen proxy does not dial either
+			if !p.gate(false) || !p.track(c) { // a frozen proxy does not dial either
 				_ = c.Close()
 				return
 			}
@@ -143,20 +167,21 @@ func (p *Proxy) accept() {
 				p.untrack(c, u)
 				return
 			}
-			p.wg.Go(func() { p.pipe(u, c) })
-			p.pipe(c, u)
+			p.wg.Go(func() { p.pipe(u, c, false) })
+			p.pipe(c, u, true)
 		})
 	}
 }
 
-// pipe copies src to dst, holding what it read while frozen; it closes
-// both ends when either fails (the other direction's pipe then ends too).
-func (p *Proxy) pipe(dst, src net.Conn) {
+// pipe copies src to dst (the server's replies: reply), holding what it
+// read while frozen; it closes both ends when either fails (the other
+// direction's pipe then ends too).
+func (p *Proxy) pipe(dst, src net.Conn, reply bool) {
 	buf := make([]byte, 32<<10)
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
-			if !p.gate() {
+			if !p.gate(reply) {
 				break
 			}
 			if _, werr := dst.Write(buf[:n]); werr != nil {

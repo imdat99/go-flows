@@ -68,15 +68,19 @@ const soakSchema = `
 // random with probability fail before its effect, applying its effect
 // (once per key) in the middle of its work, which honors ctx.
 func soakAttempt(ctx context.Context, step, k, lock string, fail float64) (err error) {
-	// The id is chosen here: an insert committed whose answer was lost (a
-	// connection cut) still gets its end recorded.
-	id := rand.Int64()
+	// The id is chosen here, and the end is an upsert: an attempt whose
+	// start was not recorded (its insert canceled, or its answer lost to a
+	// connection cut, the insert committing after the end) still gets its
+	// end, kept by the late insert.
+	a := attemptRec{
+		id: rand.Int64(), key: k, step: step, lock: lock, pid: os.Getpid(), started: time.Now(), attempt: attemptNumber(ctx),
+	}
 	dup := false
-	defer func() { endAttempt(id, attemptOutcome(ctx, err), dup) }()
+	defer func() { a.end(attemptOutcome(ctx, err), dup) }()
 	if _, err := appExec(ctx, `
 		INSERT INTO soak_attempt (id, key, step, lock_key, pid, started, attempt) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (id) DO NOTHING`,
-		id, k, step, lock, os.Getpid(), time.Now(), attemptNumber(ctx)); err != nil {
+		a.id, a.key, a.step, a.lock, a.pid, a.started, a.attempt); err != nil {
 		return err
 	}
 	if rand.Float64() < fail {
@@ -84,7 +88,9 @@ func soakAttempt(ctx context.Context, step, k, lock string, fail float64) (err e
 	}
 	lo, hi := 10*time.Millisecond, 150*time.Millisecond
 	if step == "soak.step" && soakSlow.Load() {
-		lo, hi = 2500*time.Millisecond, 4*time.Second
+		// Longer than the give-up after a blackhole (ttl - ttl/3 after
+		// the last renewal, at most 2s with soakTTL) and than the lease.
+		lo, hi = 4*time.Second, 6*time.Second
 	}
 	d := lo + rand.N(hi-lo)
 	if err := sleepCtx(ctx, d/2); err != nil {
@@ -133,14 +139,25 @@ func attemptOutcome(ctx context.Context, err error) string {
 	}
 }
 
-// endAttempt records the end of attempt id, its time taken now; it retries
-// for a while (connections cut).
-func endAttempt(id int64, outcome string, dup bool) {
+// attemptRec is an attempt as soak_attempt records it.
+type attemptRec struct {
+	id              int64
+	key, step, lock string
+	pid, attempt    int
+	started         time.Time
+}
+
+// end records the end of the attempt, its time taken now; it retries for
+// a while (connections cut).
+func (a attemptRec) end(outcome string, dup bool) {
 	ended := time.Now()
 	for range 50 {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, err := soakApp.Load().Exec(ctx, `UPDATE soak_attempt SET ended = $2, outcome = $3, dup = $4 WHERE id = $1`,
-			id, ended, outcome, dup)
+		_, err := soakApp.Load().Exec(ctx, `
+			INSERT INTO soak_attempt (id, key, step, lock_key, pid, started, attempt, ended, outcome, dup)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (id) DO UPDATE SET ended = excluded.ended, outcome = excluded.outcome, dup = excluded.dup`,
+			a.id, a.key, a.step, a.lock, a.pid, a.started, a.attempt, ended, outcome, dup)
 		cancel()
 		if err == nil {
 			return

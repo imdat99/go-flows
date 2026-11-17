@@ -43,6 +43,7 @@ type cluster struct {
 	gen    int
 	exits  map[int]time.Time // pid -> exit
 	stops  map[int][]window  // pid -> SIGSTOP windows
+	holes  map[int][]window  // pid -> blackholes of its connections (diagnostics)
 	ids    []int             // started orders
 	nextID int
 	faults map[string]int
@@ -131,7 +132,7 @@ func newCluster(t *testing.T, n int, ttl time.Duration, env ...string) *cluster 
 	}
 	cl := &cluster{
 		t: t, dbName: pool.Config().ConnConfig.Database, direct: testdb.DSN(pool), ttl: ttl, env: env,
-		exits: make(map[int]time.Time), stops: make(map[int][]window), faults: make(map[string]int),
+		exits: make(map[int]time.Time), stops: make(map[int][]window), holes: make(map[int][]window), faults: make(map[string]int),
 	}
 	cl.check = cl.pool("chaos-check", true)
 	db.Store(cl.check)                                                                             // dumps and waitFor: never cut
@@ -273,10 +274,19 @@ func (cl *cluster) pause(s *slot, d time.Duration) {
 // blackhole freezes the connections of s (the database stops answering
 // it) for d.
 func (cl *cluster) blackhole(s *slot, d time.Duration) {
+	from := time.Now()
 	s.proxy.Freeze()
 	time.Sleep(d)
 	s.proxy.Thaw()
+	cl.hole(s.proc.pid(), from)
 	cl.count("blackhole")
+}
+
+// hole records a blackhole of pid's connections, begun at from, ended now.
+func (cl *cluster) hole(pid int, from time.Time) {
+	cl.mu.Lock()
+	cl.holes[pid] = append(cl.holes[pid], window{from: from, to: time.Now()})
+	cl.mu.Unlock()
 }
 
 // frozenStop freezes the connections of s, waits after, then stops its
@@ -285,8 +295,10 @@ func (cl *cluster) blackhole(s *slot, d time.Duration) {
 // and starts another process in s. It returns how long Stop took.
 func (cl *cluster) frozenStop(s *slot, after time.Duration) time.Duration {
 	cl.t.Helper()
+	from := time.Now()
 	s.proxy.Freeze()
 	defer s.proxy.Thaw()
+	defer cl.hole(s.proc.pid(), from)
 	time.Sleep(after)
 	p := s.proc
 	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
@@ -612,12 +624,8 @@ type attemptRow struct {
 // attempt without a recorded end ended at the latest when its process
 // exited; after waitEnded every attempt has an end.
 //
-// An overlap of an attempt a by a later one b is expected only when a's
-// process was frozen with SIGSTOP (a paused process cannot be fenced off
-// its side effects): before b started, and while a held its lease (from
-// up to a ttl before its recorded start, its claim, to its end). Such
-// overlaps are only counted. A pause of b's process, or of a's after b
-// started, excuses nothing: b may start only once a's lease lapsed.
+// Some overlaps are expected around a SIGSTOP (pausedOverlap): a paused
+// process cannot be fenced off its side effects. They are only counted.
 func (cl *cluster) verifyOverlaps() {
 	cl.t.Helper()
 	t := cl.t
@@ -629,18 +637,22 @@ func (cl *cluster) verifyOverlaps() {
 	}
 	cl.mu.Lock()
 	stops := make(map[int][]window, len(cl.stops))
+	now := time.Now()
 	for pid, ws := range cl.stops {
-		stops[pid] = slices.Clone(ws)
-	}
-	cl.mu.Unlock()
-	excused := func(a, b attemptRow) bool {
-		for _, w := range stops[a.pid] {
-			if w.from.Before(b.start) && w.from.Before(a.end) && (w.to.IsZero() || w.to.After(a.start.Add(-cl.ttl))) {
-				return true
+		ws = slices.Clone(ws)
+		for i := range ws {
+			if ws[i].to.IsZero() { // still paused (not after waitEnded)
+				ws[i].to = now
 			}
 		}
-		return false
+		stops[pid] = ws
 	}
+	holes := make(map[int][]window, len(cl.holes))
+	for pid, ws := range cl.holes {
+		holes[pid] = slices.Clone(ws)
+	}
+	cl.mu.Unlock()
+	excused := func(a, b attemptRow) bool { return cl.pausedOverlap(stops, a, b) }
 	groups := map[string][]attemptRow{}
 	for _, a := range all {
 		groups["key "+a.key] = append(groups["key "+a.key], a)
@@ -663,9 +675,10 @@ func (cl *cluster) verifyOverlaps() {
 					excusedN++
 					continue
 				}
-				bad = append(bad, fmt.Sprintf("%s: attempt %d (pid %d, %s, %s..%s) and %d (pid %d, %s, from %s)",
+				bad = append(bad, fmt.Sprintf("%s: attempt %d (pid %d, %s, %s..%s) and %d (pid %d, %s, from %s); faults near: %s",
 					g, a.id, a.pid, a.outcome, a.start.Format("15:04:05.000"), a.end.Format("15:04:05.000"),
-					b.id, b.pid, b.outcome, b.start.Format("15:04:05.000")))
+					b.id, b.pid, b.outcome, b.start.Format("15:04:05.000"),
+					faultsNear(stops, holes, a.start.Add(-10*time.Second), b.start.Add(10*time.Second), a.pid, b.pid)))
 			}
 		}
 	}
@@ -678,6 +691,66 @@ func (cl *cluster) verifyOverlaps() {
 	if len(bad) > 0 {
 		t.Errorf("%d overlapping attempts:\n%s", len(bad), strings.Join(bad, "\n"))
 	}
+}
+
+// faultsNear describes the SIGSTOPs and blackholes of pids between from
+// and to (diagnostics).
+func faultsNear(stops, holes map[int][]window, from, to time.Time, pids ...int) string {
+	var b strings.Builder
+	for _, pid := range pids {
+		for _, f := range []struct {
+			kind string
+			ws   []window
+		}{{"sigstop", stops[pid]}, {"blackhole", holes[pid]}} {
+			for _, w := range f.ws {
+				if w.from.Before(to) && w.to.After(from) {
+					fmt.Fprintf(&b, "[pid %d %s %s..%s] ", pid, f.kind, w.from.Format("15:04:05.000"), w.to.Format("15:04:05.000"))
+				}
+			}
+		}
+	}
+	if b.Len() == 0 {
+		return "none"
+	}
+	return b.String()
+}
+
+// pausedOverlap reports whether attempt b, recorded as starting after a
+// while a ran, overlaps a only because a process was paused (SIGSTOP)
+// holding a lease that lapsed meanwhile, the paused attempt returning soon
+// after the resume:
+//
+//   - a's process was paused before b started, while a held its lease
+//     (from up to a ttl before a's recorded start, its claim, to its end):
+//     the lease lapsed, b's engine took the task over, and a ran on;
+//   - or b's process was paused after its claim and before it recorded its
+//     start (before a started), within a ttl before that start: its lease
+//     lapsed, a's engine took the task over, and b recorded its start on
+//     resume, after a's.
+//
+// A pause of b's process while b runs, or of a's after b started, excuses
+// nothing: b may start only once a's lease lapsed. Nor does a paused
+// attempt running on after the resume for longer than resumeMargin: the
+// resumed engine must give the lost lease up first.
+func (cl *cluster) pausedOverlap(stops map[int][]window, a, b attemptRow) bool {
+	// On resume the overdue renewal runs at once and learns the loss, or
+	// the expire timer (due within an interval) gives up the leases not
+	// renewed for ttl - interval, a hanging renewal being canceled after an
+	// interval: about two intervals at worst, plus 1s for -race and a
+	// loaded machine.
+	resumeMargin := 2*cl.ttl/3 + time.Second
+	for _, w := range stops[a.pid] {
+		if w.from.Before(b.start) && w.to.After(a.start.Add(-cl.ttl)) && !a.end.After(w.to.Add(resumeMargin)) {
+			return true
+		}
+	}
+	for _, w := range stops[b.pid] {
+		if w.from.Before(a.start) && w.from.Before(b.start) && w.to.After(b.start.Add(-cl.ttl)) &&
+			!b.end.After(w.to.Add(resumeMargin)) {
+			return true
+		}
+	}
+	return false
 }
 
 // attempts returns the attempts recorded, by start, with their ends (an
