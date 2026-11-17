@@ -739,7 +739,8 @@ Quy trình như P11. Ba mục làm song song (worktree riêng), rồi T12.4 cậ
 - [x] **T12.4** Example modulith dùng T12.1–T12.3 (bỏ activity `forward-cancel`, dùng tombstone thay kiểm tra thủ công nếu hợp lý), cập nhật mục giới hạn đã biết.
     - Đơn hàng huỷ shipment bằng `Future.RequestCancel` và nhận kết quả thật (bỏ activity `forward-cancel` và signal huỷ riêng của shipment); shipment coi huỷ root context như yêu cầu huỷ, quyết định trên dòng (pickup đã xác nhận thắng), tạo label chạy trên `Disconnected`. Composition root bật `KeepPurgedIDs`, thêm job retention (`-purge-every`, `-retention`, `-keep-purged-ids`); `Place`, notify, replenishment xử lý `ErrInstancePurged`; `GET /orders` đọc từ bảng sau khi purge. Test flowtest cho các cuộc đua huỷ, `TestPlaceAfterPurge` (pg), integration có bước sau retention. Không dùng T12.1 (không cần).
     - Review độc lập (cold context) 1 lần: đạt; sửa nit README (cần version mới khi đổi bước, giới hạn sau retention).
-- [ ] **T12.5** Soak 30 phút trên `main` cuối cùng (`CHAOS_DURATION=30m make chaos-soak`), ghi số liệu.
+- [x] **T12.5** Soak 30 phút trên `main` cuối cùng (`CHAOS_DURATION=30m make chaos-soak`), ghi số liệu.
+    - Trên `main` cuối (e4600b0): `make lint` 0 lỗi; `make test`, `make chaos`, `make upgrade`, `make benchgate` đạt. Soak 30 phút: 16198 order; lỗi tiêm: blackhole 125, Stop khi đóng băng 37, kill 41, SIGSTOP 69, statement_timeout 36, cắt kết nối 163; 94327 attempt (ok 81271, lỗi giả lập 12901, lease-lost 84, process thoát 71), 0 attempt không rõ kết thúc, 338 effect lặp đã được dedupe, 112 chồng nhau được miễn vì SIGSTOP, không chồng nhau ngoài luật; kiểm toàn vẹn cuối đạt.
 
 ## File và hàm tái sử dụng
 
