@@ -20,7 +20,7 @@ race: test
 
 # Flakiness check before ticking a task.
 race10:
-	go test -race -count=10 -timeout 30m ./...
+	go test -race -count=10 -timeout 90m ./...
 
 # Multi-process chaos tests (build tag chaos), from task T8.1 on.
 chaos:

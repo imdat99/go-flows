@@ -549,6 +549,8 @@ Gom mọi mục "Còn mở" ở trên, xếp theo mức độ ảnh hưởng. Qu
 
 Đã xong nhờ P9, chỉ cần gạch trong các ghi chú cũ: lấy lock tốn 2 round trip (T9.7); activity chờ queue hoặc retry làm lock hết hạn (T9.4); mục tiêu ≤ 80 alloc (đang 76); child tạo ở task kết thúc bị bỏ âm thầm (T9.2).
 
+Kết quả P10 (2026-11-17): mọi mục đã xong, mỗi mục qua review độc lập do phiên chính mở. Kiểm tra cuối trên `main`: `make lint` (4 module) 0 lỗi; `make test` đạt; `make chaos` đạt; `make race10` đạt mọi package (pg cần ~36 phút cho 10 lần nên timeout của `race10` nâng từ 30 lên 90 phút; pg `-count=10` riêng: đạt, 2168s).
+
 **A. Độ trễ và khôi phục**
 - [x] **T10.1** Khôi phục nhanh sau khi engine crash. Hiện việc của engine chết chỉ được nhận ở lần poll theo giờ (`PollMax`), vì T9.1 cố ý không báo hạn lease đang chạy (heartbeat đẩy nó lên liên tục). Hướng: báo hạn của lease không còn được gia hạn (ví dụ `locked_until` cũ hơn một nửa TTL so với lần gia hạn dự kiến), hoặc ghi `renewed_at` và chỉ báo lease quá hạn gia hạn. Test: kill một engine (chaos hoặc store giả), engine kia nhận việc trong khoảng `LeaseTTL` chứ không phải `PollMax`.
     - Thiết kế khác hướng gợi ý: `PollMax = min(PollMax, LeaseTTL/3)` (và `PollMin <= PollMax`), engine rảnh nhận việc của engine chết trong khoảng 4/3 `LeaseTTL`. Lý do: crash không phát tín hiệu (process chết không NOTIFY được), mọi phương án (`renewed_at`, báo hạn lease đang chạy, heartbeat của engine còn sống quét lease lạ) đều cần một lần dò định kỳ cùng bậc chi phí; index trên `locked_until` làm gia hạn lease workflow không còn HOT (activity thì `visible_at` đã có index). Mặc định (30s, 1s) không đổi gì.
