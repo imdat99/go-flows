@@ -19,18 +19,33 @@ lease, with a unique `(execution, seq)`.
 
 **Activities run at least once, and their outcome is recorded once.** An
 attempt whose lease was lost (its process paused, partitioned or died) is
-run again elsewhere, and its late result is refused by fencing (chaos test B).
-Use the `Key` to make the effect happen once (`idem.Do`).
+run again elsewhere, while its retry policy allows another attempt (see
+below), and its late result is refused by fencing (chaos test B). Use the
+`Key` to make the effect happen once (`idem.Do`).
 
-**Work that crashes its process is not retried forever.** A lost attempt
-counts against the activity's retry policy: once its attempts reach the
-policy's limit and the last one was lost (the activity kills its process:
-out of memory, `os.Exit`, a fatal runtime error), the next engine does not
-run it again but fails it permanently with `ErrAttemptsExhausted`,
-uncertain (it is compensated), as any final failure (chaos test I). A
-workflow task claimed more than `MaxTaskClaims` times in a row (default
-10) without completing parks its execution (`ErrCrashLoop`), never fails
-it; `Engine.Resume` runs it again once the cause is fixed.
+**Work that crashes its process is not retried forever.**
+
+- A lost attempt counts against the activity's retry policy. Once the
+  attempts reach the policy's limit and the last one was lost (the activity
+  kills its process: out of memory, `os.Exit`, a fatal runtime error), the
+  next engine does not run it again. It fails it permanently with
+  `ErrAttemptsExhausted`, uncertain (it is compensated), as any final
+  failure (chaos test I). An activity with `Attempts <= 1` therefore fails
+  after a single lost attempt: an engine crash, a `SIGKILL` during a deploy,
+  or a database outage longer than `LeaseTTL`.
+- "Lost" means only that the lease expired without a result: the attempt
+  may still be running, in a process that is partitioned or paused (GC, a
+  frozen VM). The compensator can then run while that attempt's effect is
+  still landing. Key effects by the `Key` (`idem`), and have the
+  compensator fence the key (`idem.Abort`) so that a late effect is
+  refused.
+- The limit is recorded when the task is created, from the retry policy of
+  the binary that schedules the activity. If that binary does not define
+  the activity (it runs elsewhere, `WithQueue`), there is no limit: lost
+  attempts are retried as before.
+- A workflow task claimed more than `MaxTaskClaims` times in a row
+  (default 10) without completing parks its execution (`ErrCrashLoop`),
+  never fails it; `Engine.Resume` runs it again once the cause is fixed.
 
 **Fencing.** Every write made for a running execution or an activity task
 checks `owner_id` and `lease_version` on the locked row:

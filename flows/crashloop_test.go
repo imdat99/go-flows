@@ -12,6 +12,8 @@ import (
 
 	"github.com/imdat99/go-flows/internal/store"
 	"github.com/imdat99/go-flows/internal/store/mem"
+	"github.com/imdat99/go-flows/internal/store/pg"
+	"github.com/imdat99/go-flows/internal/testdb"
 )
 
 // crashStore makes chosen tasks behave as if their process died while
@@ -173,24 +175,57 @@ func TestCrashingActivityExhaustsItsAttempts(t *testing.T) {
 // the execution is parked (ErrCrashLoop), never failed; Engine.Resume runs
 // it again once the cause is fixed.
 func TestCrashingWorkflowTaskParks(t *testing.T) {
-	id := "crash-loop"
-	st := newCrashStore("", id)
-	st.wfCrash.Store(true)
-	e := startedEngine(t, st, Options{InstanceID: "crash-loop", LeaseTTL: 300 * time.Millisecond, MaxTaskClaims: 2, CacheSize: -1})
-	h, err := crashLoopWF.Start(bg, e, id, "ok")
-	if err != nil {
-		t.Fatal(err)
+	stores := map[string]func(t *testing.T) store.Store{
+		"mem": func(*testing.T) store.Store { return mem.New(nil) },
+		"pg": func(t *testing.T) store.Store {
+			t.Helper()
+			pool := testdb.New(t)
+			if err := Migrate(bg, pool); err != nil {
+				t.Fatal(err)
+			}
+			return pg.New(pool)
+		},
 	}
-	_, err = h.Wait(waitCtx(t))
-	parkedWith(t, err, ErrCrashLoop)
-	if !strings.Contains(err.Error(), "3 times") {
-		t.Fatalf("reason %v", err)
+	for name, open := range stores {
+		t.Run(name, func(t *testing.T) {
+			// A fresh execution: its first task (ExecutionStarted pending,
+			// never consumed) crashes every time.
+			id := "crash-loop-" + name
+			st := newCrashStore("", id)
+			st.Store = open(t)
+			st.wfCrash.Store(true)
+			e := startedEngine(t, st, Options{InstanceID: id, LeaseTTL: 300 * time.Millisecond, MaxTaskClaims: 2, CacheSize: -1})
+			h, err := crashLoopWF.Start(bg, e, id, "ok")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = h.Wait(waitCtx(t))
+			parkedWith(t, err, ErrCrashLoop)
+			// At claim 3 (MaxTaskClaims 2), or later if the park itself was cut
+			// off (this store reports the lease lost while it crashes).
+			if !strings.Contains(err.Error(), "times without completing") || strings.Contains(err.Error(), "claimed 2 times") {
+				t.Fatalf("reason %v", err)
+			}
+			if hist, err := st.LoadHistory(bg, st.execID(), 0); err != nil || len(hist) != 0 {
+				t.Fatalf("parked with history %v, %v: want the start event still pending", hist, err)
+			}
+			st.wfCrash.Store(false) // fixed
+			if err := e.Resume(bg, id); err != nil {
+				t.Fatal(err)
+			}
+			if out, err := crashLoopWF.Handle(e, id).Wait(waitCtx(t)); err != nil || out != "ok" {
+				t.Fatalf("resumed: %q, %v", out, err)
+			}
+		})
 	}
-	st.wfCrash.Store(false) // fixed
-	if err := e.Resume(bg, id); err != nil {
-		t.Fatal(err)
+}
+
+// execID returns the execution id of the store's crashing instance.
+func (s *crashStore) execID() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id := range s.wfs {
+		return id
 	}
-	if out, err := crashLoopWF.Handle(e, id).Wait(waitCtx(t)); err != nil || out != "ok" {
-		t.Fatalf("resumed: %q, %v", out, err)
-	}
+	return 0
 }

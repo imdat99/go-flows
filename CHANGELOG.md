@@ -23,6 +23,19 @@ must take care of.
 - An engine logs once, when it is created, if it lowers `PollMax` to
   `LeaseTTL`/3
   (T11.8).
+- Work that crashes its process (out of memory, `os.Exit`, a fatal runtime
+  error) is no longer retried forever across the cluster (T11.3):
+  - an activity task records its retry policy's total attempts when it is
+    scheduled; once the attempts reach it and the last one was lost (its
+    lease expired without a result), the next engine does not run it but
+    fails it permanently with `flows.ErrAttemptsExhausted` (kind
+    `attempts_exhausted`), uncertain, so the workflow compensates as for any
+    final failure (a compensator so exhausted parks the execution as
+    `compensation_failed`);
+  - `Options.MaxTaskClaims` (default 10, negative: no bound): a workflow
+    task claimed more than that many times in a row without completing
+    parks its execution as `needs_attention` with `flows.ErrCrashLoop`
+    (kind `crash_loop`), never fails it; `Engine.Resume` resumes it.
 
 ### Changed
 
@@ -32,6 +45,14 @@ must take care of.
 - `otelflows` requires a released go-flows (v0.1.2) instead of `v0.0.0`
   with a `replace`, so `go get github.com/imdat99/go-flows/otelflows`
   works; local development uses `otelflows/go.work`.
+- A lost activity attempt (its engine died, was partitioned or paused, or
+  lost its lease) now counts against its `RetryPolicy` (T11.3). An activity
+  with `Attempts <= 1` now fails (uncertain, compensated) after a single
+  engine crash, a `SIGKILL` during a deploy, or a database outage longer
+  than `LeaseTTL`, instead of running again. A lost attempt may still be
+  running when the activity is failed and compensated: key effects with
+  `idem` and fence the key in the compensator (`idem.Abort`). The limit
+  applies only when the binary that schedules the activity defines it.
 
 ### Fixed
 
@@ -58,6 +79,26 @@ must take care of.
   while it still runs in the stopped process. Sticky executions are still
   handed over at Stop (with a budget of their own, up to 5 seconds, which
   may still run briefly after Stop returns).
+
+### Migrations
+
+| Migration | Adds | For |
+|---|---|---|
+| `00017_crash_loops` | `activity_task.max_attempts`, `execution.claims` | the attempt limit of a task, and the claims of an execution since its last completed task (T11.3) |
+
+### Upgrade notes
+
+- **`00017` (T11.3)** adds two integer columns with a constant default:
+  metadata only, no table rewrite and no long lock.
+- Activity tasks inserted by earlier binaries (and by binaries that do not
+  define the activity) have `max_attempts` 0: no limit, the earlier
+  behaviour.
+- Earlier binaries neither count nor reset `execution.claims`. Each task
+  lost by a new engine and then completed by an old one leaves the count
+  one higher; this is harmless during a rolling deploy (the default bound
+  is 10, and the first task a new engine completes resets it).
+- If engines are killed mid-activity during deploys, give the activities
+  that must survive that at least two attempts.
 
 ## v0.1.2 (2026-11-17)
 

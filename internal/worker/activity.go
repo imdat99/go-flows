@@ -200,7 +200,9 @@ func (w *Worker) attemptOnce(ctx, runCtx context.Context, a *Activity, t *store.
 	out, comp, err, panicked := safeRun(actx, a, t)
 	if errors.Is(context.Cause(ctx), ErrLeaseLost) {
 		// Another owner runs it now (or the execution ended): its outcome,
-		// not ours, is recorded (GW-6: a lost lease is not a failure).
+		// not ours, is recorded (GW-6: a lost lease is not recorded as a
+		// failure). It still counts as an attempt (T11.3): the claim after
+		// it at the policy's limit ends the activity as exhausted.
 		return attemptOutcome{lost: true}
 	}
 	if err != nil && errors.Is(context.Cause(ctx), errStopping) {
@@ -281,6 +283,17 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 	defer tracked.untrack()
 	a, ok := w.acts.Activity(t.Name, t.Compensate)
 	if !ok {
+		if t.Exhausted {
+			// Exhausted (T11.3), but whether it has a compensator (and so
+			// its outcome's compensation data) is decided where it is
+			// defined. Handing it back would clear its lost state and let
+			// the next engine run it past its limit: its lease lapses
+			// instead (not renewed), and it stays lost and exhausted for
+			// the next claim.
+			w.log.LogAttrs(ctx, slog.LevelWarn, "flows: exhausted activity not defined here, leaving it to an engine that defines it",
+				slog.String("activity", t.Name))
+			return
+		}
 		// Another instance may have it: give the task back for a while.
 		if err := w.st.RetryActivityTask(tctx, t.Lease, w.opts.HandBack, false, nil); err != nil && !errors.Is(err, store.ErrLeaseLost) {
 			w.log.LogAttrs(ctx, slog.LevelWarn, "flows: hand back activity", slog.String("activity", t.Name), slog.Any("error", err))

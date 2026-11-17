@@ -61,7 +61,11 @@ var (
 	// was lost: its process crashed (out of memory, os.Exit, a fatal
 	// runtime error) or lost its lease without recording a result. It is
 	// not run again: it fails permanently, uncertain (it may have had its
-	// effect, so it is compensated), as any final failure.
+	// effect, so it is compensated), as any final failure. A lost attempt
+	// may still be running (a partitioned or paused process): key its
+	// effect (idem) and fence the key in the compensator (idem.Abort). The
+	// limit is the retry policy of the binary that scheduled the activity;
+	// none when that binary does not define it.
 	ErrAttemptsExhausted = worker.ErrAttemptsExhausted
 	// ErrCanceled is the error of an activity, timer, child or workflow whose
 	// context was canceled.
