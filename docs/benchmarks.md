@@ -140,6 +140,28 @@ such runs taking 50 to 80 ms instead of ~5 ms, with the engine's flow
 unchanged (no hand-back, no poll): stalls of the host's disk (Postgres
 fsync), not of the engine.
 
+T10.16 confirmed it with three simultaneous traces over 2000 runs of the
+`BenchmarkActivityRun` workflow (10 minutes): the store calls of every run
+(timed in a wrapping store), every `fdatasync`/`fsync` of every Postgres
+process (`strace -f -T` from a container sharing the Postgres container's
+pid namespace), and the VM's disk (`iostat -x 1`). 21 runs took 0.9 to
+1.7 s, in three episodes of ~10 s, minutes apart. In each:
+
+- the store calls add up to the run's time (within 20 to 60 ms of it): the
+  engine waits on Postgres, nothing else;
+- the backends' WAL `fdatasync` takes 50 to 90 ms (median ~55 ms) instead
+  of ~3 ms, every one of them, for the whole episode, so the commits per
+  second drop from ~75 to ~14;
+- the disk's write latency (`w_await`) rises from ~1.5 ms to ~30 ms while
+  it writes 5 times less (~150 to ~30 writes/s): the device is slow, not
+  busy. No checkpoint, autovacuum or other Postgres `fsync` falls in the
+  episodes (the checkpointer's `fsync` calls came at other times).
+
+The development machine is a VM whose virtual disk stalls for seconds at a
+time; durable commits (fsync on, as in production) expose it. It is not
+the engine, and nothing in it to fix. A shared CI runner can stall the same
+way: the end-to-end benchmarks therefore gate allocations only, never time.
+
 ## Other benchmarks (perf gate)
 
 `make bench && make benchgate` checks medians against `perf-budget.txt`:
@@ -162,6 +184,22 @@ coroutines each running a mocked activity: ~5 ms for 16, ~6 to 10 ms for 64,
 ~10 to 18 ms for 256, close to linear, against go-workflows' O(n^3) tester,
 issue #377) has no rule: it counts the allocations of the whole tester
 process.
+
+Headroom on a shared CI runner (T10.16): the CI's bench logs and its
+`bench.txt` artifact need a GitHub login, so they were not read; the bench
+job passed the gate in all 5 CI runs so far (2026-11-16). Emulating a
+4-vCPU runner (the benchmarks pinned to 4 cores, two of them kept busy by a
+CPU hog) moved no allocation median: `BenchmarkActivityRun` 76 (samples
+72-77), `BenchmarkPublicActivityRun` 141 (136-145), `BenchmarkEagerActivity`
+5.5 allocs and 740-824 B, `BenchmarkLockStep` 0 allocs and 95-176 B,
+`BenchmarkReplay` 30, against 76.5 / 140 / 6 / 0 / 30 on the quiet 6-CPU
+machine. Allocation counts barely depend on the CPU or its load, rather on
+how many timed polls and claims fall in a sample, so the ~10% headroom of
+the end-to-end rules (single samples reach 81 and 145) is kept, not cut.
+The only time rule, `BenchmarkScheduler` ns/switch <= 2000, has ~2.5x
+headroom even so (~730 median, 620-800, against ~650 quiet); the end-to-end
+benchmarks have no time rule, since a disk stall as above multiplies their
+time.
 
 ## Reproducing
 
