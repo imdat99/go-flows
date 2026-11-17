@@ -21,6 +21,16 @@ defer engine.Stop(shutdownCtx)
   chiếu. Migration đã áp dụng thì không bao giờ sửa, nên vài comment trong
   đó đã cũ; mục Corrections của `CHANGELOG.md` đính chính lại (ví dụ claim
   không xoá `sticky_owner`).
+- **Index trên bảng lớn.** Migration 00013 (v0.1.1) tạo
+  `execution_due_idx` không có `CONCURRENTLY`, nên chặn ghi vào
+  `flows.execution` trong lúc tạo. Với bảng lớn, trước khi chạy `Migrate`,
+  thêm cột được index (`ALTER TABLE flows.execution ADD COLUMN IF NOT
+  EXISTS due_owner text NOT NULL DEFAULT ''`, không ghi lại bảng) rồi tạo
+  index bằng `CREATE INDEX CONCURRENTLY IF NOT EXISTS` (cùng tên và định
+  nghĩa trong `migrations/00013_due_owner.sql`); `Migrate` sau đó bỏ qua cả
+  hai. Migration mới
+  tạo index trên bảng lớn dùng `-- +goose NO TRANSACTION` và
+  `CONCURRENTLY`.
 - **Process chỉ làm client.** Engine không được start vẫn bắt đầu workflow,
   gửi signal, huỷ, terminate và chờ kết quả được. Một process API có thể
   dùng engine như vậy mà không chạy task.
@@ -80,7 +90,7 @@ defer engine.Stop(shutdownCtx)
 | --- | --- | --- |
 | `LeaseTTL` | 30s | Engine đã chết giữ việc của nó bao lâu. Lease được gia hạn mỗi một phần ba thời gian này. Ngắn hơn: khôi phục nhanh hơn, gia hạn nhiều hơn. |
 | `MaxWorkflowTasks`, `MaxActivities` | 64, 64 | Mức đồng thời của mỗi engine. |
-| `PollMax` | 1s | Khoảng poll dài nhất khi rảnh, tối đa `LeaseTTL`/3 (khôi phục việc của engine đã crash). Notification và thời điểm đến hạn đánh thức poller sớm hơn. |
+| `PollMax` | 1s | Khoảng poll dài nhất khi rảnh, tối đa `LeaseTTL`/3 (khôi phục việc của engine đã crash; giá trị lớn hơn bị hạ xuống và ghi log một lần khi start). Engine rảnh nhận việc của engine đã crash trong khoảng 4/3 `LeaseTTL`, với giả định mọi engine dùng cùng `LeaseTTL`. Notification và thời điểm đến hạn đánh thức poller sớm hơn. |
 | `StickyFor`, `CacheSize`, `CacheBytes` | 10s, 1000, 256 MiB | Giữ execution đã replay trong bộ nhớ, cùng với task kế tiếp của nó trên engine này. `CacheSize: -1` tắt cache (task nào cũng replay). `CacheBytes` giới hạn bộ nhớ ước tính của cache (vài KiB cho mỗi execution và mỗi coroutine còn sống, cộng payload đã mã hoá trong lịch sử của nó); vượt giới hạn nào thì evict execution dùng lâu nhất trước. `CacheBytes: -1` chỉ giới hạn theo số lượng. |
 | `DisableEager` | false | Chạy mọi activity qua queue thay vì chạy ngay trong engine đã lên lịch nó. |
 | `ListenDSN` | (pool) | Connection string cho kết nối `LISTEN` của engine (một kết nối), cho pool đứng sau PgBouncer ở transaction mode. |
@@ -118,6 +128,19 @@ Chi phí đo được và nguyên nhân nằm trong [benchmarks.md](../benchmark
   WHERE status IN ('running', 'compensating', 'needs_attention')
   GROUP BY 1, 2, 3;
   ```
+
+## Bảo trì Postgres
+
+- **Autovacuum.** `flows.execution` và `flows.activity_task` được cập nhật
+  ở mỗi task (lease, thời điểm sẵn sàng) và có nhiều index một phần, nên
+  dead tuple tích tụ nhanh. Hãy để autovacuum theo kịp trên hai bảng này,
+  ví dụ `ALTER TABLE flows.execution SET (autovacuum_vacuum_scale_factor =
+  0.01, autovacuum_analyze_scale_factor = 0.02)`, tương tự với
+  `flows.activity_task`; theo dõi số dead tuple và kích thước index.
+- **Kích thước payload.** Engine không giới hạn kích thước input, output
+  hay payload của signal, và mỗi lần replay đọc toàn bộ history của
+  execution. Hãy giới hạn những gì caller gửi (`Start`, `Signal`) ở API của
+  bạn, và giữ execution sống lâu ngắn lại bằng `ContinueAsNew`.
 
 ## Retention
 
