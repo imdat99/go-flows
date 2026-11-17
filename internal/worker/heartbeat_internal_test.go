@@ -119,3 +119,72 @@ func TestRetryDelay(t *testing.T) {
 		t.Errorf("constant policy: %v", got)
 	}
 }
+
+// busyStub reports every lease busy (never renewed, never lost).
+type busyStub struct{ store.Store }
+
+func (busyStub) RenewLeases(_ context.Context, _ string, wf, act []store.Lease, _ time.Duration) (store.Renewal, error) {
+	var r store.Renewal
+	for _, l := range wf {
+		r.BusyWorkflows = append(r.BusyWorkflows, l.ID)
+	}
+	for _, l := range act {
+		r.BusyActivities = append(r.BusyActivities, l.ID)
+	}
+	return r, nil
+}
+
+// T11.11: a lease whose claim was sent ttl - interval ago or more (its
+// reply came late) is never held: its context is canceled with
+// ErrLeaseLost at once, and the heartbeat does not track it.
+func TestHeartbeatDoesNotTrackAStaleClaim(t *testing.T) {
+	h := newHeartbeat(busyStub{}, "o", 3*time.Second, slog.New(slog.DiscardHandler))
+	ctx, tr := h.track(context.Background(), true, store.Lease{ID: 1, Owner: "o", Version: 1}, time.Now().Add(-2*time.Second))
+	defer tr.untrack()
+	if !lostBeforeStart(ctx) {
+		t.Fatalf("a stale claim's context: %v, want canceled with ErrLeaseLost", context.Cause(ctx))
+	}
+	h.mu.Lock()
+	n := len(h.held)
+	h.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d leases held, want 0", n)
+	}
+	fresh, tr2 := h.track(context.Background(), true, store.Lease{ID: 2, Owner: "o", Version: 1}, time.Now())
+	defer tr2.untrack()
+	if lostBeforeStart(fresh) {
+		t.Fatal("a fresh claim's context is canceled")
+	}
+}
+
+// T11.11: a lease tracked late, due before the heartbeat's next expire
+// tick, is given up when due, not at that tick.
+func TestHeartbeatGivesUpALateClaimOnTime(t *testing.T) {
+	const ttl = 3 * time.Second // interval 1s, given up 2s after the claim
+	h := newHeartbeat(busyStub{}, "o", ttl, slog.New(slog.DiscardHandler))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	time.Sleep(50 * time.Millisecond) // run armed its expire timer (an interval)
+	tracked := time.Now()
+	lctx, tr := h.track(context.Background(), true, store.Lease{ID: 1, Owner: "o", Version: 1}, tracked.Add(-1800*time.Millisecond))
+	defer tr.untrack()
+	select {
+	case <-lctx.Done():
+		if !errors.Is(context.Cause(lctx), ErrLeaseLost) {
+			t.Fatalf("cause %v, want ErrLeaseLost", context.Cause(lctx))
+		}
+		if d := time.Since(tracked); d > 600*time.Millisecond {
+			t.Fatalf("given up %v after it was tracked, want about 200ms", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lease was never given up")
+	}
+}

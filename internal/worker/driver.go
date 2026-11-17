@@ -102,6 +102,18 @@ func (w *Worker) runWorkflowTask(pollCtx context.Context, task *store.WorkflowTa
 		}
 		d.untrack()
 	}()
+	if lostBeforeStart(tctx) {
+		// The claim's reply came after the point where the heartbeat gives
+		// the lease up (heartbeat.track): another owner may hold it. Not
+		// run (T11.11); released (fenced: a no-op if another owner claimed
+		// it), which undoes the claim (MaxTaskClaims, T11.3). Workflow code
+		// only acts through the fenced completion, but its tracer spans,
+		// replay and eager activities would be wasted or stale.
+		w.log.LogAttrs(pollCtx, slog.LevelWarn, "flows: workflow task not started: its claim's reply came after its lease was given up",
+			slog.String("instance", task.Execution.InstanceID))
+		d.release(0)
+		return
+	}
 	d.run(pollCtx, task)
 }
 

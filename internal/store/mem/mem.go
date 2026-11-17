@@ -925,6 +925,21 @@ func (s *Store) RetryActivityTask(_ context.Context, l store.Lease, delay time.D
 	return nil
 }
 
+// ReleaseActivityTask implements store.Store.
+func (s *Store) ReleaseActivityTask(_ context.Context, l store.Lease) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.clock.Now()
+	t, err := s.fencedTask(l)
+	if err != nil {
+		return err
+	}
+	t.Lease.Owner, t.lockedUntil, t.visibleAt = "", time.Time{}, now
+	t.Attempt = max(t.Attempt-1, 0)
+	s.hint(store.ActivityWork, t.Queue)
+	return nil
+}
+
 // Signal implements store.Store.
 func (s *Store) Signal(_ context.Context, instanceID, name string, payload []byte) error {
 	return s.deliver(instanceID, history.Event{Type: history.SignalReceived, Name: name, Payload: clone(payload)})

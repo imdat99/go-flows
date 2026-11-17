@@ -122,6 +122,13 @@ func (c *crashable) RetryActivityTask(ctx context.Context, l store.Lease, d time
 	return c.st.RetryActivityTask(ctx, l, d, uncertain, compData)
 }
 
+func (c *crashable) ReleaseActivityTask(ctx context.Context, l store.Lease) error {
+	if c.dead() {
+		return errCrashed
+	}
+	return c.st.ReleaseActivityTask(ctx, l)
+}
+
 func (c *crashable) Unstick(ctx context.Context, owner string) error {
 	if c.dead() {
 		return errCrashed

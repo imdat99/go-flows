@@ -84,6 +84,15 @@ must take care of.
   while it still runs in the stopped process. Sticky executions are still
   handed over at Stop (with a budget of their own, up to 5 seconds, which
   may still run briefly after Stop returns).
+- A claimed task whose claim reply arrived late (the database held its
+  replies, during a network stall) could start on a lease that had
+  already expired and been taken by another engine, overlapping that
+  engine's attempt until the heartbeat noticed. An engine now starts no
+  task (activity, eagerly claimed activity or workflow task) whose claim
+  was sent `LeaseTTL - LeaseTTL/3` ago or more: it gives the claim back
+  (a fenced write that undoes the claim, so it uses no attempt and does
+  not count toward `MaxTaskClaims`), and a lease tracked late is given up
+  when due rather than at the heartbeat's next tick (T11.11).
 
 ### Migrations
 

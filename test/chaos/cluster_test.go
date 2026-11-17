@@ -728,8 +728,10 @@ func faultsNear(stops, holes map[int][]window, from, to time.Time, pids ...int) 
 //     lapsed, a's engine took the task over, and b recorded its start on
 //     resume, after a's.
 //
-// A pause of b's process while b runs, or of a's after b started, excuses
-// nothing: b may start only once a's lease lapsed. Nor does a paused
+// In both, the other engine's start must come at least the give-up point
+// (ttl - ttl/3) after the pause began: sooner, the paused lease was still
+// live. A pause of b's process while b runs, or of a's after b started,
+// excuses nothing: b may start only once a's lease lapsed. Nor does a paused
 // attempt running on after the resume for longer than resumeMargin: the
 // resumed engine must give the lost lease up first.
 func (cl *cluster) pausedOverlap(stops map[int][]window, a, b attemptRow) bool {
@@ -739,14 +741,24 @@ func (cl *cluster) pausedOverlap(stops map[int][]window, a, b attemptRow) bool {
 	// interval: about two intervals at worst, plus 1s for -race and a
 	// loaded machine.
 	resumeMargin := 2*cl.ttl/3 + time.Second
+	// The paused process's lease, renewed (or claimed) at the latest when
+	// the pause began, lapses no sooner than ttl - ttl/3 after it (the
+	// point where its own heartbeat would give it up; the store's lease
+	// lasts longer): another engine starting the task sooner after the
+	// pause began took a live lease, and the pause excuses nothing.
+	// lapseSlack covers the clocks of the processes (one machine) and the
+	// recording of the pause.
+	const lapseSlack = 100 * time.Millisecond
+	lapse := cl.ttl - cl.ttl/3 - lapseSlack
 	for _, w := range stops[a.pid] {
-		if w.from.Before(b.start) && w.to.After(a.start.Add(-cl.ttl)) && !a.end.After(w.to.Add(resumeMargin)) {
+		if w.from.Before(b.start) && w.to.After(a.start.Add(-cl.ttl)) && !a.end.After(w.to.Add(resumeMargin)) &&
+			!b.start.Before(w.from.Add(lapse)) {
 			return true
 		}
 	}
 	for _, w := range stops[b.pid] {
-		if w.from.Before(a.start) && w.from.Before(b.start) && w.to.After(b.start.Add(-cl.ttl)) &&
-			!b.end.After(w.to.Add(resumeMargin)) {
+		if w.from.Before(a.start) && w.to.After(b.start.Add(-cl.ttl)) && !b.end.After(w.to.Add(resumeMargin)) &&
+			!a.start.Before(w.from.Add(lapse)) {
 			return true
 		}
 	}

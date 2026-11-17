@@ -1,11 +1,67 @@
 package storetest
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/imdat99/go-flows/internal/history"
 	"github.com/imdat99/go-flows/internal/store"
 )
+
+// T11.11: a claim whose attempt never started (its reply came too late) is
+// given back with ReleaseActivityTask: claimable at once, the claim undone
+// (its attempt count back, no lost attempt, not uncertain). It is fenced:
+// a stale lease (another owner claimed since) is ErrLeaseLost. A lost
+// attempt before the released claim keeps the task uncertain.
+func testReleaseActivityTask(t *testing.T, h Harness) {
+	s := h.New(t)
+	scheduleActivity(t, s, h, "i1", store.NewActivityTask{ScheduleID: 1, Name: "a", Queue: queue, MaxAttempts: 1})
+	a := claimActivity(t, s, owner, h.TTL)[0]
+	if err := s.ReleaseActivityTask(ctx, a.Lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReleaseActivityTask(ctx, a.Lease); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("released twice: %v, want ErrLeaseLost", err)
+	}
+	reclaim(t, s, h, "after a release", 1, false)
+	if err := s.ReleaseActivityTask(ctx, a.Lease); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("a stale lease: %v, want ErrLeaseLost", err)
+	}
+
+	// Eagerly claimed: back to unclaimed.
+	s = h.New(t)
+	leases := scheduleActivity(t, s, h, "i2", store.NewActivityTask{ScheduleID: 1, Name: "a", Queue: queue, ClaimFor: h.TTL, MaxAttempts: 1})
+	if len(leases) != 1 {
+		t.Fatalf("eager leases %+v", leases)
+	}
+	if err := s.ReleaseActivityTask(ctx, leases[0]); err != nil {
+		t.Fatal(err)
+	}
+	reclaim(t, s, h, "eager, after a release", 1, false)
+
+	// A lost attempt before: still uncertain, the attempt count back.
+	s = h.New(t)
+	scheduleActivity(t, s, h, "i3", store.NewActivityTask{ScheduleID: 1, Name: "a", Queue: queue, MaxAttempts: 3})
+	lose(t, s, h)
+	a = claimActivity(t, s, owner, h.TTL)[0]
+	if a.Attempt != 2 || !a.Uncertain {
+		t.Fatalf("after a lost attempt: %+v", a)
+	}
+	if err := s.ReleaseActivityTask(ctx, a.Lease); err != nil {
+		t.Fatal(err)
+	}
+	reclaim(t, s, h, "released after a lost attempt", 2, true)
+}
+
+// reclaim claims the single activity task as another owner and checks its
+// attempt and uncertainty (never exhausted).
+func reclaim(t *testing.T, s store.Store, h Harness, what string, attempt int32, uncertain bool) {
+	t.Helper()
+	acts := claimActivity(t, s, other, h.TTL)
+	if len(acts) != 1 || acts[0].Attempt != attempt || acts[0].Exhausted || acts[0].Uncertain != uncertain {
+		t.Fatalf("%s: %+v, want attempt %d, uncertain %v, not exhausted", what, acts, attempt, uncertain)
+	}
+}
 
 // lose claims the single visible activity task and lets its lease expire
 // without a result (its process crashed), returning the claim.

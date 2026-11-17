@@ -154,6 +154,7 @@ func Run(t *testing.T, h Harness) {
 		{"TraceOnCompensation", testTraceOnCompensation},
 		{"ActivityLostAttemptsExhaust", testActivityLostAttemptsExhaust},
 		{"ActivityExhaustEdges", testActivityExhaustEdges},
+		{"ReleaseActivityTask", testReleaseActivityTask},
 		{"WorkflowClaimsCount", testWorkflowClaimsCount},
 	}
 	for _, c := range cases {

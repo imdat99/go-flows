@@ -558,6 +558,14 @@ type Store interface {
 	// compData replaces the kept compensation data (ActivityTask.CompData
 	// of later attempts; ignored for compensation tasks); nil keeps it.
 	RetryActivityTask(ctx context.Context, l Lease, delay time.Duration, uncertain bool, compData []byte) error
+	// ReleaseActivityTask gives back lease l of a claim whose attempt was
+	// never started (its reply came too late to start it safely, T11.11):
+	// the task is claimable at once and its attempt count is back to what
+	// it was before the claim (the claim is undone: no lost attempt).
+	// Not for a claim that came Exhausted: undoing it clears the lost state
+	// that makes the next claim exhausted. ErrLeaseLost when l is no longer
+	// held.
+	ReleaseActivityTask(ctx context.Context, l Lease) error
 
 	// Unstick clears every execution's stickiness to owner: a stopping
 	// owner hands them over at once instead of keeping them for StickyFor.

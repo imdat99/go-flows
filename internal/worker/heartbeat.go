@@ -40,6 +40,9 @@ type heartbeat struct {
 	renewing    bool
 	renewStart  time.Time
 	renewCancel context.CancelCauseFunc
+	// soon tells run that a lease tracked late (its claim's reply was
+	// slow) falls due before its expire timer fires (T11.11).
+	soon chan struct{}
 }
 
 type heldKey struct {
@@ -57,6 +60,7 @@ func newHeartbeat(st store.Store, owner string, ttl time.Duration, log *slog.Log
 	return &heartbeat{
 		st: st, owner: owner, ttl: ttl, interval: ttl / 3, log: log,
 		held: make(map[heldKey]held),
+		soon: make(chan struct{}, 1),
 	}
 }
 
@@ -64,13 +68,40 @@ func newHeartbeat(st store.Store, owner string, ttl time.Duration, log *slog.Log
 // claim) and returns a context canceled with ErrLeaseLost when the lease is
 // lost, and the tracking to untrack it with (which also cancels the
 // context).
+//
+// A lease is given up when not renewed for ttl - interval since claimed
+// (expire), whenever the claim's reply came: a lease already past that
+// point (its reply came too late) is not tracked, its context canceled
+// with ErrLeaseLost at once, so its task never starts (T11.11: another
+// owner may be running it); one that falls due within an interval wakes
+// run to give it up on time, not at its next expire tick.
 func (h *heartbeat) track(ctx context.Context, activity bool, l store.Lease, claimed time.Time) (context.Context, tracking) {
 	tctx, cancel := context.WithCancelCause(ctx)
 	k := heldKey{activity: activity, id: l.ID}
+	tr := tracking{h: h, key: k, lease: l, cancel: cancel}
+	left := h.ttl - h.interval - time.Since(claimed)
+	if left <= 0 {
+		cancel(ErrLeaseLost)
+		return tctx, tr
+	}
 	h.mu.Lock()
 	h.held[k] = held{lease: l, cancel: cancel, renewed: claimed}
 	h.mu.Unlock()
-	return tctx, tracking{h: h, key: k, lease: l, cancel: cancel}
+	if left < h.interval {
+		select {
+		case h.soon <- struct{}{}:
+		default:
+		}
+	}
+	return tctx, tr
+}
+
+// lostBeforeStart reports whether a task's context was canceled because
+// its lease was lost (or never safely held: track) before the task
+// started: then its work must not start. The cheap check (an atomic load)
+// comes first.
+func lostBeforeStart(ctx context.Context) bool {
+	return ctx.Err() != nil && errors.Is(context.Cause(ctx), ErrLeaseLost)
 }
 
 // tracking is a lease tracked by the heartbeat (a value: no closure to
@@ -138,6 +169,8 @@ func (h *heartbeat) run(ctx context.Context) {
 			}
 			h.mu.Unlock()
 		case <-expire.C:
+			expire.Reset(h.expire(time.Now()))
+		case <-h.soon:
 			expire.Reset(h.expire(time.Now()))
 		}
 	}

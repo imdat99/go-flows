@@ -49,6 +49,9 @@ type attemptOutcome struct {
 	maybe bool   // the retried attempt may have had its effect
 	keep  []byte // with maybe: its compensation data, kept for later attempts
 	lost  bool   // the lease was lost: record nothing
+	// With lost: the attempt never started (its lease was given up before,
+	// T11.11); its claim is given back, undone.
+	unstarted bool
 }
 
 // startAttempt calls the tracer, recovering its panics.
@@ -96,6 +99,12 @@ var nullData = []byte("null")
 // lost) and decides what to record: an activity outcome, or for a
 // compensation task, CompensationCompleted or CompensationFailed.
 func (w *Worker) attempt(ctx context.Context, a *Activity, t *store.ActivityTask) attemptOutcome {
+	if lostBeforeStart(ctx) {
+		// Its claim's reply came too late (heartbeat.track) or its lease
+		// was lost meanwhile: another owner may be running it. Not started
+		// (no tracer, no observer).
+		return attemptOutcome{lost: true, unstarted: true}
+	}
 	t.LegacyKey = t.ExecutionID < w.keyEpoch
 	var start time.Time
 	if w.opts.Observer != nil {
@@ -300,6 +309,10 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 				slog.String("activity", t.Name), slog.String("instance", t.InstanceID))
 			return
 		}
+		if lostBeforeStart(tctx) {
+			w.releaseUnstarted(w.writeCtx(), t) // a late claim reply (T11.11)
+			return
+		}
 		// Another instance may have it: give the task back for a while.
 		if err := w.st.RetryActivityTask(tctx, t.Lease, w.opts.HandBack, false, nil); err != nil && !errors.Is(err, store.ErrLeaseLost) {
 			w.log.LogAttrs(ctx, slog.LevelWarn, "flows: hand back activity", slog.String("activity", t.Name), slog.Any("error", err))
@@ -311,6 +324,25 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 		w.log.LogAttrs(ctx, slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
 			slog.String("activity", t.Name), slog.Any("error", err))
 	}
+}
+
+// releaseUnstarted gives back the claim of a task whose attempt never
+// started because its lease was given up first (T11.11: the claim's reply
+// came after the point where the heartbeat gives a lease up): the claim is
+// undone, so it uses no attempt. The release is fenced: when another owner
+// claimed the task meanwhile, it does nothing. An exhausted claim (T11.3)
+// is left to lapse instead: undoing it would clear the lost state that
+// makes the next claim exhausted, and let the activity run past its limit.
+func (w *Worker) releaseUnstarted(ctx context.Context, t *store.ActivityTask) {
+	var err error
+	if !t.Exhausted {
+		err = w.st.ReleaseActivityTask(ctx, t.Lease)
+		if errors.Is(err, store.ErrLeaseLost) {
+			err = nil
+		}
+	}
+	w.log.LogAttrs(ctx, slog.LevelWarn, "flows: activity task not started: its lease was given up before it could start (a slow claim reply, or lost meanwhile)",
+		slog.String("activity", t.Name), slog.String("instance", t.InstanceID), slog.Bool("released", !t.Exhausted && err == nil), slog.Any("error", err))
 }
 
 // record stores an attempt's outcome, retrying transient store errors a
@@ -331,6 +363,9 @@ func (w *Worker) record(ctx context.Context, t *store.ActivityTask, o attemptOut
 
 func (w *Worker) recordOnce(ctx context.Context, t *store.ActivityTask, o attemptOutcome, resume *store.Lease, into *store.WorkflowTask) (next *store.WorkflowTask, resumeLost bool, err error) {
 	switch {
+	case o.lost && o.unstarted:
+		w.releaseUnstarted(ctx, t)
+		return nil, false, nil
 	case o.lost:
 		return nil, false, nil
 	case o.retry:

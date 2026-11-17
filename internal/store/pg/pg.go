@@ -1775,6 +1775,26 @@ func (s *Store) RetryActivityTask(ctx context.Context, l store.Lease, delay time
 	return nil
 }
 
+// ReleaseActivityTask implements store.Store. Clearing owner_id also
+// clears the claim's mark of a lost attempt before it, which only matters
+// at the attempt limit, for an exhausted claim (never released); the
+// task's uncertainty stays.
+func (s *Store) ReleaseActivityTask(ctx context.Context, l store.Lease) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE flows.activity_task
+		SET owner_id = '', locked_until = NULL, visible_at = now(), attempt = greatest(attempt - 1, 0)
+		WHERE id = $1 AND owner_id = $2 AND lease_version = $3 AND owner_id <> ''
+		RETURNING `+notifyA+`queue)`,
+		l.ID, l.Owner, l.Version)
+	if err != nil {
+		return fmt.Errorf("release activity task: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrLeaseLost
+	}
+	return nil
+}
+
 // Delivering an activity result wakes the execution (wakeForTask). The
 // UPDATE always takes the row lock, so it waits for a holder that is
 // releasing the lease, then sees the released row: a wake-up is never lost.
