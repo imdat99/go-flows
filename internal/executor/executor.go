@@ -81,6 +81,10 @@ type Options struct {
 	// form (storage-safe text; comma-separated sentinel kinds). Defaults:
 	// err.Error() and no kinds.
 	ErrorText, ErrorKinds func(error) string
+	// InstanceID is the instance the execution belongs to, which workflow
+	// code reads (State.InstanceID). It is per executor: callers sharing
+	// Options set it on their copy.
+	InstanceID string
 }
 
 func (o *Options) errorText(err error) string {

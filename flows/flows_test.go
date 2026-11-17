@@ -443,6 +443,8 @@ func TestZeroCtxPanicsWithErrNotInWorkflow(t *testing.T) {
 		"Disconnected": func() { Disconnected(z) },
 		"Go":           func() { Go(z, func(Ctx) {}) },
 		"Select":       func() { Select(z, OnDefault(func(Ctx) {})) },
+		"InstanceID":   func() { InstanceID(z) },
+		"ExecutionID":  func() { ExecutionID(z) },
 	}
 	for name, call := range calls {
 		func() {

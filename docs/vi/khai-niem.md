@@ -60,6 +60,10 @@ Vì vậy code workflow phải **tất định**:
   goroutine, `select`, channel và `sync`;
 - không làm I/O: I/O thuộc về activity.
 
+`flows.InstanceID` và `flows.ExecutionID` cho workflow đang chạy biết id của
+chính nó, giống nhau khi replay, để đưa vào input của activity hay khoá
+idempotency: continue-as-new giữ instance id và bắt đầu execution id mới.
+
 Analyzer `flowsvet` (module `analyzer/`) báo các lỗi này.
 
 Khi replay, mỗi lời gọi đã ghi được so với code: loại, tên, hash của tham số,

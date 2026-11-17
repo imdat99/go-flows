@@ -299,6 +299,12 @@ func (st *State) Now() time.Time { return st.now }
 // (side effects such as logging should be skipped).
 func (st *State) Replaying() bool { return st.replaying }
 
+// InstanceID returns the instance id of the execution (Options.InstanceID).
+func (st *State) InstanceID() string { return st.ex.opts.InstanceID }
+
+// ExecutionID returns the store's id of the execution.
+func (st *State) ExecutionID() int64 { return st.ex.executionID }
+
 // Root returns the workflow's root context.
 func (st *State) Root() coro.Context { return st.root }
 

@@ -61,6 +61,10 @@ This is why workflow code must be **deterministic**:
   goroutines, `select`, channels and `sync`;
 - do no I/O: I/O belongs in activities.
 
+`flows.InstanceID` and `flows.ExecutionID` give the running workflow its own
+ids, the same on replay, for activity inputs or idempotency keys:
+continue-as-new keeps the instance id and starts a new execution id.
+
 The `flowsvet` analyzer (module `analyzer/`) reports these mistakes.
 
 The replay checks each recorded call against the code: its type, name,

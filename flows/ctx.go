@@ -77,6 +77,19 @@ func Go(c Ctx, fn func(c Ctx)) {
 // start, the same on every replay.
 func Now(c Ctx) time.Time { return c.state().Now() }
 
+// InstanceID returns the id of the running workflow instance: the id it
+// was started with (Handle.InstanceID, RunInfo.InstanceID), or the id its
+// parent gave a child; not the engine's Options.InstanceID. Continue-as-new
+// keeps it. It is the same on every replay, so it may go into activity
+// inputs or idempotency keys.
+func InstanceID(c Ctx) string { return c.state().InstanceID() }
+
+// ExecutionID returns the id of the running execution: one run of the
+// instance, unique in its store (WorkflowTaskInfo.ExecutionID,
+// ActivityInfo.ExecutionID). Every replay of the execution sees the same
+// id; continue-as-new starts an execution with a new one.
+func ExecutionID(c Ctx) int64 { return c.state().ExecutionID() }
+
 // Replaying reports whether the workflow is replaying recorded history;
 // use it to skip logging or metrics on replay.
 func Replaying(c Ctx) bool { return c.state().Replaying() }

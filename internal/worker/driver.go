@@ -660,7 +660,9 @@ func (d *driver) build(task *store.WorkflowTask) bool {
 		d.release(w.opts.HandBack)
 		return false
 	}
-	ex := executor.New(wf, e.ID, w.exOpts)
+	opts := w.exOpts
+	opts.InstanceID = e.InstanceID
+	ex := executor.New(wf, e.ID, opts)
 	var err error
 	if task.LastSeq > 0 { // a new execution has no history yet
 		var hist []history.Event
