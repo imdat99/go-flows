@@ -98,8 +98,10 @@ func (h *heartbeat) track(ctx context.Context, activity bool, l store.Lease, cla
 
 // lostBeforeStart reports whether a task's context was canceled because
 // its lease was lost (or never safely held: track) before the task
-// started: then its work must not start. The cheap check (an atomic load)
-// comes first.
+// started: then its work must not start. ctx.Err() comes first: it is
+// nil on the common path, where context.Cause (a context lookup) is
+// skipped; on a cancelCtx both take its mutex briefly, and neither
+// allocates.
 func lostBeforeStart(ctx context.Context) bool {
 	return ctx.Err() != nil && errors.Is(context.Cause(ctx), ErrLeaseLost)
 }

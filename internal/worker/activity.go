@@ -290,6 +290,12 @@ func safeRun(ctx context.Context, a *Activity, t *store.ActivityTask) (out, comp
 func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, claimed time.Time) {
 	tctx, tracked := w.hb.track(w.taskCtx(), true, t.Lease, claimed)
 	defer tracked.untrack()
+	if lostBeforeStart(tctx) {
+		// A late claim reply (T11.11): nothing runs, the hand-back below
+		// included.
+		w.releaseUnstarted(w.writeCtx(), t)
+		return
+	}
 	a, ok := w.acts.Activity(t.Name, t.Compensate)
 	if !ok {
 		if t.Exhausted {
@@ -307,10 +313,6 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 			}
 			w.log.LogAttrs(ctx, level, "flows: exhausted activity not defined here, leaving it to an engine that defines it",
 				slog.String("activity", t.Name), slog.String("instance", t.InstanceID))
-			return
-		}
-		if lostBeforeStart(tctx) {
-			w.releaseUnstarted(w.writeCtx(), t) // a late claim reply (T11.11)
 			return
 		}
 		// Another instance may have it: give the task back for a while.
@@ -333,16 +335,28 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 // claimed the task meanwhile, it does nothing. An exhausted claim (T11.3)
 // is left to lapse instead: undoing it would clear the lost state that
 // makes the next claim exhausted, and let the activity run past its limit.
+// Transient store errors are retried a few times, as record does: a
+// release given up leaves the claim to lapse as a lost (uncertain)
+// attempt.
 func (w *Worker) releaseUnstarted(ctx context.Context, t *store.ActivityTask) {
 	var err error
+	released := false
 	if !t.Exhausted {
-		err = w.st.ReleaseActivityTask(ctx, t.Lease)
-		if errors.Is(err, store.ErrLeaseLost) {
-			err = nil
+		delay := 20 * time.Millisecond
+		for try := 0; ; try++ {
+			err = w.st.ReleaseActivityTask(ctx, t.Lease)
+			released = err == nil
+			if errors.Is(err, store.ErrLeaseLost) {
+				err = nil // another owner claimed it meanwhile
+			}
+			if err == nil || try == 4 || ctx.Err() != nil || !sleep(w.taskCtx(), delay) {
+				break
+			}
+			delay *= 2
 		}
 	}
 	w.log.LogAttrs(ctx, slog.LevelWarn, "flows: activity task not started: its lease was given up before it could start (a slow claim reply, or lost meanwhile)",
-		slog.String("activity", t.Name), slog.String("instance", t.InstanceID), slog.Bool("released", !t.Exhausted && err == nil), slog.Any("error", err))
+		slog.String("activity", t.Name), slog.String("instance", t.InstanceID), slog.Bool("released", released), slog.Any("error", err))
 }
 
 // record stores an attempt's outcome, retrying transient store errors a

@@ -92,7 +92,10 @@ must take care of.
   was sent `LeaseTTL - LeaseTTL/3` ago or more: it gives the claim back
   (a fenced write that undoes the claim, so it uses no attempt and does
   not count toward `MaxTaskClaims`), and a lease tracked late is given up
-  when due rather than at the heartbeat's next tick (T11.11).
+  when due rather than at the heartbeat's next tick (T11.11). Exception:
+  an activity claim that came back exhausted (T11.3) is not given back
+  but left to lapse, so that it stays exhausted; likewise a claim whose
+  give-back fails after a few tries lapses as a lost attempt.
 
 ### Migrations
 

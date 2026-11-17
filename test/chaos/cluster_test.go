@@ -652,7 +652,7 @@ func (cl *cluster) verifyOverlaps() {
 		holes[pid] = slices.Clone(ws)
 	}
 	cl.mu.Unlock()
-	excused := func(a, b attemptRow) bool { return cl.pausedOverlap(stops, a, b) }
+	excused := func(a, b attemptRow) bool { return cl.pausedOverlap(stops, holes, a, b) }
 	groups := map[string][]attemptRow{}
 	for _, a := range all {
 		groups["key "+a.key] = append(groups["key "+a.key], a)
@@ -734,31 +734,46 @@ func faultsNear(stops, holes map[int][]window, from, to time.Time, pids ...int) 
 // excuses nothing: b may start only once a's lease lapsed. Nor does a paused
 // attempt running on after the resume for longer than resumeMargin: the
 // resumed engine must give the lost lease up first.
-func (cl *cluster) pausedOverlap(stops map[int][]window, a, b attemptRow) bool {
+func (cl *cluster) pausedOverlap(stops, holes map[int][]window, a, b attemptRow) bool {
 	// On resume the overdue renewal runs at once and learns the loss, or
 	// the expire timer (due within an interval) gives up the leases not
 	// renewed for ttl - interval, a hanging renewal being canceled after an
 	// interval: about two intervals at worst, plus 1s for -race and a
 	// loaded machine.
 	resumeMargin := 2*cl.ttl/3 + time.Second
-	// The paused process's lease, renewed (or claimed) at the latest when
-	// the pause began, lapses no sooner than ttl - ttl/3 after it (the
-	// point where its own heartbeat would give it up; the store's lease
-	// lasts longer): another engine starting the task sooner after the
-	// pause began took a live lease, and the pause excuses nothing.
-	// lapseSlack covers the clocks of the processes (one machine) and the
-	// recording of the pause.
+	// The paused process's lease was renewed (or claimed) within an
+	// interval before its renewals stopped: when the pause began, or when
+	// a blackhole of that process began, if one was on within a ttl before
+	// the pause (renewals stalled before the SIGSTOP). It lapses no sooner
+	// than ttl - ttl/3 after that (renewed at most an interval before, for
+	// ttl): another engine starting the task sooner took a live lease, and
+	// the pause excuses nothing. lapseSlack covers the clocks of the
+	// processes (one machine) and the recording of the pause.
+	//
+	// Accepted, rare false failure: b's process paused between its
+	// engine's start check (the claim's age, T11.11) and the recording of
+	// its start, with b's renewals stalled by something other than a
+	// recorded blackhole; its lease lapsed earlier than the rule assumes.
 	const lapseSlack = 100 * time.Millisecond
 	lapse := cl.ttl - cl.ttl/3 - lapseSlack
+	stalled := func(pid int, w window) time.Time {
+		from := w.from
+		for _, h := range holes[pid] {
+			if h.from.Before(from) && h.to.After(w.from.Add(-cl.ttl)) {
+				from = h.from
+			}
+		}
+		return from
+	}
 	for _, w := range stops[a.pid] {
 		if w.from.Before(b.start) && w.to.After(a.start.Add(-cl.ttl)) && !a.end.After(w.to.Add(resumeMargin)) &&
-			!b.start.Before(w.from.Add(lapse)) {
+			!b.start.Before(stalled(a.pid, w).Add(lapse)) {
 			return true
 		}
 	}
 	for _, w := range stops[b.pid] {
 		if w.from.Before(a.start) && w.to.After(b.start.Add(-cl.ttl)) && !b.end.After(w.to.Add(resumeMargin)) &&
-			!a.start.Before(w.from.Add(lapse)) {
+			!a.start.Before(stalled(b.pid, w).Add(lapse)) {
 			return true
 		}
 	}
