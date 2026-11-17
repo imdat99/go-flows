@@ -150,6 +150,13 @@ func (c *crashable) PurgeEnded(ctx context.Context, older time.Duration, limit i
 	return c.st.PurgeEnded(ctx, older, limit)
 }
 
+func (c *crashable) ForgetInstance(ctx context.Context, id string) error {
+	if c.dead() {
+		return errCrashed
+	}
+	return c.st.ForgetInstance(ctx, id)
+}
+
 func (c *crashable) ReopenCompensation(ctx context.Context, id string) error {
 	if c.dead() {
 		return errCrashed

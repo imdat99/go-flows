@@ -84,8 +84,15 @@ var (
 	// ErrTerminated is the error of a terminated workflow.
 	ErrTerminated = errors.New("flows: terminated")
 	// ErrInstanceExists is the error of a child workflow whose instance id
-	// was already in use.
+	// was already in use (or purged, see ErrInstancePurged).
 	ErrInstanceExists = errors.New("flows: instance id already in use")
+	// ErrInstancePurged reports an instance id whose executions retention
+	// purged (Engine.PurgeEnded) while Options.KeepPurgedIDs kept a
+	// tombstone of it: Workflow.Start fails with it instead of running the
+	// workflow again, and so does a child started with that id (its error
+	// matches ErrInstanceExists too), until the tombstone expires or
+	// Engine.ForgetInstance deletes it.
+	ErrInstancePurged = store.ErrInstancePurged
 	// ErrNotInWorkflow reports a workflow API called outside a workflow.
 	ErrNotInWorkflow = errors.New("flows: called outside a workflow")
 	// ErrCompensated matches the error of a workflow that failed and whose
@@ -132,6 +139,7 @@ var kinds = struct {
 	{store.KindStuck, ErrStuck},
 	{store.KindTerminated, ErrTerminated},
 	{store.KindInstanceExists, ErrInstanceExists},
+	{store.KindInstancePurged, ErrInstancePurged},
 	{"activity_canceled", ErrActivityCanceled},
 	{store.KindCompensated, ErrCompensated},
 	{store.KindCompensationFailed, ErrCompensationFailed},

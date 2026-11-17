@@ -44,8 +44,8 @@ func TestGW7_ConcurrentMigrate(t *testing.T) {
 	if err := base.QueryRow(ctx, `SELECT count(*) FROM pg_tables WHERE schemaname = 'flows'`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 8 { // execution, history, pending_event, activity_task, lock, lock_waiter, key_epoch, goose_db_version
-		t.Fatalf("%d tables in schema flows, want 8", n)
+	if n != 9 { // execution, history, pending_event, activity_task, lock, lock_waiter, key_epoch, purged_instance, goose_db_version
+		t.Fatalf("%d tables in schema flows, want 9", n)
 	}
 }
 

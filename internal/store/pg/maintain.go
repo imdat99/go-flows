@@ -163,7 +163,10 @@ func readRenewal(br pgx.BatchResults, ids []int64) (lost, busy, canceled []int64
 // candidate walks up its ancestors (a few primary key lookups), so a call
 // reads about as many rows as it deletes (execution_ended_idx order).
 const purgeEnded = `
-	DELETE FROM flows.execution WHERE id = ANY(ARRAY( -- IN (...) may scan the table (a semi join)
+	DELETE FROM flows.execution WHERE id = ANY(ARRAY(` + purgeCandidates + `))`
+
+// purgeCandidates selects purgeEnded's executions and locks them.
+const purgeCandidates = ` -- IN (...) may scan the table (a semi join)
 		SELECT x.id FROM flows.execution x
 		WHERE x.ended_at < now() - $1 * interval '1 microsecond'
 		  AND NOT EXISTS (
@@ -175,17 +178,95 @@ const purgeEnded = `
 			SELECT 1 FROM anc WHERE anc.status IN ` + activeStatuses + `)
 		ORDER BY x.ended_at
 		LIMIT $2
-		FOR UPDATE OF x SKIP LOCKED))`
+		FOR UPDATE OF x SKIP LOCKED`
+
+// purgeEndedKept is purgeEnded keeping tombstones (store.PurgedKeeper):
+// the latest execution of an instance id, deleted, leaves a tombstone. The
+// latest: no execution of the id with a greater id exists, deleted or not
+// (an earlier execution of a continue-as-new chain whose successor runs
+// leaves none; one whose successor a concurrent purge deletes leaves it to
+// that purge). A tombstone left by an engine without KeepPurgedIDs having
+// started the id again is renewed.
+const purgeEndedKept = `
+	WITH d AS (
+		DELETE FROM flows.execution WHERE id = ANY(ARRAY(` + purgeCandidates + `))
+		RETURNING id, instance_id, workflow, status, ended_at
+	), t AS (
+		INSERT INTO flows.purged_instance (instance_id, workflow, status, ended_at)
+		SELECT d.instance_id, d.workflow, d.status, d.ended_at FROM d
+		WHERE NOT EXISTS (SELECT 1 FROM flows.execution x WHERE x.instance_id = d.instance_id AND x.id > d.id)
+		ON CONFLICT (instance_id) DO UPDATE
+		SET workflow = excluded.workflow, status = excluded.status, ended_at = excluded.ended_at, purged_at = now()
+	)
+	SELECT count(*) FROM d`
+
+// expirePurged deletes up to $2 tombstones older than $1 µs, oldest first
+// (purged_instance_purged_idx); rows locked elsewhere are skipped.
+const expirePurged = `
+	DELETE FROM flows.purged_instance WHERE instance_id = ANY(ARRAY(
+		SELECT instance_id FROM flows.purged_instance
+		WHERE purged_at < now() - $1 * interval '1 microsecond'
+		ORDER BY purged_at
+		LIMIT $2
+		FOR UPDATE SKIP LOCKED))`
+
+// KeepPurged implements store.PurgedKeeper (before the store is used).
+func (s *Store) KeepPurged(d time.Duration) { s.keepPurged = d }
+
+// ForgetInstance implements store.Store.
+func (s *Store) ForgetInstance(ctx context.Context, instanceID string) error {
+	var tag pgconn.CommandTag
+	err := retry(ctx, func() error {
+		var err error
+		tag, err = s.pool.Exec(ctx, `DELETE FROM flows.purged_instance WHERE instance_id = $1`, instanceID)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("forget instance: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
 
 // PurgeEnded implements store.Store. The foreign keys cascade to history,
 // pending events and activity tasks (GW-4). limit bounds executions, not
 // history rows: keep it modest when histories are long.
 func (s *Store) PurgeEnded(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
+	if s.keepPurged > 0 {
+		return s.purgeEndedKept(ctx, olderThan, limit)
+	}
 	tag, err := s.pool.Exec(ctx, purgeEnded, micros(olderThan), limit)
 	if err != nil {
 		return 0, fmt.Errorf("purge ended executions: %w", err)
 	}
 	return int(tag.RowsAffected()), nil
+}
+
+// purgeEndedKept is PurgeEnded keeping tombstones: one batch (one round
+// trip, one transaction), expired tombstones first, so that the purge never
+// renews a row the expiry deletes.
+func (s *Store) purgeEndedKept(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
+	var n int64
+	err := retry(ctx, func() error {
+		b := &pgx.Batch{}
+		b.Queue(expirePurged, micros(s.keepPurged), limit)
+		b.Queue(purgeEndedKept, micros(olderThan), limit)
+		br := s.pool.SendBatch(ctx, b)
+		defer br.Close()
+		if _, err := br.Exec(); err != nil {
+			return err
+		}
+		if err := br.QueryRow().Scan(&n); err != nil {
+			return err
+		}
+		return br.Close()
+	})
+	if err != nil {
+		return 0, fmt.Errorf("purge ended executions: %w", err)
+	}
+	return int(n), nil
 }
 
 // terminate ends the latest execution of $1 if active (raising 22012

@@ -31,6 +31,14 @@ BenchmarkHashArgs allocs/op <= 0
 BenchmarkEagerActivity allocs/op <= 8
 BenchmarkEagerActivity B/op <= 1024
 
+# internal/store/pg (T12.3): Workflow.Start's store side, one new id per op
+# (fast path), tombstones of purged ids off (the default) and kept (one
+# more index probe in the same statement). Measured 1 alloc, ~160 B, both.
+BenchmarkCreateExecution/off allocs/op <= 2
+BenchmarkCreateExecution/off B/op <= 512
+BenchmarkCreateExecution/kept allocs/op <= 2
+BenchmarkCreateExecution/kept B/op <= 512
+
 # T9.7: a step taking a lock, its answer returned with the completion (one
 # round trip). Measured 0 allocs, ~130 B (was 77 allocs, 7.4 KiB, 2 round
 # trips).

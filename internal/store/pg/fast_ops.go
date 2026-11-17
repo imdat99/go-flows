@@ -21,6 +21,7 @@ var (
 	nInsertPending       = stmtName(insertPending)
 	nInsertActs          = stmtName(insertActivities)
 	nInsertChild         = stmtName(insertChild)
+	nInsertChildKept     = stmtName(insertChildKept)
 	nCancelChildren      = stmtName(cancelChildren)
 	nCancelActs          = stmtName(cancelActivities)
 	nAcquireLock         = stmtName(acquireLock)
@@ -44,6 +45,7 @@ var (
 	nClaimWorkflow       = stmtName(claimWorkflow)
 	nClaimWorkflowQueues = stmtName(claimWorkflowQueues)
 	nInsertExecution     = stmtName(insertExecution)
+	nInsertExecutionKept = stmtName(insertExecutionKept)
 	nClaimActivities     = stmtName(claimActivities)
 	nNextWorkflowDue     = stmtName(nextWorkflowDue)
 	nNextActivityDue     = stmtName(nextActivityDue)
@@ -171,10 +173,11 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 		})
 	}
 	childAt := fb.stmts
+	childSQL, childName := s.insertChildSQL()
 	for i := range c.Children {
 		ch := &c.Children[i]
 		ch.Taken = false // set below from its row (retry may run this twice)
-		fb.stmt(insertChild, nInsertChild, func() {
+		fb.stmt(childSQL, childName, func() {
 			fb.Str(ch.InstanceID)
 			fb.Str(ch.Workflow)
 			fb.Int(int64(ch.Version))
@@ -551,7 +554,8 @@ func (s *Store) createFast(ctx context.Context, ne *store.NewExecution) (e store
 	fb := s.getFastBatch(ctx, pc.Conn())
 	defer fb.release()
 	fb.oneShot = true // ctx is the application's (Workflow.Start), possibly never canceled
-	fb.stmt(insertExecution, nInsertExecution, func() {
+	sql, name := s.insertExecutionSQL()
+	fb.stmt(sql, name, func() {
 		fb.Str(ne.InstanceID)
 		fb.Str(ne.Workflow)
 		fb.Int(int64(ne.Version))

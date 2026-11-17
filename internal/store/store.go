@@ -20,7 +20,8 @@
 //     task produced, or nothing.
 //   - At most one active execution per instance id (GW-1). An instance id
 //     is an idempotency key: it stays reserved after its execution ends,
-//     until retention purges it.
+//     until retention purges it (and, with KeepPurged, while its tombstone
+//     lasts).
 //   - Signals and cancel requests are never accepted and then lost (GW-3).
 //     They reach the active execution. A completion that would end it while
 //     such events are pending and undelivered fails with ErrPendingEvents,
@@ -62,6 +63,10 @@ var (
 	// runs a new task with them (GW-3). A steady stream of signals can delay
 	// the end indefinitely: this is the price of never losing one.
 	ErrPendingEvents = errors.New("store: undelivered signals or cancel requests")
+	// ErrInstancePurged reports an instance id whose executions retention
+	// purged while a store kept purged ids (PurgedKeeper): it is not
+	// started again until its tombstone expires or is forgotten.
+	ErrInstancePurged = errors.New("store: instance id purged")
 )
 
 // Error kinds the store adds to the ChildFailed events it delivers to a
@@ -69,6 +74,9 @@ var (
 const (
 	// KindInstanceExists means the child's instance id was already in use.
 	KindInstanceExists = "instance_exists"
+	// KindInstancePurged means the child's instance id was purged and its
+	// tombstone kept (PurgedKeeper); KindInstanceExists comes with it.
+	KindInstancePurged = "instance_purged"
 	// KindCanceled means the child ended canceled.
 	KindCanceled = "canceled"
 	// KindTerminated means the child was terminated.
@@ -505,6 +513,10 @@ type Store interface {
 	// ExecutionStarted pending event, unless the instance id exists. Then it
 	// returns the latest execution of that id and created == false, or
 	// ErrInstanceConflict when that execution belongs to another workflow.
+	// When the store keeps purged ids (PurgedKeeper) and the id has a
+	// tombstone, it creates nothing and fails with ErrInstancePurged: a
+	// concurrent PurgeEnded commits the delete and the tombstone at once,
+	// so the id is seen either in use or purged, never free.
 	CreateExecution(ctx context.Context, e NewExecution) (Execution, bool, error)
 	// GetExecution returns the latest execution of an instance id.
 	GetExecution(ctx context.Context, instanceID string) (Execution, error)
@@ -585,7 +597,14 @@ type Store interface {
 	// now - olderThan (but not the descendants of an active execution), with their history, pending events and tasks, and
 	// returns how many it deleted. Their instance ids become free. Rows
 	// locked elsewhere are skipped, so concurrent purges split the work.
+	// When the store keeps purged ids (PurgedKeeper), each id left without
+	// an execution gets a tombstone in the same transaction, and up to
+	// limit tombstones older than their retention are deleted too (not
+	// counted).
 	PurgeEnded(ctx context.Context, olderThan time.Duration, limit int) (int, error)
+	// ForgetInstance deletes the tombstone of a purged instance id, so the
+	// id can be started again. ErrNotFound when it has none.
+	ForgetInstance(ctx context.Context, instanceID string) error
 
 	// ReopenCompensation resumes the compensation of an execution parked
 	// because a compensation failed (its ErrKinds hold
@@ -714,6 +733,16 @@ type DueClaimer interface {
 // has no such executions (every key carries the execution id).
 type KeyEpocher interface {
 	KeyEpoch(ctx context.Context) (int64, error)
+}
+
+// PurgedKeeper is implemented by stores that can keep a tombstone of each
+// instance id PurgeEnded frees (T12.3). KeepPurged(d), called before the
+// store is used, with d > 0, makes PurgeEnded record the tombstones and drop
+// those older than d, and CreateExecution and child starts refuse a
+// tombstoned id (ErrInstancePurged, KindInstancePurged). With d <= 0 (the
+// default) none of this happens: no tombstone is written or read.
+type PurgedKeeper interface {
+	KeepPurged(d time.Duration)
 }
 
 // Watcher is implemented by stores that can push hints that work is ready

@@ -47,6 +47,16 @@ must take care of.
     define the workflow's version) undoes only its own claim. Compensating
     executions are not counted (a known gap: planning a compensation loads
     the history).
+- `Options.KeepPurgedIDs`, `flows.ErrInstancePurged` and
+  `Engine.ForgetInstance` (T12.3): instance-id idempotency past retention.
+  With `KeepPurgedIDs` set, `PurgeEnded` keeps a tombstone of each instance
+  id it frees, in the transaction that deletes its last execution, and
+  deletes the tombstones older than `KeepPurgedIDs`; `Workflow.Start` of a
+  tombstoned id fails with `ErrInstancePurged` instead of running the
+  workflow again, and a child started with one fails with it (kind
+  `instance_purged`; it matches `ErrInstanceExists` too).
+  `Engine.ForgetInstance` deletes a tombstone. Off by default: nothing
+  changes, and Start reads nothing more.
 
 ### Changed
 
@@ -108,6 +118,7 @@ must take care of.
 | Migration | Adds | For |
 |---|---|---|
 | `00017_crash_loops` | `activity_task.max_attempts`, `execution.claims` | the attempt limit of a task, and the claims of an execution since its last completed task, less its releases (T11.3) |
+| `00018_purged_instance` | table `purged_instance` and its index on `purged_at` | tombstones of purged instance ids (`Options.KeepPurgedIDs`, T12.3) |
 
 ### Upgrade notes
 
@@ -123,6 +134,12 @@ must take care of.
   it).
 - If engines are killed mid-activity during deploys, give the activities
   that must survive that at least two attempts.
+- **`00018` (T12.3)** creates an empty table: no lock on existing tables.
+- Turn `Options.KeepPurgedIDs` on only once every engine of the database
+  runs this release, and on all of them: an engine without it (an earlier
+  release, or this one with it unset) neither writes tombstones when it
+  purges nor reads them when it starts, so it would start a purged id
+  again.
 
 ## v0.1.2 (2026-11-17)
 

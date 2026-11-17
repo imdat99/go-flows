@@ -156,6 +156,11 @@ func Run(t *testing.T, h Harness) {
 		{"ActivityExhaustEdges", testActivityExhaustEdges},
 		{"ReleaseActivityTask", testReleaseActivityTask},
 		{"WorkflowClaimsCount", testWorkflowClaimsCount},
+		{"PurgedIDsKept", testPurgedIDsKept},
+		{"PurgedIDsOffByDefault", testPurgedIDsOffByDefault},
+		{"PurgedIDOfChain", testPurgedIDOfChain},
+		{"PurgedChildID", testPurgedChildID},
+		{"PurgeRacesCreate", testPurgeRacesCreate},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

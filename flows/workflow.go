@@ -95,7 +95,8 @@ func (w *Workflow[I, O]) Version() int { return int(w.version) }
 // an idempotency key: if the id was used already (by an execution of this
 // workflow, running or ended, until retention purges it), Start returns a
 // handle on that execution and starts nothing. ErrInstanceConflict when
-// the id belongs to another workflow.
+// the id belongs to another workflow. ErrInstancePurged when retention
+// purged it and Options.KeepPurgedIDs keeps its tombstone.
 func (w *Workflow[I, O]) Start(ctx context.Context, e *Engine, instanceID string, in I) (*Handle[O], error) {
 	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
 		return nil, err
@@ -133,7 +134,8 @@ func (w *Workflow[I, O]) Handle(e *Engine, instanceID string) *Handle[O] {
 // instance id instanceID, and returns its future. Canceling c cancels the
 // child and resolves the future with ErrCanceled at once; to ask the child
 // to cancel and still get its real outcome, use Future.RequestCancel. A
-// child whose id is already in use fails with ErrInstanceExists.
+// child whose id is already in use fails with ErrInstanceExists; one whose
+// id was purged (Options.KeepPurgedIDs) with ErrInstancePurged too.
 //
 // When the parent fails (or is canceled) and compensates, a child that
 // completed is compensated too, in reverse order with the parent's own

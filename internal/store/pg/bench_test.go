@@ -3,12 +3,43 @@ package pg_test
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/imdat99/go-flows/internal/history"
 	"github.com/imdat99/go-flows/internal/store"
 )
+
+// BenchmarkCreateExecution measures Workflow.Start's store side, one new
+// instance id per op, with tombstones of purged ids off (the default: the
+// statement of earlier releases) and kept (T12.3: one more index probe).
+func BenchmarkCreateExecution(b *testing.B) {
+	for _, keep := range []time.Duration{0, time.Hour} {
+		name := "off"
+		if keep > 0 {
+			name = "kept"
+		}
+		b.Run(name, func(b *testing.B) {
+			s := newStoreB(b)
+			s.KeepPurged(keep)
+			ctx := context.Background()
+			ids := make([]string, b.N)
+			for i := range ids {
+				ids[i] = "bench-" + strconv.Itoa(i)
+			}
+			input := []byte(`{"order_id":"9f1c2a4e-5b6d-4c3e-8f7a-1b2c3d4e5f60","amount":12999}`)
+			b.ResetTimer()
+			for i := range b.N {
+				if _, created, err := s.CreateExecution(ctx, store.NewExecution{
+					InstanceID: ids[i], Workflow: "w", Version: 1, Queue: "q", Input: input,
+				}); err != nil || !created {
+					b.Fatal(created, err)
+				}
+			}
+		})
+	}
+}
 
 // BenchmarkEagerActivity measures the store side of the eager loop, one
 // activity per op: complete the workflow task (history + eager activity

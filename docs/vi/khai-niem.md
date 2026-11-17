@@ -21,7 +21,9 @@ var placeOrder = flows.DefineWorkflow("place-order", 1, func(c flows.Ctx, o Orde
   engine, "order-42", o)` tạo một execution. Start lại cùng id thì nhận về
   handle của execution đó, dù nó đang chạy hay đã kết thúc, cho tới khi
   retention xoá nó. Nếu id thuộc workflow khác thì Start lỗi
-  `ErrInstanceConflict`.
+  `ErrInstanceConflict`. Với `Options.KeepPurgedIDs`, id đã bị xoá giữ một
+  tombstone trong khoảng thời gian đó và Start lỗi `ErrInstancePurged` thay
+  vì chạy lại (vận hành: Retention).
 - **Một instance có thể có nhiều execution.** `ContinueAsNew` kết thúc
   execution hiện tại và bắt đầu execution kế tiếp với cùng instance id.
   `Handle.Wait` đi theo chuỗi đó và trả kết quả của execution cuối.

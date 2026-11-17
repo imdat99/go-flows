@@ -92,6 +92,11 @@ func TestGW8_ClaimsReadOnlyWhatTheyClaim(t *testing.T) {
 		 SELECT 'e' || g, 'w', 1, 'q', 'completed', now() - interval '1 day',
 		        CASE WHEN g % 2 = 0 THEN (SELECT min(id) FROM flows.execution) ELSE 0 END
 		 FROM generate_series(1, 20000) g`,
+		// Tombstones (T12.3), half of them expired.
+		`INSERT INTO flows.purged_instance (instance_id, workflow, status, ended_at, purged_at)
+		 SELECT 'p' || g, 'w', 'completed', now() - interval '3 days',
+		        now() - CASE WHEN g % 2 = 0 THEN interval '2 days' ELSE interval '1 minute' END
+		 FROM generate_series(1, 20000) g`,
 		`ANALYZE`,
 	} {
 		if _, err := pool.Exec(ctx, sql); err != nil {
@@ -141,6 +146,11 @@ func TestGW8_ClaimsReadOnlyWhatTheyClaim(t *testing.T) {
 		{"workflow claim, queues", claimWorkflowQueues, `('{q,r}', 'o', 10, 60000000)`},
 		{"activity claim", claimActivities, `('{q}', 'o', 10, 60000000)`},
 		{"purge", purgeEnded, `(0, 10)`},
+		{"purge keeping tombstones", purgeEndedKept, `(0, 10)`},
+		{"tombstone expiry", expirePurged, `(86400000000, 10)`},
+		{"create", insertExecution, `('p2', 'w', 1, 'q', 0, 0, NULL, NULL)`},
+		{"create, tombstones kept", insertExecutionKept, `('p2', 'w', 1, 'q', 0, 0, NULL, NULL)`},
+		{"child, tombstones kept", insertChildKept, `('p2', 'w', 1, 'q', 1, 1, NULL, NULL)`},
 	} {
 		if most, plan := maxRows(t, c.sql, c.args); most > 100 {
 			t.Errorf("%s reads %d rows of a %d backlog to claim 10:\n%s", c.name, most, n, plan)

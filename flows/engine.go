@@ -103,6 +103,21 @@ type Options struct {
 	// checked by New: a connection that fails is logged ("flows: watch
 	// failed") and retried, the engine polling meanwhile.
 	ListenDSN string
+	// KeepPurgedIDs, when positive, keeps a tombstone of each instance id
+	// PurgeEnded frees, for that long after the purge (default 0: none),
+	// so that an instance id stays an idempotency key past retention:
+	// Workflow.Start of a purged id fails with ErrInstancePurged instead of
+	// running the workflow again (a client retrying "place order X" after
+	// retention), and a child started with one fails with it. PurgeEnded
+	// writes each tombstone in the transaction that deletes the id's last
+	// execution (a concurrent Start sees the execution or the tombstone,
+	// never a free id) and deletes the tombstones older than KeepPurgedIDs;
+	// Engine.ForgetInstance deletes one. An id is thus kept for the
+	// retention passed to PurgeEnded plus KeepPurgedIDs. Set the same value
+	// on every engine of the database: an engine without it neither writes
+	// nor reads tombstones (its starts cost nothing more; with it, they
+	// read one more index entry).
+	KeepPurgedIDs time.Duration
 }
 
 // Engine runs the workflows and activities defined in this binary against
@@ -160,6 +175,11 @@ func newEngineWith(st store.Store, acts worker.Activities, opts Options) (*Engin
 			SetHook(func(context.Context, store.EndInfo) error)
 		}:
 			s.SetHook(func(ctx context.Context, e store.EndInfo) error { return h.RunEnded(ctx, nil, runInfo(e)) })
+		}
+	}
+	if opts.KeepPurgedIDs > 0 {
+		if k, ok := st.(store.PurgedKeeper); ok {
+			k.KeepPurged(opts.KeepPurgedIDs)
 		}
 	}
 	var obs worker.Observer
@@ -295,6 +315,24 @@ func (e *Engine) Terminate(ctx context.Context, instanceID, reason string) error
 // ago (their histories with them), freeing their instance ids. Descendants
 // of an active execution (children, grandchildren) are kept until it ends:
 // its compensation may reach them.
+//
+// With Options.KeepPurgedIDs, the instance ids are not freed: each id
+// whose last execution is deleted gets a tombstone in the same
+// transaction (Start then fails with ErrInstancePurged), and up to limit
+// tombstones older than KeepPurgedIDs are deleted (not counted in the
+// result), freeing their ids.
 func (e *Engine) PurgeEnded(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
 	return e.st.PurgeEnded(ctx, olderThan, limit)
+}
+
+// ForgetInstance deletes the tombstone of a purged instance id
+// (Options.KeepPurgedIDs), so that Start runs the workflow again with that
+// id: for an operator who means it. ErrNotFound when the id has none (it
+// was never purged with KeepPurgedIDs set, its tombstone expired, or it
+// has an execution). It works whatever KeepPurgedIDs is.
+func (e *Engine) ForgetInstance(ctx context.Context, instanceID string) error {
+	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
+		return err
+	}
+	return e.st.ForgetInstance(ctx, instanceID)
 }

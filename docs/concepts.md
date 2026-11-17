@@ -22,7 +22,9 @@ var placeOrder = flows.DefineWorkflow("place-order", 1, func(c flows.Ctx, o Orde
   engine, "order-42", o)` creates an execution. Starting the same id again
   returns a handle on that execution, whether it is running or ended, until
   retention purges it. If the id belongs to another workflow, Start fails with
-  `ErrInstanceConflict`.
+  `ErrInstanceConflict`. With `Options.KeepPurgedIDs`, a purged id keeps a
+  tombstone for that long and Start fails with `ErrInstancePurged` instead of
+  running it again (operations: Retention).
 - **An instance can have several executions.** `ContinueAsNew` ends one
   execution and starts the next under the same instance id. `Handle.Wait`
   follows the chain and returns the last execution's result.

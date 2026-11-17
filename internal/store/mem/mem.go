@@ -68,6 +68,12 @@ type Store struct {
 	watchers map[int]func(store.WorkKind, string)
 	nextW    int
 
+	// keepPurged > 0 keeps a tombstone of each purged instance id for
+	// that long (store.PurgedKeeper); tombstones are kept regardless, for
+	// ForgetInstance.
+	keepPurged time.Duration
+	purged     map[string]tombstone
+
 	// Indexes of executions (T10.8), so that the lookups made per task
 	// (claims, Wake, ending a parent) are proportional to the matching set,
 	// not to every execution kept for retention. Kept by create, setStatus
@@ -97,6 +103,40 @@ func (s *Store) callHook(ctx context.Context, e *execution, status store.Status,
 	}()
 	if err := s.hook(ctx, endInfo(e, status, msg, kinds)); err != nil {
 		return fmt.Errorf("end hook: %w", err)
+	}
+	return nil
+}
+
+// tombstone records a purged instance id (store.PurgedKeeper).
+type tombstone struct {
+	workflow string
+	status   store.Status
+	purgedAt time.Time
+}
+
+// KeepPurged implements store.PurgedKeeper (before the store is used).
+func (s *Store) KeepPurged(d time.Duration) { s.keepPurged = d }
+
+// ForgetInstance implements store.Store.
+func (s *Store) ForgetInstance(_ context.Context, instanceID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.purged[instanceID]; !ok {
+		return store.ErrNotFound
+	}
+	delete(s.purged, instanceID)
+	return nil
+}
+
+// purgedErr returns ErrInstancePurged when id has a tombstone that counts;
+// s.mu is held.
+func (s *Store) purgedErr(id string) error {
+	if s.keepPurged <= 0 {
+		return nil
+	}
+	if ts, ok := s.purged[id]; ok {
+		return fmt.Errorf("%w: %s (workflow %s, %s, purged at %s)", store.ErrInstancePurged, id, ts.workflow, ts.status,
+			ts.purgedAt.Format(time.RFC3339))
 	}
 	return nil
 }
@@ -284,6 +324,9 @@ func (s *Store) CreateExecution(_ context.Context, ne store.NewExecution) (store
 			return store.Execution{}, false, store.ErrInstanceConflict
 		}
 		return cloneExecution(e.Execution), false, nil
+	}
+	if err := s.purgedErr(ne.InstanceID); err != nil {
+		return store.Execution{}, false, err
 	}
 	e := s.create(ne, s.clock.Now())
 	return cloneExecution(e.Execution), true, nil
@@ -705,11 +748,16 @@ func (s *Store) createActivities(e *execution, owner string, acts []store.NewAct
 func (s *Store) createChildren(e *execution, children []store.NewExecution, now time.Time) {
 	for i, ch := range children {
 		_, used := s.latest[ch.InstanceID]
-		children[i].Taken = used
-		if used {
+		purged := !used && s.purgedErr(ch.InstanceID) != nil
+		children[i].Taken = used || purged
+		if used || purged {
+			msg, kinds := "child instance id already in use", store.KindInstanceExists
+			if purged {
+				msg, kinds = "child instance id purged", store.KindInstanceExists+","+store.KindInstancePurged
+			}
 			s.addPending(e, history.Event{
 				Type: history.ChildFailed, ScheduleID: ch.ParentSched, Ref: ch.InstanceID,
-				Err: "child instance id already in use", ErrKinds: store.KindInstanceExists, Permanent: true,
+				Err: msg, ErrKinds: kinds, Permanent: true,
 			}, now)
 			continue
 		}
@@ -1300,7 +1348,8 @@ func (s *Store) activeAncestor(e *execution) bool {
 func (s *Store) PurgeEnded(_ context.Context, olderThan time.Duration, limit int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cutoff := s.clock.Now().Add(-olderThan)
+	now := s.clock.Now()
+	cutoff := now.Add(-olderThan)
 	var ids []int64
 	for id, e := range s.executions {
 		if !e.EndedAt.IsZero() && e.EndedAt.Before(cutoff) && !s.activeAncestor(e) {
@@ -1317,6 +1366,12 @@ func (s *Store) PurgeEnded(_ context.Context, olderThan time.Duration, limit int
 		s.unindex(e)
 		if s.latest[e.InstanceID] == id {
 			delete(s.latest, e.InstanceID)
+			if s.keepPurged > 0 {
+				if s.purged == nil {
+					s.purged = make(map[string]tombstone)
+				}
+				s.purged[e.InstanceID] = tombstone{workflow: e.Workflow, status: e.Status, purgedAt: now}
+			}
 		}
 		for tid, t := range s.tasks {
 			if t.ExecutionID == id {
@@ -1324,7 +1379,34 @@ func (s *Store) PurgeEnded(_ context.Context, olderThan time.Duration, limit int
 			}
 		}
 	}
+	if s.keepPurged > 0 {
+		s.dropTombstones(now.Add(-s.keepPurged), limit)
+	}
 	return len(ids), nil
+}
+
+// dropTombstones deletes up to limit tombstones purged before cutoff,
+// oldest first; s.mu is held.
+func (s *Store) dropTombstones(cutoff time.Time, limit int) {
+	type old struct {
+		id string
+		at time.Time
+	}
+	var olds []old
+	for id, ts := range s.purged {
+		if ts.purgedAt.Before(cutoff) {
+			olds = append(olds, old{id, ts.purgedAt})
+		}
+	}
+	slices.SortFunc(olds, func(a, b old) int {
+		if c := a.at.Compare(b.at); c != 0 {
+			return c
+		}
+		return strings.Compare(a.id, b.id)
+	})
+	for i := range min(limit, len(olds)) {
+		delete(s.purged, olds[i].id)
+	}
 }
 
 // Watch implements store.Watcher. wake is called with the store's lock

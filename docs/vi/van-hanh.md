@@ -173,8 +173,29 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // kết thúc hơn 30 n
 - **Cái được giữ.** Hậu duệ của một execution còn hoạt động (đang chạy, đang
   compensate hoặc bị park), cả child lẫn cháu, được giữ lại, vì compensation
   có thể chạm tới chúng.
-- **Id.** Instance id đã bị xoá có thể dùng để start lại. Trước khi bị xoá,
-  `Workflow.Start` với id đó trả về execution cũ.
+- **Id.** Mặc định, instance id đã bị xoá có thể dùng để start lại. Trước
+  khi bị xoá, `Workflow.Start` với id đó trả về execution cũ. Client retry
+  "đặt đơn X" sau retention sẽ chạy lại workflow: khi id phải còn là khoá
+  idempotency sau retention, hãy đặt `Options.KeepPurgedIDs` (trên mọi
+  engine dùng chung database).
+- **Tombstone (`Options.KeepPurgedIDs`).** Khi đó `PurgeEnded` ghi lại mỗi
+  instance id mà nó xoá execution cuối cùng (id, workflow, status, thời điểm
+  kết thúc và thời điểm xoá, bảng `flows.purged_instance`) trong cùng
+  transaction. `Workflow.Start` với id đó lỗi `flows.ErrInstancePurged`, và
+  child start với id đó cũng lỗi như vậy (lỗi của nó khớp cả
+  `ErrInstanceExists`). Một Start chạy đua với việc xoá thấy hoặc execution
+  hoặc tombstone, không bao giờ thấy id trống. Mỗi lần gọi `PurgeEnded` cũng
+  xoá tối đa `limit` tombstone cũ hơn `KeepPurgedIDs`: id được giữ trong
+  khoảng tuổi xoá cộng `KeepPurgedIDs`, rồi được giải phóng.
+  `Engine.ForgetInstance(ctx, id)` xoá ngay một tombstone, cho operator thực
+  sự muốn chạy lại id đó. Các execution trước của một chuỗi continue-as-new
+  không để lại tombstone khi còn execution sau. Bảng giữ một dòng nhỏ cho mỗi
+  id bị xoá trong cửa sổ đó: chọn cửa sổ theo thời gian client có thể retry.
+  Khi tắt tuỳ chọn (mặc định) không có gì được ghi hay đọc và Start không tốn
+  thêm gì; khi bật, Start và child start đọc thêm một mục index. Tombstone
+  còn lại sau khi tắt tuỳ chọn ở nguyên đó cho tới khi bật lại (khi đó chúng
+  hết hạn) hoặc bị xoá (`ForgetInstance`, hoặc
+  `DELETE FROM flows.purged_instance`).
 - **Bảng `idem`.** Xoá bằng `idem.Purge`, với độ tuổi lớn hơn hẳn khoảng
   thời gian retry và compensation dài nhất của bạn.
 

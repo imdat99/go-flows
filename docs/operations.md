@@ -176,8 +176,29 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // ended over 30 days ag
 - **What is kept.** Descendants of an active execution (running,
   compensating or parked) are kept, children and grandchildren alike,
   because compensation may reach them.
-- **Ids.** A purged instance id can be started again. Until then,
-  `Workflow.Start` with that id returns the old execution.
+- **Ids.** By default a purged instance id can be started again. Until
+  then, `Workflow.Start` with that id returns the old execution. A client
+  that retries "place order X" after retention would run the workflow
+  again: when ids must stay idempotency keys past retention, set
+  `Options.KeepPurgedIDs` (on every engine of the database).
+- **Tombstones (`Options.KeepPurgedIDs`).** `PurgeEnded` then records each
+  instance id whose last execution it deletes (id, workflow, status, end
+  and purge times, table `flows.purged_instance`) in the same transaction.
+  `Workflow.Start` of such an id fails with `flows.ErrInstancePurged`, and
+  a child started with one fails with it (its error matches
+  `ErrInstanceExists` too). A Start racing the purge sees the execution or
+  the tombstone, never a free id. Each `PurgeEnded` call also deletes up to
+  `limit` tombstones older than `KeepPurgedIDs`: an id is kept for the
+  purge age plus `KeepPurgedIDs`, then freed.
+  `Engine.ForgetInstance(ctx, id)` deletes one tombstone at once, for an
+  operator who means to run the id again. Earlier executions of a
+  continue-as-new chain leave no tombstone while a later one exists. The
+  table holds one small row per purged id within the window: size the
+  window to how long clients may retry. With the option off (the default)
+  nothing is written or read and Start costs nothing more; with it, Start
+  and child starts read one more index entry. Tombstones left after turning
+  it off stay until it is turned on again (then they expire) or are
+  deleted (`ForgetInstance`, or `DELETE FROM flows.purged_instance`).
 - **`idem` tables.** Purge them with `idem.Purge`, using an age well above
   your longest retry and compensation horizon.
 

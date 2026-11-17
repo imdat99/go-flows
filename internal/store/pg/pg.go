@@ -40,6 +40,10 @@ type Store struct {
 	hook    Hook            // nil: no end hook
 	watches sync.Map        // done channel -> *ctxWatch (fast.go)
 	listen  *pgx.ConnConfig // nil: Watch listens on a connection of the pool
+	// keepPurged > 0 keeps tombstones of purged instance ids that long
+	// (store.PurgedKeeper): the statements that read and write them are
+	// used only then.
+	keepPurged time.Duration
 }
 
 // Hook runs inside the transaction that ends or parks an execution
@@ -295,7 +299,7 @@ const insertExecution = `
 	WITH ins AS (
 		INSERT INTO flows.execution (instance_id, workflow, version, queue, status, parent_id, parent_sched, input, ready_at, trace)
 		SELECT $1, $2, $3, $4, 'running', $5, $6, $7, now(), $8
-		WHERE NOT EXISTS (SELECT 1 FROM flows.execution WHERE instance_id = $1)
+		WHERE ` + idFree + `
 		ON CONFLICT (instance_id) WHERE status IN ` + activeStatuses + ` DO NOTHING
 		RETURNING ` + executionColumns + `
 	), start AS (
@@ -306,6 +310,46 @@ const insertExecution = `
 	SELECT ` + executionColumns + ` FROM ins`
 
 const typeStarted = "1" // history.ExecutionStarted
+
+// idFree is the condition of an insert of an execution with instance id $1:
+// no execution of it exists. idFreeKept adds: no tombstone of it either
+// (store.PurgedKeeper). PurgeEnded deletes an id's last execution and
+// writes its tombstone in one transaction, so the statement's snapshot
+// sees one or the other.
+const (
+	idFree     = `NOT EXISTS (SELECT 1 FROM flows.execution WHERE instance_id = $1)`
+	idFreeKept = idFree + `
+		  AND NOT EXISTS (SELECT 1 FROM flows.purged_instance WHERE instance_id = $1)`
+)
+
+// insertExecutionKept is insertExecution when tombstones are kept.
+var insertExecutionKept = strings.Replace(insertExecution, idFree, idFreeKept, 1)
+
+// insertExecutionSQL returns the insert of CreateExecution and its fast
+// path statement name.
+func (s *Store) insertExecutionSQL() (sql, name string) {
+	if s.keepPurged > 0 {
+		return insertExecutionKept, nInsertExecutionKept
+	}
+	return insertExecution, nInsertExecution
+}
+
+// purgedErr returns ErrInstancePurged, with the tombstone's details, when
+// instance id has one.
+func (s *Store) purgedErr(ctx context.Context, id string) error {
+	var workflow, status string
+	var at time.Time
+	err := s.pool.QueryRow(ctx, `SELECT workflow, status, purged_at FROM flows.purged_instance WHERE instance_id = $1`,
+		id).Scan(&workflow, &status, &at)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("create execution: %w", err)
+	}
+	return fmt.Errorf("%w: %s (workflow %s, %s, purged at %s)", store.ErrInstancePurged, id, workflow, status,
+		at.UTC().Format(time.RFC3339))
+}
 
 // CreateExecution implements store.Store.
 func (s *Store) CreateExecution(ctx context.Context, ne store.NewExecution) (store.Execution, bool, error) {
@@ -318,7 +362,8 @@ func (s *Store) CreateExecution(ctx context.Context, ne store.NewExecution) (sto
 				err = pgx.ErrNoRows
 			}
 		} else {
-			e, err = scanExecution(s.pool.QueryRow(ctx, insertExecution,
+			sql, _ := s.insertExecutionSQL()
+			e, err = scanExecution(s.pool.QueryRow(ctx, sql,
 				ne.InstanceID, ne.Workflow, ne.Version, ne.Queue, ne.ParentID, ne.ParentSched, ne.Input, ne.Trace))
 		}
 		if err == nil {
@@ -329,7 +374,15 @@ func (s *Store) CreateExecution(ctx context.Context, ne store.NewExecution) (sto
 		}
 		e, err = s.GetExecution(ctx, ne.InstanceID)
 		if errors.Is(err, store.ErrNotFound) {
-			continue // the concurrent insert we waited for rolled back
+			// Purged since the insert's snapshot (then it has a
+			// tombstone, if kept), or the concurrent insert we waited
+			// for rolled back.
+			if s.keepPurged > 0 {
+				if err := s.purgedErr(ctx, ne.InstanceID); err != nil {
+					return store.Execution{}, false, err
+				}
+			}
+			continue
 		}
 		if err != nil {
 			return e, false, err
@@ -1178,11 +1231,24 @@ const (
 
 // insertChild creates a child execution, or delivers ChildFailed
 // (instance_exists) to the parent $5 when the id is taken.
-const insertChild = `
+var insertChild = childInsert(idFree, `'child instance id already in use', '`+store.KindInstanceExists+`'`)
+
+// insertChildKept is insertChild when tombstones are kept: a purged id
+// (a tombstone, no execution) fails the child too, with instance_purged
+// added.
+var insertChildKept = childInsert(idFreeKept, `
+	CASE WHEN `+purgedOnly+` THEN 'child instance id purged' ELSE 'child instance id already in use' END,
+	CASE WHEN `+purgedOnly+` THEN '`+store.KindInstanceExists+`,`+store.KindInstancePurged+`'
+	     ELSE '`+store.KindInstanceExists+`' END`)
+
+const purgedOnly = `EXISTS (SELECT 1 FROM flows.purged_instance WHERE instance_id = $1) AND ` + idFree
+
+func childInsert(free, failure string) string {
+	return `
 	WITH ins AS (
 		INSERT INTO flows.execution (instance_id, workflow, version, queue, status, parent_id, parent_sched, input, ready_at, trace)
 		SELECT $1, $2, $3, $4, 'running', $5, $6, $7, now(), $8
-		WHERE NOT EXISTS (SELECT 1 FROM flows.execution WHERE instance_id = $1)
+		WHERE ` + free + `
 		ON CONFLICT (instance_id) WHERE status IN ` + activeStatuses + ` DO NOTHING
 		RETURNING id
 	), start AS (
@@ -1191,9 +1257,18 @@ const insertChild = `
 		RETURNING ` + notifyW + "$4)" + `
 	)
 	INSERT INTO flows.pending_event (execution_id, visible_at, type, schedule_id, ref, err, err_kinds, permanent)
-	SELECT $5, now(), ` + typeChildFailed + `, $6, $1, 'child instance id already in use', '` + store.KindInstanceExists + `', true
+	SELECT $5, now(), ` + typeChildFailed + `, $6, $1, ` + failure + `, true
 	WHERE NOT EXISTS (SELECT 1 FROM ins)
 	RETURNING schedule_id` // a row only when the id was taken (store.NewExecution.Taken)
+}
+
+// insertChildSQL returns the child insert and its fast path statement name.
+func (s *Store) insertChildSQL() (sql, name string) {
+	if s.keepPurged > 0 {
+		return insertChildKept, nInsertChildKept
+	}
+	return insertChild, nInsertChild
+}
 
 const cancelChildren = `
 	WITH t AS (
@@ -1525,8 +1600,9 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		queue(insertActivities, l.ID, scheds, comps, names, queues, inputs, claims, l.Owner, uncertain, maxAttempts)
 	}
 	sh.childAt = sh.statements
+	childSQL, _ := s.insertChildSQL()
 	for _, ch := range c.Children {
-		queue(insertChild, ch.InstanceID, ch.Workflow, ch.Version, ch.Queue, l.ID, ch.ParentSched, ch.Input, ch.Trace)
+		queue(childSQL, ch.InstanceID, ch.Workflow, ch.Version, ch.Queue, l.ID, ch.ParentSched, ch.Input, ch.Trace)
 	}
 	if len(c.ChildCancels) > 0 {
 		queue(cancelChildren, l.ID, c.ChildCancels)
