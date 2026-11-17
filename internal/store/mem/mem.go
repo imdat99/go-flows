@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"slices"
 	"strings"
 	"sync"
@@ -94,10 +95,7 @@ func (s *Store) callHook(ctx context.Context, e *execution, status store.Status,
 			err = fmt.Errorf("end hook: panic: %v", r)
 		}
 	}()
-	if err := s.hook(ctx, store.EndInfo{
-		ExecutionID: e.ID, InstanceID: e.InstanceID, Workflow: e.Workflow, Version: e.Version,
-		Status: status, Err: msg, ErrKinds: kinds,
-	}); err != nil {
+	if err := s.hook(ctx, endInfo(e, status, msg, kinds)); err != nil {
 		return fmt.Errorf("end hook: %w", err)
 	}
 	return nil
@@ -237,9 +235,33 @@ func (s *Store) unindex(e *execution) {
 	}
 }
 
-// firstOf reports whether queues[i] is not repeated earlier in queues: an
-// execution of a queue listed twice is visited once.
-func firstOf(queues []string, i int) bool { return !slices.Contains(queues[:i], queues[i]) }
+// runnableIn yields the runnable executions of queues, each queue once
+// (a queue repeated in queues is not visited twice).
+func (s *Store) runnableIn(queues []string) iter.Seq[*execution] {
+	return func(yield func(*execution) bool) {
+		for i, q := range queues {
+			if slices.Contains(queues[:i], q) {
+				continue
+			}
+			for _, e := range s.runnable[q] {
+				if !yield(e) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// earliestPending is the earliest visibility of e's pending events (ok
+// false: none).
+func (e *execution) earliestPending() (at time.Time, ok bool) {
+	for _, p := range e.pending {
+		if !ok || p.visibleAt.Before(at) {
+			at, ok = p.visibleAt, true
+		}
+	}
+	return at, ok
+}
 
 func (s *Store) id() int64 {
 	s.nextID++
@@ -289,14 +311,14 @@ func (s *Store) addPending(e *execution, ev history.Event, visibleAt time.Time) 
 
 // Executions returns the executions kept, earlier ones of a
 // continue-as-new chain included, in creation (id) order, without their
-// Input and Output (flowtest walks them).
+// Input and Output and with a copy of their Trace (flowtest walks them).
 func (s *Store) Executions() []store.Execution {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]store.Execution, 0, len(s.executions))
 	for _, e := range s.executions {
 		x := e.Execution
-		x.Input, x.Output = nil, nil
+		x.Input, x.Output, x.Trace = nil, nil, clone(x.Trace)
 		out = append(out, x)
 	}
 	slices.SortFunc(out, func(a, b store.Execution) int { return cmp.Compare(a.ID, b.ID) })
@@ -378,32 +400,20 @@ func (s *Store) Wake(owner string, queues []string) (ready bool, next time.Time,
 			next, ok = at, true
 		}
 	}
-	for i, q := range queues {
-		if !firstOf(queues, i) {
+	for e := range s.runnableIn(queues) {
+		s.visited++
+		earliest, found := e.earliestPending()
+		if e.forceReady {
+			earliest, found = now, true
+		}
+		if !found {
 			continue
 		}
-		for _, e := range s.runnable[q] {
-			s.visited++
-			if len(e.pending) == 0 && !e.forceReady {
-				continue
-			}
-			var earliest time.Time
-			if e.forceReady {
-				earliest = now
-			} else {
-				earliest = e.pending[0].visibleAt
-				for _, p := range e.pending[1:] {
-					if p.visibleAt.Before(earliest) {
-						earliest = p.visibleAt
-					}
-				}
-			}
-			at := latest(earliest, e.lockedUntil, e.notBefore)
-			if e.stickyOwner != "" && e.stickyOwner != owner {
-				at = latest(at, e.stickyUntil)
-			}
-			consider(at)
+		at := latest(earliest, e.lockedUntil, e.notBefore)
+		if e.stickyOwner != "" && e.stickyOwner != owner {
+			at = latest(at, e.stickyUntil)
 		}
+		consider(at)
 	}
 	for _, t := range s.tasks {
 		if contains(queues, t.Queue) {
@@ -436,20 +446,15 @@ func (s *Store) ClaimWorkflowTasks(_ context.Context, owner string, queues []str
 		at time.Time
 	}
 	var cands []cand
-	for i, q := range queues {
-		if !firstOf(queues, i) {
+	for e := range s.runnableIn(queues) {
+		if e.lockedUntil.After(now) || e.notBefore.After(now) {
 			continue
 		}
-		for _, e := range s.runnable[q] {
-			if e.lockedUntil.After(now) || e.notBefore.After(now) {
-				continue
-			}
-			if e.stickyOwner != "" && e.stickyOwner != owner && e.stickyUntil.After(now) {
-				continue
-			}
-			if at, ok := e.readyAt(now); ok {
-				cands = append(cands, cand{e, at})
-			}
+		if e.stickyOwner != "" && e.stickyOwner != owner && e.stickyUntil.After(now) {
+			continue
+		}
+		if at, ok := e.readyAt(now); ok {
+			cands = append(cands, cand{e, at})
 		}
 	}
 	slices.SortFunc(cands, func(a, b cand) int {
@@ -569,13 +574,8 @@ func ownerDue(e *execution, c *store.Completion, now time.Time) bool {
 	if c.DueKnown <= 0 {
 		return false
 	}
-	var first time.Time
-	for _, p := range e.pending {
-		if first.IsZero() || p.visibleAt.Before(first) {
-			first = p.visibleAt
-		}
-	}
-	return !first.IsZero() && !first.After(now.Add(min(c.StickyFor, c.DueKnown)))
+	first, ok := e.earliestPending()
+	return ok && !first.After(now.Add(min(c.StickyFor, c.DueKnown)))
 }
 
 // cancelRequests marks canceled activities and asks children to cancel.
@@ -979,14 +979,9 @@ func (s *Store) hasActivity(id int64) bool {
 // (T10.5): work waiting for its workflow task, such as an activity's
 // result. A future timer is not, nor the events of a parked execution.
 func (s *Store) hasWaitingEvents(id int64, now time.Time) bool {
-	if e := s.executions[id]; e != nil && (e.Status == store.StatusRunning || e.Status == store.StatusCompensating) {
-		for _, p := range e.pending {
-			if !p.visibleAt.After(now) {
-				return true
-			}
-		}
-	}
-	return false
+	e := s.executions[id]
+	return e != nil && claimable(e.Status) &&
+		slices.ContainsFunc(e.pending, func(p pending) bool { return !p.visibleAt.After(now) })
 }
 
 // extendLocks extends the locks held by execution id by their TTL.
@@ -1357,10 +1352,15 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) (store
 	e.lease = store.Lease{ID: e.ID, Version: e.lease.Version + 1}
 	e.lockedUntil, e.stickyOwner, e.stickyUntil = time.Time{}, "", time.Time{}
 	s.end(e, &store.Completion{Status: store.StatusTerminated, Err: reason}, now)
+	return endInfo(e, store.StatusTerminated, reason, ""), nil
+}
+
+// endInfo is e's identity ending with status, msg and kinds.
+func endInfo(e *execution, status store.Status, msg, kinds string) store.EndInfo {
 	return store.EndInfo{
 		ExecutionID: e.ID, InstanceID: e.InstanceID, Workflow: e.Workflow, Version: e.Version,
-		Status: store.StatusTerminated, Err: reason,
-	}, nil
+		Status: status, Err: msg, ErrKinds: kinds,
+	}
 }
 
 // ClaimWorkflowTasksDue implements store.DueClaimer.
@@ -1378,21 +1378,16 @@ func (s *Store) ClaimWorkflowTasksDue(ctx context.Context, owner string, queues 
 			next = t
 		}
 	}
-	for i, q := range queues {
-		if !firstOf(queues, i) {
-			continue
-		}
-		for _, e := range s.runnable[q] {
-			earlier(e.notBefore)
-			// As Postgres' ready_at: the earliest pending event, if none is
-			// visible now (then the execution is ready, not due later), of an
-			// execution without a lease (a kept lease is its owner's), unless
-			// it is its sticky owner's (due_owner, T10.3).
-			if at, ok := e.readyAt(now); e.lockedUntil.IsZero() && (!ok || at.After(now)) {
-				if e.stickyOwner == "" || !e.ownerDue {
-					for _, p := range e.pending {
-						earlier(p.visibleAt)
-					}
+	for e := range s.runnableIn(queues) {
+		earlier(e.notBefore)
+		// As Postgres' ready_at: the earliest pending event, if none is
+		// visible now (then the execution is ready, not due later), of an
+		// execution without a lease (a kept lease is its owner's), unless
+		// it is its sticky owner's (due_owner, T10.3).
+		if at, ok := e.readyAt(now); e.lockedUntil.IsZero() && (!ok || at.After(now)) {
+			if e.stickyOwner == "" || !e.ownerDue {
+				if first, ok := e.earliestPending(); ok {
+					earlier(first)
 				}
 			}
 		}

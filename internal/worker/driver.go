@@ -734,27 +734,22 @@ func (w *Worker) ended(e *store.Execution, status store.Status, msg, kinds strin
 	}
 }
 
-// observe calls the observer, recovering (and logging) its panics: a
-// broken metrics hook must not lose a result nor crash the process.
-func (w *Worker) observe(fn func()) {
+// guard calls fn, recovering (and logging as msg) its panics: a broken
+// observer, tracer or hook must not lose a result nor crash the process.
+func (w *Worker) guard(msg string, fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			w.log.LogAttrs(context.Background(), slog.LevelError, "flows: panic in observer", slog.Any("panic", r))
+			w.log.LogAttrs(context.Background(), slog.LevelError, msg, slog.Any("panic", r))
 		}
 	}()
 	fn()
 }
 
-// traced calls the tracer, recovering (and logging) its panics, as
-// observe.
-func (w *Worker) traced(fn func()) {
-	defer func() {
-		if r := recover(); r != nil {
-			w.log.LogAttrs(context.Background(), slog.LevelError, "flows: panic in tracer", slog.Any("panic", r))
-		}
-	}()
-	fn()
-}
+// observe calls the observer under guard.
+func (w *Worker) observe(fn func()) { w.guard("flows: panic in observer", fn) }
+
+// traced calls the tracer under guard.
+func (w *Worker) traced(fn func()) { w.guard("flows: panic in tracer", fn) }
 
 func (d *driver) evict() {
 	if d.ex != nil {
@@ -792,18 +787,9 @@ func (d *driver) reportDropped(task *store.WorkflowTask, c *store.Completion) {
 		slog.String("instance", task.Execution.InstanceID), slog.String("status", string(c.Status)),
 		slog.Int("activities", acts), slog.Int("children", kids))
 	if w.droppedHook != nil {
-		w.callDroppedHook(task.Execution.InstanceID, task.Execution.ID, acts, kids)
+		// The task is committed: the rest of its completion must run.
+		w.guard("flows: panic in dropped hook", func() {
+			w.droppedHook(task.Execution.InstanceID, task.Execution.ID, acts, kids)
+		})
 	}
-}
-
-// callDroppedHook calls the dropped hook, recovering (and logging) its
-// panics: the task is committed, the rest of its completion must run.
-func (w *Worker) callDroppedHook(instanceID string, executionID int64, acts, kids int) {
-	defer func() {
-		if r := recover(); r != nil {
-			w.log.LogAttrs(context.Background(), slog.LevelError, "flows: panic in dropped hook",
-				slog.String("instance", instanceID), slog.Any("panic", r))
-		}
-	}()
-	w.droppedHook(instanceID, executionID, acts, kids)
 }

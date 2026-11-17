@@ -115,10 +115,10 @@ func (c checker) checkBody(body *ast.BlockStmt) {
 		case *ast.SelectStmt:
 			pass.Reportf(n.Pos(), "select is not deterministic in workflow code: use flows.Select")
 		case *ast.SendStmt:
-			pass.Reportf(n.Pos(), "native channels are not allowed in workflow code: use signals (flows.Signals) or flows.Go with flows.WaitGroup")
+			pass.Report(analysis.Diagnostic{Pos: n.Pos(), Message: chanMsg + ": " + chanAdvice})
 		case *ast.UnaryExpr:
 			if n.Op == token.ARROW {
-				pass.Reportf(n.Pos(), "native channels are not allowed in workflow code: use signals (flows.Signals) or flows.Go with flows.WaitGroup")
+				pass.Report(analysis.Diagnostic{Pos: n.Pos(), Message: chanMsg + ": " + chanAdvice})
 			}
 		case *ast.RangeStmt:
 			checkRange(pass, n)
@@ -162,7 +162,7 @@ func checkRange(pass *analysis.Pass, n *ast.RangeStmt) {
 	case *types.Map:
 		pass.Reportf(n.Pos(), "iterating over a map is not deterministic in workflow code: iterate over sorted keys")
 	case *types.Chan:
-		pass.Reportf(n.Pos(), "native channels are not allowed in workflow code: use signals (flows.Signals) or flows.Go with flows.WaitGroup")
+		pass.Report(analysis.Diagnostic{Pos: n.Pos(), Message: chanMsg + ": " + chanAdvice})
 	}
 }
 
@@ -295,7 +295,7 @@ func typeReport(t types.Type, field string) string {
 		field = " (field " + field + ")"
 	}
 	if _, ok := coreType(t).(*types.Chan); ok {
-		return "native channels are not allowed in workflow code" + field + ": use signals (flows.Signals) or flows.Go with flows.WaitGroup"
+		return chanMsg + field + ": " + chanAdvice
 	}
 	named, ok := t.(*types.Named)
 	if !ok || named.Obj().Pkg() == nil || named.Obj().Pkg().Path() != "sync" {
@@ -471,6 +471,12 @@ var forbidden = map[string]map[string]string{
 		"NewDCEGroup": idAdvice, "NewDCEPerson": idAdvice, "NewDCESecurity": idAdvice,
 	},
 }
+
+// chanMsg and chanAdvice make the report of a native channel.
+const (
+	chanMsg    = "native channels are not allowed in workflow code"
+	chanAdvice = "use signals (flows.Signals) or flows.Go with flows.WaitGroup"
+)
 
 const idAdvice = "generate ids with flows.SideEffect (or in an activity)"
 

@@ -196,14 +196,10 @@ func (t tracer) StartAttempt(ctx context.Context, a *store.ActivityTask) (contex
 }
 
 func (t tracer) StartTask(ctx context.Context, e *store.Execution) (context.Context, func(store.Status, error)) {
-	tctx, end := t.t.StartWorkflowTask(ctx, WorkflowTaskInfo{
+	return t.t.StartWorkflowTask(ctx, WorkflowTaskInfo{
 		InstanceID: e.InstanceID, ExecutionID: e.ID, Workflow: e.Workflow, Version: int(e.Version),
 		Status: e.Status, Trace: e.Trace,
 	})
-	if end == nil {
-		return tctx, nil
-	}
-	return tctx, end
 }
 
 func (t tracer) StartFrom(ctx context.Context, from *store.Execution, ne *store.NewExecution, continued bool) func(bool, error) {

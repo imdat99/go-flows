@@ -35,17 +35,8 @@ func realTime(t *testing.T, h Harness, run func(h Harness) bool) {
 // check holds.
 func within(t *testing.T, s store.Store, d time.Duration) func() bool {
 	t.Helper()
-	start, err := s.Now(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return func() bool {
-		now, err := s.Now(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return now.Sub(start) < d
-	}
+	start := storeNow(t, s)
+	return func() bool { return storeNow(t, s).Sub(start) < d }
 }
 
 // lease is the lease of the tasks the lock waiter tests claim: long enough

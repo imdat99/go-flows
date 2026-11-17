@@ -54,16 +54,16 @@ func (s *Store) SetHook(h Hook) { s.hook = h }
 // inTx runs fn in a transaction, then the end hook with info, which fn
 // completes with the identity of the execution it ended (read in its own
 // batch, T10.9: no extra round trip), then commits.
-func (s *Store) inTx(ctx context.Context, info store.EndInfo, fn func(tx pgx.Tx, info *store.EndInfo) error) error {
+func (s *Store) inTx(ctx context.Context, info *store.EndInfo, fn func(tx pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if err := fn(tx, &info); err != nil {
+	if err := fn(tx); err != nil {
 		return err
 	}
-	if err := callHook(ctx, s.hook, tx, info); err != nil {
+	if err := callHook(ctx, s.hook, tx, *info); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -1215,7 +1215,8 @@ const cancelActivities = `
 const updateRunning = `
 	WITH v AS (
 		SELECT coalesce(nullif($3::text, ''), status) AS status,
-		       $4::bigint > 0 AND coalesce(nullif($3::text, ''), status) IN ('running', 'compensating') AS keep
+		       $4::bigint > 0 AND coalesce(nullif($3::text, ''), status) IN ('running', 'compensating') AS keep,
+		       (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1) AS next_due
 		FROM flows.execution WHERE id = $1
 	)
 	UPDATE flows.execution e
@@ -1227,9 +1228,8 @@ const updateRunning = `
 	    -- (wakeForTask) leave ready_at alone, so a dead holder's execution
 	    -- is found then, possibly with nothing pending (an empty task).
 	    ready_at = CASE WHEN v.keep
-	        THEN least((SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
-	                   now() + $4 * interval '1 microsecond')
-	        ELSE (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1) END,
+	        THEN least(v.next_due, now() + $4 * interval '1 microsecond')
+	        ELSE v.next_due END,
 	    owner_id = CASE WHEN v.keep THEN e.owner_id ELSE '' END,
 	    -- The next due time is the owner's (due_owner, T10.2, T10.3): a
 	    -- kept lease's, or the first event falling due while the execution
@@ -1237,8 +1237,7 @@ const updateRunning = `
 	    -- wakes for it). The mark counts while sticky_owner names the owner:
 	    -- a kept lease's sticky_owner is its owner (no sticky_until).
 	    due_owner = CASE WHEN v.keep OR coalesce($5::bigint > 0 AND $9::bigint > 0 AND
-	        (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1)
-	            <= now() + least($5::bigint, $9::bigint) * interval '1 microsecond', false)
+	        v.next_due <= now() + least($5::bigint, $9::bigint) * interval '1 microsecond', false)
 	        THEN $6 ELSE '' END,
 	    locked_until = CASE WHEN v.keep THEN now() + $4 * interval '1 microsecond' END,
 	    sticky_owner = CASE WHEN v.keep OR $5::bigint > 0 THEN $6 ELSE '' END,
@@ -1443,8 +1442,8 @@ func (s *Store) completeWithPgx(ctx context.Context, l store.Lease, c *store.Com
 		return br.Close()
 	}
 	if hooked {
-		err := s.inTx(ctx, store.EndInfo{Status: c.Status, Err: c.Err, ErrKinds: c.ErrKinds},
-			func(tx pgx.Tx, info *store.EndInfo) error { return send(tx, info) })
+		info := store.EndInfo{Status: c.Status, Err: c.Err, ErrKinds: c.ErrKinds}
+		err := s.inTx(ctx, &info, func(tx pgx.Tx) error { return send(tx, &info) })
 		return claimed, err
 	}
 	return claimed, send(s.pool, nil)

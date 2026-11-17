@@ -259,10 +259,7 @@ func (e *Engine) Terminate(ctx context.Context, instanceID, reason string) error
 	if e.obs != nil {
 		func() {
 			defer func() { _ = recover() }() // a broken observer must not fail Terminate
-			e.obs.RunEnded(RunInfo{
-				InstanceID: instanceID, Workflow: ended.Workflow, Version: int(ended.Version),
-				Status: StatusTerminated, Error: reason,
-			})
+			e.obs.RunEnded(runInfo(ended))
 		}()
 	}
 	return nil

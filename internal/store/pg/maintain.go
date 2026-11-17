@@ -385,13 +385,7 @@ func (s *Store) Terminate(ctx context.Context, instanceID, reason string) (store
 			}
 			ended = store.EndInfo{Status: store.StatusTerminated, Err: reason}
 			if s.hook != nil {
-				return s.inTx(ctx, ended, func(tx pgx.Tx, info *store.EndInfo) error {
-					if err := send(tx, info); err != nil {
-						return err
-					}
-					ended = *info
-					return nil
-				})
+				return s.inTx(ctx, &ended, func(tx pgx.Tx) error { return send(tx, &ended) })
 			}
 			return send(s.pool, &ended)
 		})

@@ -67,11 +67,7 @@ func (seq lockSeq) askAll(t *testing.T, s store.Store, h Harness, id string, sch
 	}
 	seq.add(c, id, history.Event{Type: history.LockRequested, ScheduleID: sched, Name: key})
 	if retry > 0 {
-		now, err := s.Now(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		at := now.Add(wake).Truncate(time.Microsecond)
+		at := storeNow(t, s).Add(wake).Truncate(time.Microsecond)
 		seq.add(c, id, history.Event{Type: history.TimerScheduled, ScheduleID: sched + 1000, Name: store.LockWaitTimer(key), At: at})
 		c.Timers = []history.Event{{ScheduleID: sched + 1000, Name: store.LockWaitTimer(key), At: at}}
 	}
