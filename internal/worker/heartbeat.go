@@ -35,6 +35,11 @@ type heartbeat struct {
 
 	mu   sync.Mutex
 	held map[heldKey]held // by value: tracking a lease allocates no entry
+	// The renewal in flight (renewing), started at renewStart; renewCancel
+	// cancels its context.
+	renewing    bool
+	renewStart  time.Time
+	renewCancel context.CancelCauseFunc
 }
 
 type heldKey struct {
@@ -91,18 +96,84 @@ func (t tracking) untrack() {
 	t.cancel(context.Canceled)
 }
 
-// run renews every interval until ctx is done.
+// errRenewalTimeout is the cause of a renewal canceled because it took
+// longer than the heartbeat interval.
+var errRenewalTimeout = errors.New("flows: lease renewal timed out")
+
+// run renews every interval and gives up the leases not renewed in time
+// until ctx is done. The renewals run in their own goroutine, so a renewal
+// that hangs (a database that blackholes: failover, a network drop without
+// RST) does not delay giving up leases, and is canceled after an interval,
+// in time for the next renewal (T11.1).
 func (h *heartbeat) run(ctx context.Context) {
-	t := time.NewTimer(h.interval)
-	defer t.Stop()
+	kick := make(chan struct{}, 1) // a renewal tick waits while a renewal runs
+	deadline := time.NewTimer(h.interval)
+	deadline.Stop() // armed by each renewal
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.renew(ctx, kick, deadline)
+	}()
+	renew := time.NewTimer(h.interval)
+	defer renew.Stop()
+	expire := time.NewTimer(h.interval)
+	defer expire.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			<-done // a renewal returns once ctx is done
+			deadline.Stop()
+			return
+		case <-renew.C:
+			select {
+			case kick <- struct{}{}:
+			default:
+			}
+			renew.Reset(h.interval)
+		case <-deadline.C:
+			h.mu.Lock()
+			// The renewal it was armed for, not one started since.
+			if h.renewing && time.Since(h.renewStart) >= h.interval {
+				h.renewCancel(errRenewalTimeout)
+			}
+			h.mu.Unlock()
+		case <-expire.C:
+			expire.Reset(h.expire(time.Now()))
+		}
+	}
+}
+
+// renew runs a renewal per kick until ctx is done, each with a deadline of
+// an interval: deadline, armed here, has run cancel it. The renewals'
+// context is made again only after such a cancel (no allocation per
+// renewal).
+func (h *heartbeat) renew(ctx context.Context, kick <-chan struct{}, deadline *time.Timer) {
+	var rctx context.Context
+	defer func() {
+		h.mu.Lock()
+		if h.renewCancel != nil {
+			h.renewCancel(context.Canceled)
+		}
+		h.mu.Unlock()
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-kick:
 		}
-		h.tick(ctx)
-		t.Reset(h.interval)
+		h.mu.Lock()
+		if rctx == nil || rctx.Err() != nil {
+			rctx, h.renewCancel = context.WithCancelCause(ctx) //nolint:fatcontext // from ctx, not nested: replaces a canceled one
+		}
+		h.renewing, h.renewStart = true, time.Now()
+		deadline.Reset(h.interval)
+		h.mu.Unlock()
+		h.tick(rctx)
+		h.mu.Lock()
+		h.renewing = false
+		deadline.Stop()
+		h.mu.Unlock()
 	}
 }
 
@@ -123,7 +194,7 @@ func (h *heartbeat) tick(ctx context.Context) {
 	sent := time.Now()
 	r, err := h.st.RenewLeases(ctx, h.owner, wf, act, h.ttl)
 	if err != nil {
-		if !errors.Is(err, context.Canceled) {
+		if !errors.Is(err, context.Canceled) || errors.Is(context.Cause(ctx), errRenewalTimeout) {
 			h.log.LogAttrs(ctx, slog.LevelWarn, "flows: lease renewal failed", slog.Any("error", err))
 		}
 		h.expire(time.Now())
@@ -158,16 +229,25 @@ func (h *heartbeat) tick(ctx context.Context) {
 }
 
 // expire gives up leases not renewed for ttl - interval: past that point
-// another owner may hold them.
-func (h *heartbeat) expire(now time.Time) {
+// another owner may hold them. It returns when to check again: when the
+// next lease falls due, at most an interval from now, so a lease tracked
+// in between is given up an interval late at most (run checks on its own
+// timer, whether or not a renewal returns).
+func (h *heartbeat) expire(now time.Time) time.Duration {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	keep := h.ttl - h.interval
+	next := h.interval
 	for k, e := range h.held {
-		if now.Sub(e.renewed) >= h.ttl-h.interval {
+		left := keep - now.Sub(e.renewed)
+		if left <= 0 {
 			e.cancel(ErrLeaseLost)
 			delete(h.held, k)
+			continue
 		}
+		next = min(next, left)
 	}
+	return next
 }
 
 // renewed records an extension done by the task itself (a resume).

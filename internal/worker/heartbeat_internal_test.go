@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +48,63 @@ func TestHeartbeatIgnoresReportsAboutOlderLeases(t *testing.T) {
 	h.tick(context.Background())
 	if !errors.Is(context.Cause(ctx2), ErrLeaseLost) {
 		t.Fatalf("a report about v2 itself must cancel it: %v", context.Cause(ctx2))
+	}
+}
+
+// hangOnce hangs its first renewal until its context is done, recording
+// why; the next ones succeed.
+type hangOnce struct {
+	store.Store
+	calls  atomic.Int32
+	cause  chan error
+	second chan struct{}
+}
+
+func (s *hangOnce) RenewLeases(ctx context.Context, _ string, _, _ []store.Lease, _ time.Duration) (store.Renewal, error) {
+	switch s.calls.Add(1) {
+	case 1:
+		<-ctx.Done()
+		s.cause <- context.Cause(ctx)
+		return store.Renewal{}, ctx.Err()
+	case 2:
+		close(s.second)
+	}
+	return store.Renewal{}, nil
+}
+
+// T11.1: a renewal that hangs is canceled after about an interval, and
+// the renewals go on.
+func TestHeartbeatRenewalHasADeadline(t *testing.T) {
+	st := &hangOnce{cause: make(chan error, 1), second: make(chan struct{})}
+	h := newHeartbeat(st, "o", 300*time.Millisecond, slog.New(slog.DiscardHandler))
+	_, tr := h.track(context.Background(), false, store.Lease{ID: 1, Owner: "o", Version: 1}, time.Now())
+	defer tr.untrack()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	select {
+	case err := <-st.cause:
+		if !errors.Is(err, errRenewalTimeout) {
+			t.Fatalf("cause %v, want errRenewalTimeout", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hung renewal was never canceled")
+	}
+	// The lease was given up meanwhile (not renewed for ttl - interval);
+	// track another so the next renewal has something to send.
+	_, tr2 := h.track(context.Background(), false, store.Lease{ID: 2, Owner: "o", Version: 1}, time.Now())
+	defer tr2.untrack()
+	select {
+	case <-st.second:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no renewal after the hung one")
 	}
 }
 
