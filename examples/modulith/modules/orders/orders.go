@@ -1,16 +1,12 @@
-// Package orders is the orders module: it takes orders and runs their
-// fulfilment, a saga across the payments, inventory and shipping modules.
+// Package orders is the orders module: orders, their business state, and
+// the events published when an order ends.
 //
-// Public API: Place, Cancel and Get (Go functions for the HTTP API), the
-// events it publishes (TopicCompleted, TopicCanceled, TopicFailed,
-// Event), Hook, Queue, Configure, Migrate and ErrCanceledByCustomer. The
-// schema orders is private to the module.
-//
-// It uses the other modules only through their public API: the activities
-// of payments, and the workflows of inventory and shipping started as
-// children. When the fulfilment fails or the customer cancels, the engine
-// undoes the completed steps of every module, latest first, by activity
-// name (refund, release, void).
+// It is pure domain: it knows nothing of the workflow engine nor of the
+// other modules. Whatever runs the fulfilment (the process layer) records
+// an order with Record and ends it with End; End stages the order's event
+// in the caller's transaction (transactional outbox). The schema orders is
+// private to the module; the events (Event, the Topic* constants) are its
+// public contract.
 package orders
 
 import (
@@ -20,69 +16,51 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/imdat99/go-flows/examples/modulith/internal/platform/deps"
+	"github.com/imdat99/go-flows/examples/modulith/internal/platform/outbox"
 	"github.com/imdat99/go-flows/examples/modulith/internal/platform/schema"
-	"github.com/imdat99/go-flows/flows"
 )
 
-// Queue is the queue of the module's workflows and activities.
-const Queue = "orders"
+// Business rejections: retrying the same request cannot change the answer
+// (IsRejection). Any other error is transient.
+var (
+	// ErrInvalidOrder is the error of an order Validate refuses.
+	ErrInvalidOrder = errors.New("orders: invalid order")
+	// ErrOrderConflict is the error of an order id already used for an
+	// order with other contents, or for an order that has ended.
+	ErrOrderConflict = errors.New("orders: order id already used")
+)
 
-// SignalCancel is the signal of a customer's cancellation (Cancel).
-const SignalCancel = "orders.cancel"
-
-// ErrCanceledByCustomer is the error of a fulfilment the customer canceled.
-var ErrCanceledByCustomer = errors.New("orders: canceled by the customer")
-
-// ErrInvalidOrder is the error of Place for an order it refuses.
-var ErrInvalidOrder = errors.New("orders: invalid order")
-
-// ErrOrderConflict is the error of an order id already used for an order
-// with other contents.
-var ErrOrderConflict = errors.New("orders: order id already used")
-
-// kindCanceledByCustomer is the stored kind of ErrCanceledByCustomer; the
-// hook reads it from RunInfo.ErrorKinds.
-const kindCanceledByCustomer = "orders_canceled_by_customer"
-
-func init() {
-	flows.RegisterErrorKind(kindCanceledByCustomer, ErrCanceledByCustomer)
-	flows.RegisterErrorKind("orders_order_conflict", ErrOrderConflict)
+// IsRejection reports whether err is a business rejection of the module.
+func IsRejection(err error) bool {
+	return errors.Is(err, ErrInvalidOrder) || errors.Is(err, ErrOrderConflict)
 }
 
-// Config holds the module's dependencies and settings.
-type Config struct {
-	DB     *pgxpool.Pool
-	Logger *slog.Logger
-	// Engine is used by the activity that forwards a cancel to the
-	// shipment (any engine on the database works).
-	Engine *flows.Engine
-	// PickupWithin is how long an order waits for the carrier (default
-	// 48h). Place copies it into the workflow's input.
-	PickupWithin time.Duration
-}
+// Business states of an order.
+const (
+	StateProcessing = "processing"
+	StateCompleted  = "completed"
+	StateCanceled   = "canceled"
+	StateFailed     = "failed"
+)
 
-var cfg = deps.New[Config]("orders")
+// Topics of the events the module publishes when an order ends.
+const (
+	TopicCompleted = "orders.order_completed"
+	TopicCanceled  = "orders.order_canceled"
+	TopicFailed    = "orders.order_failed"
+)
 
-// Configure sets the module's dependencies. Call it before the engine
-// starts, in every process that runs the module or calls its functions.
-func Configure(c Config) error {
-	if c.DB == nil || c.Engine == nil {
-		return errors.New("orders: Configure: DB and Engine are required")
-	}
-	if c.Logger == nil {
-		c.Logger = slog.Default()
-	}
-	if c.PickupWithin <= 0 {
-		c.PickupWithin = 48 * time.Hour
-	}
-	cfg.Set(c)
-	return nil
+// Event is the payload of the module's events: the contract its consumers
+// depend on. Add fields, never change or remove one.
+type Event struct {
+	OrderID string `json:"order_id"`
+	Email   string `json:"email"`
+	State   string `json:"state"` // completed, canceled, failed
+	Reason  string `json:"reason,omitempty"`
 }
 
 //go:embed migrations/*.sql
@@ -99,91 +77,53 @@ type Line struct {
 	Qty int    `json:"qty"`
 }
 
-// PlaceRequest is an order as the API takes it.
-type PlaceRequest struct {
-	ID      string `json:"id"` // the client's order id: the idempotency key
+// Order is an order as the customer placed it. ID is the client's order
+// id: the idempotency key.
+type Order struct {
+	ID      string `json:"id"`
 	Email   string `json:"email"`
 	Address string `json:"address"`
 	Amount  int64  `json:"amount"` // cents
 	Lines   []Line `json:"lines"`
 }
 
-// CancelRequest is the payload of SignalCancel.
-type CancelRequest struct {
-	Reason string `json:"reason"`
-}
-
-// View is an order as Get returns it.
+// View is an order's business state.
 type View struct {
-	ID string `json:"id"`
-	// Status is the fulfilment workflow's status (running, completed,
-	// compensating, compensated, needs_attention...).
-	Status flows.Status `json:"status"`
-	// State is the order's business state: processing, completed,
-	// canceled or failed ("" before the workflow recorded it).
-	State  string `json:"state"`
+	ID     string `json:"id"`
+	State  string `json:"state"` // processing, completed, canceled, failed
 	Reason string `json:"reason,omitempty"`
 }
 
-// InstanceID is the instance id of an order's fulfilment. Instance ids are
-// global across modules: each module prefixes its own.
-func InstanceID(orderID string) string { return "orders-" + orderID }
-
-// Place starts the fulfilment of an order. The order id is the idempotency
-// key: placing the same order again starts nothing, placing other contents
-// under a used id fails with ErrOrderConflict.
-//
-// The engine's own idempotency (Start returns the existing execution) lasts
-// only until retention purges the execution, so Place checks the orders
-// table first, which keeps orders for good. Two different orders racing
-// for a new id both get nil here; the second one's contents are dropped
-// (its Start finds the first execution).
-func Place(ctx context.Context, e *flows.Engine, r PlaceRequest) error {
-	c, err := cfg.Get()
-	if err != nil {
-		return err
-	}
-	if err := validate(r); err != nil {
-		return err
-	}
-	lines, err := json.Marshal(r.Lines)
-	if err != nil {
-		return fmt.Errorf("place %s: %w", r.ID, err)
-	}
-	var same bool
-	err = c.DB.QueryRow(ctx, `
-		SELECT email = $2 AND address = $3 AND amount = $4 AND lines = $5::jsonb
-		FROM orders.orders WHERE id = $1`, r.ID, r.Email, r.Address, r.Amount, lines).Scan(&same)
-	switch {
-	case err == nil && same:
-		return nil // placed already
-	case err == nil:
-		return fmt.Errorf("%w: %s", ErrOrderConflict, r.ID)
-	case !errors.Is(err, pgx.ErrNoRows):
-		return fmt.Errorf("place %s: %w", r.ID, err)
-	}
-	_, err = fulfil.Start(ctx, e, InstanceID(r.ID), Order{
-		ID: r.ID, Email: r.Email, Address: r.Address, Amount: r.Amount, Lines: r.Lines,
-		PickupWithin: c.PickupWithin,
-	})
-	if err != nil {
-		return fmt.Errorf("place %s: %w", r.ID, err)
-	}
-	return nil
+// Service is the module's API.
+type Service struct {
+	db  *pgxpool.Pool
+	log *slog.Logger
 }
 
-func validate(r PlaceRequest) error {
+// NewService returns the module's service on db.
+func NewService(db *pgxpool.Pool, log *slog.Logger) (*Service, error) {
+	if db == nil {
+		return nil, errors.New("orders: NewService: db is required")
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Service{db: db, log: log}, nil
+}
+
+// Validate checks an order before anything is started for it.
+func (*Service) Validate(o Order) error {
 	switch {
-	case r.ID == "" || len(r.ID) > 100:
+	case o.ID == "" || len(o.ID) > 100:
 		return fmt.Errorf("%w: id must have 1 to 100 bytes", ErrInvalidOrder)
-	case r.Email == "" || r.Address == "":
+	case o.Email == "" || o.Address == "":
 		return fmt.Errorf("%w: email and address are required", ErrInvalidOrder)
-	case r.Amount <= 0:
+	case o.Amount <= 0:
 		return fmt.Errorf("%w: amount must be positive", ErrInvalidOrder)
-	case len(r.Lines) == 0 || len(r.Lines) > 50:
+	case len(o.Lines) == 0 || len(o.Lines) > 50:
 		return fmt.Errorf("%w: 1 to 50 lines", ErrInvalidOrder)
 	}
-	for _, l := range r.Lines {
+	for _, l := range o.Lines {
 		if l.SKU == "" || l.Qty <= 0 {
 			return fmt.Errorf("%w: line %q x %d", ErrInvalidOrder, l.SKU, l.Qty)
 		}
@@ -191,36 +131,98 @@ func validate(r PlaceRequest) error {
 	return nil
 }
 
-// Cancel asks for the cancellation of an order. It is honored until the
-// carrier picks the parcel up; after that the order completes anyway (the
-// fulfilment forwards the cancel to the shipment, which decides). It fails
-// with flows.ErrNotActive once the order has ended.
-//
-// Use it, not Engine.Cancel, for customers. Engine.Cancel is an operator's
-// tool: it cancels the order's context, so the shipment child's future
-// resolves at once with ErrCanceled and the order compensates (refund,
-// release, void) without waiting for the shipment's outcome. After a
-// pickup that means the money is refunded and the stock released while the
-// parcel ships (the shipment itself still completes: its decision stands).
-func Cancel(ctx context.Context, e *flows.Engine, orderID, reason string) error {
-	return e.Signal(ctx, InstanceID(orderID), SignalCancel, CancelRequest{Reason: reason})
+// Placed reports whether o was recorded already, and fails with
+// ErrOrderConflict if its id was recorded with other contents. The orders
+// table keeps orders for good: it is the lasting idempotency of an order
+// id.
+func (s *Service) Placed(ctx context.Context, o Order) (bool, error) {
+	lines, err := json.Marshal(o.Lines)
+	if err != nil {
+		return false, fmt.Errorf("placed %s: %w", o.ID, err)
+	}
+	var same bool
+	err = s.db.QueryRow(ctx, `
+		SELECT email = $2 AND address = $3 AND amount = $4 AND lines = $5::jsonb
+		FROM orders.orders WHERE id = $1`, o.ID, o.Email, o.Address, o.Amount, lines).Scan(&same)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("placed %s: %w", o.ID, err)
+	case !same:
+		return true, fmt.Errorf("%w: %s", ErrOrderConflict, o.ID)
+	}
+	return true, nil
 }
 
-// Get returns an order: its workflow's status and its business state.
-// flows.ErrNotFound for an unknown order.
-func Get(ctx context.Context, e *flows.Engine, orderID string) (View, error) {
-	c, err := cfg.Get()
+// Record inserts the order's row, processing. A repeat finds its own row.
+// A row with other contents, or one that has ended already (the id of an
+// earlier order, reused), fails with ErrOrderConflict.
+func (s *Service) Record(ctx context.Context, o Order) error {
+	lines, err := json.Marshal(o.Lines)
 	if err != nil {
-		return View{}, err
+		return fmt.Errorf("record order %s: %w", o.ID, err)
 	}
-	st, err := fulfil.Handle(e, InstanceID(orderID)).Status(ctx)
+	var same bool
+	var state string
+	err = s.db.QueryRow(ctx, `
+		WITH ins AS (
+			INSERT INTO orders.orders (id, email, address, amount, lines, state)
+			VALUES ($1, $2, $3, $4, $5, 'processing')
+			ON CONFLICT (id) DO NOTHING
+			RETURNING state)
+		SELECT true, state FROM ins
+		UNION ALL
+		SELECT email = $2 AND address = $3 AND amount = $4 AND lines = $5::jsonb, state
+		FROM orders.orders WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM ins)`,
+		o.ID, o.Email, o.Address, o.Amount, lines).Scan(&same, &state)
 	if err != nil {
-		return View{}, fmt.Errorf("order %s: %w", orderID, err)
+		return fmt.Errorf("record order %s: %w", o.ID, err)
 	}
-	v := View{ID: orderID, Status: st}
-	err = c.DB.QueryRow(ctx, `SELECT state, reason FROM orders.orders WHERE id = $1`, orderID).Scan(&v.State, &v.Reason)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return View{}, fmt.Errorf("order %s: %w", orderID, err)
+	if !same || state != StateProcessing {
+		return fmt.Errorf("%w: %s (%s)", ErrOrderConflict, o.ID, state)
 	}
-	return v, nil
+	return nil
+}
+
+// End sets the final state of a processing order (StateCompleted,
+// StateCanceled or StateFailed) and stages its event, in tx: the state and
+// the event commit with the caller's change or not at all. It reports
+// whether it ended the order: no row means it was never recorded (nothing
+// to tell the customer); an ended row belongs to an earlier order with
+// this id (Record refused this one).
+func (s *Service) End(ctx context.Context, tx pgx.Tx, orderID, state, reason string) (bool, error) {
+	topic := map[string]string{StateCompleted: TopicCompleted, StateCanceled: TopicCanceled, StateFailed: TopicFailed}[state]
+	if topic == "" {
+		return false, fmt.Errorf("orders: end of %s: invalid state %q", orderID, state)
+	}
+	ev := Event{OrderID: orderID, State: state, Reason: reason}
+	err := tx.QueryRow(ctx, `
+		UPDATE orders.orders SET state = $2, reason = $3, updated_at = now()
+		WHERE id = $1 AND state = 'processing' RETURNING email`, orderID, state, reason).Scan(&ev.Email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("orders: end of %s: %w", orderID, err)
+	}
+	if err := outbox.Stage(ctx, tx, topic, orderID, ev); err != nil {
+		return false, err
+	}
+	s.log.LogAttrs(ctx, slog.LevelInfo, "orders: ended", slog.String("order_id", orderID), slog.String("state", state))
+	return true, nil
+}
+
+// Get returns an order's business state, and false if it was never
+// recorded.
+func (s *Service) Get(ctx context.Context, orderID string) (View, bool, error) {
+	v := View{ID: orderID}
+	err := s.db.QueryRow(ctx, `SELECT state, reason FROM orders.orders WHERE id = $1`, orderID).Scan(&v.State, &v.Reason)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return v, false, nil
+	}
+	if err != nil {
+		return View{}, false, fmt.Errorf("order %s: %w", orderID, err)
+	}
+	return v, true, nil
 }

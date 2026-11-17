@@ -13,8 +13,10 @@ import (
 
 	"github.com/imdat99/go-flows/examples/modulith/modules/inventory"
 	"github.com/imdat99/go-flows/examples/modulith/modules/orders"
-	"github.com/imdat99/go-flows/examples/modulith/modules/payments"
 	"github.com/imdat99/go-flows/examples/modulith/modules/shipping"
+	"github.com/imdat99/go-flows/examples/modulith/processes/fulfilment"
+	"github.com/imdat99/go-flows/examples/modulith/processes/replenishment"
+	"github.com/imdat99/go-flows/examples/modulith/processes/shipment"
 	"github.com/imdat99/go-flows/flows"
 )
 
@@ -31,7 +33,7 @@ const adjustWait = 15 * time.Second
 // Handler returns the HTTP API. It works in any process, whatever modules
 // it runs: it only starts workflows, sends signals and reads.
 //
-//	POST /orders                      place an order (orders.PlaceRequest)
+//	POST /orders                      place an order (orders.Order)
 //	GET  /orders/{id}                 the order, its payment and its shipment
 //	POST /orders/{id}/cancel          {"reason": "..."}
 //	POST /shipments/{order}/pickup    the carrier's webhook: {"tracking": "..."}
@@ -48,40 +50,50 @@ func (a *App) Handler() http.Handler {
 	return mux
 }
 
+// placeOrder starts the order saga (the process layer).
 func (a *App) placeOrder(w http.ResponseWriter, r *http.Request) {
-	var req orders.PlaceRequest
+	var req orders.Order
 	if !a.decode(w, r, &req) {
 		return
 	}
-	if err := orders.Place(r.Context(), a.engine, req); err != nil {
+	if err := fulfilment.Place(r.Context(), a.engine, req); err != nil {
 		a.fail(w, r, err)
 		return
 	}
 	a.reply(w, http.StatusAccepted, map[string]string{"id": req.ID})
 }
 
-// orderView composes the views of three modules, through their APIs.
+// orderView composes the saga's status (the engine) and the views of three
+// modules, each through its own service.
 type orderView struct {
 	orders.View
-	Payment  string `json:"payment,omitempty"`
-	Shipment string `json:"shipment,omitempty"`
+	// Status is the saga's status (running, completed, compensating,
+	// compensated, needs_attention...).
+	Status   flows.Status `json:"status"`
+	Payment  string       `json:"payment,omitempty"`
+	Shipment string       `json:"shipment,omitempty"`
 }
 
 func (a *App) getOrder(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	v, err := orders.Get(r.Context(), a.engine, id)
+	st, err := fulfilment.Status(r.Context(), a.engine, id)
 	if err != nil {
 		a.fail(w, r, err)
 		return
 	}
-	out := orderView{View: v}
-	if p, err := payments.Find(r.Context(), id); err == nil {
+	v, _, err := a.svc.orders.Get(r.Context(), id) // State "" before the saga recorded it
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	out := orderView{View: v, Status: st}
+	if p, err := a.svc.payments.Find(r.Context(), id); err == nil {
 		out.Payment = p.State
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		a.fail(w, r, err)
 		return
 	}
-	if s, err := shipping.Find(r.Context(), id); err == nil {
+	if s, err := a.svc.shipping.Find(r.Context(), id); err == nil {
 		out.Shipment = s
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		a.fail(w, r, err)
@@ -91,23 +103,33 @@ func (a *App) getOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) cancelOrder(w http.ResponseWriter, r *http.Request) {
-	var req orders.CancelRequest
+	var req fulfilment.CancelRequest
 	if !a.decode(w, r, &req) {
 		return
 	}
-	if err := orders.Cancel(r.Context(), a.engine, r.PathValue("id"), req.Reason); err != nil {
+	if err := fulfilment.Cancel(r.Context(), a.engine, r.PathValue("id"), req.Reason); err != nil {
 		a.fail(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// confirmPickup is the carrier's webhook. The shipping module decides
+// (the pickup is recorded for good, or refused); only then is the shipment
+// workflow woken up. 202 means the pickup is recorded: the order will
+// complete. If waking fails, the client retries: both steps are idempotent,
+// and the workflow also finds the decision when its timeout fires.
 func (a *App) confirmPickup(w http.ResponseWriter, r *http.Request) {
-	var req shipping.Pickup
+	var req shipment.Pickup
 	if !a.decode(w, r, &req) {
 		return
 	}
-	if err := shipping.ConfirmPickup(r.Context(), a.engine, r.PathValue("order"), req.Tracking); err != nil {
+	order := r.PathValue("order")
+	if err := a.svc.shipping.ConfirmPickup(r.Context(), order, req.Tracking); err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	if err := shipment.WakeOnPickup(r.Context(), a.engine, order, req.Tracking); err != nil {
 		a.fail(w, r, err)
 		return
 	}
@@ -121,7 +143,7 @@ type stockView struct {
 
 func (a *App) getStock(w http.ResponseWriter, r *http.Request) {
 	sku := r.PathValue("sku")
-	n, err := inventory.Level(r.Context(), sku)
+	n, err := a.svc.inventory.Level(r.Context(), sku)
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -147,7 +169,7 @@ func (a *App) adjustStock(w http.ResponseWriter, r *http.Request) {
 	sku := r.PathValue("sku")
 	ctx, cancel := context.WithTimeout(r.Context(), adjustWait)
 	defer cancel()
-	n, err := inventory.Adjust(ctx, a.engine, req.RequestID, sku, req.Delta, req.Reason)
+	n, err := replenishment.Adjust(ctx, a.engine, req.RequestID, sku, req.Delta, req.Reason)
 	if errors.Is(err, context.DeadlineExceeded) {
 		a.reply(w, http.StatusGatewayTimeout, map[string]string{"error": "still running: retry with the same request_id"})
 		return
@@ -180,7 +202,7 @@ func (a *App) reply(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// fail maps the modules' errors to HTTP statuses. Errors read back from a
+// fail maps the modules' and the engine's errors to HTTP statuses. Errors read back from a
 // workflow's history keep their kinds (flows.RegisterErrorKind), so
 // errors.Is works on them too.
 func (a *App) fail(w http.ResponseWriter, r *http.Request, err error) {

@@ -1,4 +1,4 @@
-package orders
+package fulfilment
 
 import (
 	"context"
@@ -12,8 +12,11 @@ import (
 	"time"
 
 	"github.com/imdat99/go-flows/examples/modulith/modules/inventory"
-	"github.com/imdat99/go-flows/examples/modulith/modules/payments"
+	"github.com/imdat99/go-flows/examples/modulith/modules/orders"
 	"github.com/imdat99/go-flows/examples/modulith/modules/shipping"
+	"github.com/imdat99/go-flows/examples/modulith/processes/payment"
+	"github.com/imdat99/go-flows/examples/modulith/processes/reservation"
+	"github.com/imdat99/go-flows/examples/modulith/processes/shipment"
 	"github.com/imdat99/go-flows/flows"
 	"github.com/imdat99/go-flows/flowtest"
 )
@@ -43,7 +46,7 @@ func (u *undoLog) get() []string {
 func newTester(t *testing.T) (*flowtest.Tester, *undoLog) {
 	t.Helper()
 	tst := flowtest.New(t, flowtest.WithOptions(flows.Options{
-		Queues: []string{Queue, payments.Queue, inventory.Queue, shipping.Queue},
+		Queues: []string{Queue, payment.Queue, reservation.Queue, shipment.Queue},
 	}))
 	undo := &undoLog{}
 
@@ -60,21 +63,21 @@ func newTester(t *testing.T) (*flowtest.Tester, *undoLog) {
 	// the tester's.
 	flowtest.OnActivity(tst, forwardCancel, func(ctx context.Context, _ flows.Key, f ForwardedCancel) (struct{}, struct{}, error) {
 		undo.add("forward cancel")
-		err := shipping.Cancel(ctx, tst.Engine(), f.OrderID, f.Reason)
+		err := shipment.Cancel(ctx, tst.Engine(), f.OrderID, f.Reason)
 		if errors.Is(err, flows.ErrNotActive) {
 			err = nil
 		}
 		return struct{}{}, struct{}{}, err
 	})
-	flowtest.OnActivity(tst, payments.Authorize,
-		func(_ context.Context, _ flows.Key, r payments.AuthorizeRequest) (payments.Authorization, string, error) {
-			return payments.Authorization{PaymentID: "pay_" + r.OrderID}, "pay_" + r.OrderID, nil
+	flowtest.OnActivity(tst, payment.Authorize,
+		func(_ context.Context, _ flows.Key, r payment.AuthorizeRequest) (payment.Authorization, string, error) {
+			return payment.Authorization{PaymentID: "pay_" + r.OrderID}, "pay_" + r.OrderID, nil
 		})
-	flowtest.OnCompensator(tst, payments.Authorize, func(_ context.Context, _ flows.Key, id string) error {
+	flowtest.OnCompensator(tst, payment.Authorize, func(_ context.Context, _ flows.Key, id string) error {
 		undo.add("void " + id)
 		return nil
 	})
-	flowtest.OnActivity(tst, payments.Capture, func(ctx context.Context, _ flows.Key, id string) (string, string, error) {
+	flowtest.OnActivity(tst, payment.Capture, func(ctx context.Context, _ flows.Key, id string) (string, string, error) {
 		if id == "pay_o8" {
 			// The customer cancels while the payment is being captured.
 			if err := tst.Engine().Signal(ctx, InstanceID("o8"), SignalCancel, CancelRequest{Reason: "during capture"}); err != nil {
@@ -83,31 +86,31 @@ func newTester(t *testing.T) (*flowtest.Tester, *undoLog) {
 		}
 		return id, id, nil
 	})
-	flowtest.OnCompensator(tst, payments.Capture, func(_ context.Context, _ flows.Key, id string) error {
+	flowtest.OnCompensator(tst, payment.Capture, func(_ context.Context, _ flows.Key, id string) error {
 		undo.add("refund " + id)
 		return nil
 	})
-	flowtest.OnActivity(tst, inventory.ReserveLine, func(_ context.Context, _ flows.Key, r inventory.LineRequest) (int64, int64, error) {
+	flowtest.OnActivity(tst, reservation.ReserveLine, func(_ context.Context, _ flows.Key, r reservation.LineRequest) (int64, int64, error) {
 		if r.SKU == "sku-gone" {
 			return 0, 0, flows.Permanent(inventory.ErrOutOfStock)
 		}
 		return int64(r.Qty), int64(r.Qty), nil // the quantity as the reservation id
 	})
-	flowtest.OnCompensator(tst, inventory.ReserveLine, func(_ context.Context, _ flows.Key, id int64) error {
+	flowtest.OnCompensator(tst, reservation.ReserveLine, func(_ context.Context, _ flows.Key, id int64) error {
 		undo.add("release " + strconv.FormatInt(id, 10))
 		return nil
 	})
-	flowtest.OnActivity(tst, shipping.CreateLabel, func(_ context.Context, _ flows.Key, r shipping.Request) (string, string, error) {
+	flowtest.OnActivity(tst, shipment.CreateLabel, func(_ context.Context, _ flows.Key, r shipment.Request) (string, string, error) {
 		return "shp_" + r.OrderID, "shp_" + r.OrderID, nil
 	})
-	flowtest.OnCompensator(tst, shipping.CreateLabel, func(_ context.Context, _ flows.Key, id string) error {
+	flowtest.OnCompensator(tst, shipment.CreateLabel, func(_ context.Context, _ flows.Key, id string) error {
 		undo.add("cancel label " + id)
 		return nil
 	})
-	// The shipments table's decision: first wins (see shipping's tests).
+	// The shipments table's decision: first wins (see the shipment and shipping tests).
 	var decMu sync.Mutex
 	decided := map[string]shipping.Decided{}
-	flowtest.OnActivity(tst, shipping.Decide, func(_ context.Context, _ flows.Key, d shipping.Decision) (shipping.Decided, struct{}, error) {
+	flowtest.OnActivity(tst, shipment.Decide, func(_ context.Context, _ flows.Key, d shipping.Decision) (shipping.Decided, struct{}, error) {
 		decMu.Lock()
 		defer decMu.Unlock()
 		if got, ok := decided[d.ShipmentID]; ok {
@@ -118,7 +121,7 @@ func newTester(t *testing.T) (*flowtest.Tester, *undoLog) {
 	})
 	var markFailures atomic.Int32
 	markFailures.Store(35) // for TRK-FLAKY: more than three rounds of attempts
-	flowtest.OnActivity(tst, shipping.MarkPickedUp, func(ctx context.Context, _ flows.Key, u shipping.PickupUpdate) (struct{}, struct{}, error) {
+	flowtest.OnActivity(tst, shipment.MarkPickedUp, func(ctx context.Context, _ flows.Key, u shipment.PickupUpdate) (struct{}, struct{}, error) {
 		if u.Tracking == "TRK-FLAKY" && markFailures.Add(-1) >= 0 {
 			return struct{}{}, struct{}{}, errors.New("shipping database down")
 		}
@@ -135,16 +138,16 @@ func newTester(t *testing.T) (*flowtest.Tester, *undoLog) {
 	return tst, undo
 }
 
-func order(id string, lines ...Line) Order {
+func order(id string, lines ...orders.Line) Order {
 	if len(lines) == 0 {
-		lines = []Line{{SKU: "sku-apple", Qty: 2}}
+		lines = []orders.Line{{SKU: "sku-apple", Qty: 2}}
 	}
 	return Order{ID: id, Email: "c@example.com", Address: "Hanoi", Amount: 1500, Lines: lines, PickupWithin: 48 * time.Hour}
 }
 
 func TestFulfilShipped(t *testing.T) {
 	tst, undo := newTester(t)
-	tst.SignalAfter(time.Hour, shipping.InstanceID("o1"), shipping.SignalPickedUp, shipping.Pickup{Tracking: "TRK1"})
+	tst.SignalAfter(time.Hour, shipment.InstanceID("o1"), shipment.SignalPickedUp, shipment.Pickup{Tracking: "TRK1"})
 
 	res, err := flowtest.Run(tst, fulfil, InstanceID("o1"), order("o1"))
 	if err != nil {
@@ -184,7 +187,7 @@ func TestFulfilPickupTimeout(t *testing.T) {
 	start := tst.Now()
 
 	_, err := flowtest.Run(tst, fulfil, InstanceID("o3"), o)
-	if !errors.Is(err, shipping.ErrPickupTimeout) || !errors.Is(err, flows.ErrCompensated) {
+	if !errors.Is(err, shipment.ErrPickupTimeout) || !errors.Is(err, flows.ErrCompensated) {
 		t.Fatalf("err = %v, want pickup timeout, compensated", err)
 	}
 	if waited := tst.Now().Sub(start); waited < 2*time.Hour {
@@ -198,7 +201,7 @@ func TestFulfilPickupTimeout(t *testing.T) {
 
 func TestFulfilOutOfStock(t *testing.T) {
 	tst, undo := newTester(t)
-	o := order("o4", Line{SKU: "sku-apple", Qty: 3}, Line{SKU: "sku-gone", Qty: 1})
+	o := order("o4", orders.Line{SKU: "sku-apple", Qty: 3}, orders.Line{SKU: "sku-gone", Qty: 1})
 
 	_, err := flowtest.Run(tst, fulfil, InstanceID("o4"), o)
 	if !errors.Is(err, inventory.ErrOutOfStock) {
@@ -217,7 +220,7 @@ func TestFulfilOutOfStock(t *testing.T) {
 // with the carrier, so the order completes and nothing is refunded.
 func TestFulfilCancelAfterPickup(t *testing.T) {
 	tst, undo := newTester(t)
-	tst.SignalAfter(time.Hour, shipping.InstanceID("o6"), shipping.SignalPickedUp, shipping.Pickup{Tracking: "TRK-RACE"})
+	tst.SignalAfter(time.Hour, shipment.InstanceID("o6"), shipment.SignalPickedUp, shipment.Pickup{Tracking: "TRK-RACE"})
 
 	res, err := flowtest.Run(tst, fulfil, InstanceID("o6"), order("o6"))
 	if err != nil {
@@ -248,7 +251,7 @@ func TestFulfilCancelBeforeShipping(t *testing.T) {
 	if got := undo.get(); !slices.Equal(got, want) {
 		t.Fatalf("compensations %v, want %v", got, want)
 	}
-	if types := tst.EventTypes(shipping.InstanceID("o7")); len(types) != 0 {
+	if types := tst.EventTypes(shipment.InstanceID("o7")); len(types) != 0 {
 		t.Fatalf("a shipment was started: %v", types)
 	}
 }
@@ -258,7 +261,7 @@ func TestFulfilCancelBeforeShipping(t *testing.T) {
 // undone: no label canceled, no refund; it completes once the record lands.
 func TestFulfilPickupRecordFailsForLong(t *testing.T) {
 	tst, undo := newTester(t)
-	tst.SignalAfter(time.Hour, shipping.InstanceID("o9"), shipping.SignalPickedUp, shipping.Pickup{Tracking: "TRK-FLAKY"})
+	tst.SignalAfter(time.Hour, shipment.InstanceID("o9"), shipment.SignalPickedUp, shipment.Pickup{Tracking: "TRK-FLAKY"})
 
 	res, err := flowtest.Run(tst, fulfil, InstanceID("o9"), order("o9"))
 	if err != nil || res.Tracking != "TRK-FLAKY" {
@@ -281,7 +284,7 @@ func TestFulfilCancelDuringCapture(t *testing.T) {
 	if got := undo.get(); !slices.Equal(got, want) {
 		t.Fatalf("compensations %v, want %v", got, want)
 	}
-	if types := tst.EventTypes(shipping.InstanceID("o8")); len(types) != 0 {
+	if types := tst.EventTypes(shipment.InstanceID("o8")); len(types) != 0 {
 		t.Fatalf("a shipment was started: %v", types)
 	}
 }

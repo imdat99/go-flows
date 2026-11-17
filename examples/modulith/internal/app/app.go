@@ -1,13 +1,15 @@
 // Package app is the composition root of the modular monolith: it migrates
-// and configures the modules, builds the engine, starts the background
+// the database, constructs the domain modules' services, builds the
+// engine, wires the services into the process layer, starts the background
 // work of the modules this process runs, and serves the HTTP API.
 //
-// One binary, every module compiled in. Config.Modules picks the modules
-// whose queues this process serves: all of them in a single deployment,
-// a subset per deployment once the monolith is split. Nothing else
-// changes: every process registers every definition (they are package
-// level), migrates every schema and installs the same hook, and work
-// reaches the processes serving its queue through Postgres.
+// One binary, every module and every process compiled in. Config.Modules
+// picks the modules whose queues this process serves: all of them in a
+// single deployment, a subset per deployment once the monolith is split.
+// Nothing else changes: every process registers every definition (they are
+// package level), migrates every schema, configures every process package
+// and installs the same hook, and work reaches the processes serving its
+// queue through Postgres.
 package app
 
 import (
@@ -27,10 +29,18 @@ import (
 	"github.com/imdat99/go-flows/examples/modulith/modules/orders"
 	"github.com/imdat99/go-flows/examples/modulith/modules/payments"
 	"github.com/imdat99/go-flows/examples/modulith/modules/shipping"
+	"github.com/imdat99/go-flows/examples/modulith/processes/fulfilment"
+	"github.com/imdat99/go-flows/examples/modulith/processes/notify"
+	"github.com/imdat99/go-flows/examples/modulith/processes/payment"
+	"github.com/imdat99/go-flows/examples/modulith/processes/replenishment"
+	"github.com/imdat99/go-flows/examples/modulith/processes/reservation"
+	"github.com/imdat99/go-flows/examples/modulith/processes/shipment"
 	"github.com/imdat99/go-flows/flows"
 )
 
-// module is what the composition root knows of a module.
+// module is what the composition root knows of a module: its migrations,
+// and the queue of the processes that work on its tables (a module's
+// processes share its queue, so serving a module serves all of them).
 type module struct {
 	name    string
 	queue   string
@@ -39,11 +49,31 @@ type module struct {
 
 // modules lists every module, in migration order.
 var modules = []module{
-	{"orders", orders.Queue, orders.Migrate},
-	{"payments", payments.Queue, payments.Migrate},
-	{"inventory", inventory.Queue, inventory.Migrate},
-	{"shipping", shipping.Queue, shipping.Migrate},
-	{"notifications", notifications.Queue, notifications.Migrate},
+	{"orders", fulfilment.Queue, orders.Migrate},
+	{"payments", payment.Queue, payments.Migrate},
+	{"inventory", reservation.Queue, inventory.Migrate}, // replenishment.Queue too
+	{"shipping", shipment.Queue, shipping.Migrate},
+	{"notifications", notify.Queue, notifications.Migrate},
+}
+
+// services are the domain modules' services, constructed once per process.
+type services struct {
+	orders        *orders.Service
+	payments      *payments.Service
+	inventory     *inventory.Service
+	shipping      *shipping.Service
+	notifications *notifications.Service
+}
+
+func newServices(pool *pgxpool.Pool, log *slog.Logger) (services, error) {
+	var s services
+	var errs [5]error
+	s.orders, errs[0] = orders.NewService(pool, log)
+	s.payments, errs[1] = payments.NewService(pool, log)
+	s.inventory, errs[2] = inventory.NewService(pool, log)
+	s.shipping, errs[3] = shipping.NewService(pool, log)
+	s.notifications, errs[4] = notifications.NewService(pool, log)
+	return s, errors.Join(errs[:]...)
 }
 
 // ModuleNames returns the names of every module.
@@ -79,13 +109,15 @@ type App struct {
 	pool   *pgxpool.Pool
 	engine *flows.Engine
 	log    *slog.Logger
+	svc    services
 
 	started   bool
 	stopRelay context.CancelFunc
 	relayDone chan struct{}
 }
 
-// New migrates the database, configures the modules and builds the engine.
+// New migrates the database, constructs the modules' services, builds the
+// engine and configures the process layer.
 // Call Start next.
 func New(ctx context.Context, pool *pgxpool.Pool, cfg Config) (*App, error) {
 	log := cfg.Logger
@@ -116,6 +148,11 @@ func New(ctx context.Context, pool *pgxpool.Pool, cfg Config) (*App, error) {
 		}
 	}
 
+	svc, err := newServices(pool, log)
+	if err != nil {
+		return nil, err
+	}
+
 	var obs flows.Observer = logObserver{log}
 	if cfg.Observer != nil {
 		obs = observers{obs, cfg.Observer}
@@ -126,28 +163,32 @@ func New(ctx context.Context, pool *pgxpool.Pool, cfg Config) (*App, error) {
 		Logger:     log,
 		// The same hooks on every engine: whichever engine records an end
 		// (or performs a Terminate) runs them.
-		Hook:     runHooks{orders.Hook()},
+		Hook:     runHooks{fulfilment.Hook(svc.orders)},
 		Observer: obs,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("new engine: %w", err)
 	}
 
-	// Every module is configured, run here or not: its Go API (orders.Get,
-	// payments.Find, inventory.Adjust...) may be called by the HTTP API of
-	// any process. A wiring mistake fails here, at startup, rather than as
-	// activities retrying ErrNotConfigured on a live replica.
+	// The module services reach the activities here: the one place the
+	// process layer's package-level holders are set (definitions are
+	// global, see processes/internal/adapt). Every process package is
+	// configured, its module run here or not: the HTTP API of any process
+	// starts workflows (Place, Adjust). A wiring mistake fails here, at
+	// startup, rather than as activities retrying adapt.ErrNotConfigured on
+	// a live replica.
 	err = errors.Join(
-		orders.Configure(orders.Config{DB: pool, Logger: log, Engine: engine, PickupWithin: cfg.PickupWithin}),
-		payments.Configure(payments.Config{DB: pool, Logger: log}),
-		inventory.Configure(inventory.Config{DB: pool, Logger: log, ReplenishEvery: cfg.ReplenishEvery}),
-		shipping.Configure(shipping.Config{DB: pool, Logger: log}),
-		notifications.Configure(notifications.Config{DB: pool, Logger: log}),
+		fulfilment.Configure(fulfilment.Services{Orders: svc.orders, Engine: engine, PickupWithin: cfg.PickupWithin}),
+		payment.Configure(payment.Services{Payments: svc.payments}),
+		reservation.Configure(reservation.Services{Inventory: svc.inventory}),
+		replenishment.Configure(replenishment.Services{Inventory: svc.inventory, Every: cfg.ReplenishEvery}),
+		shipment.Configure(shipment.Services{Shipping: svc.shipping}),
+		notify.Configure(notify.Services{Notifications: svc.notifications, Logger: log}),
 	)
 	if err != nil {
 		return nil, err
 	}
-	return &App{cfg: cfg, pool: pool, engine: engine, log: log}, nil
+	return &App{cfg: cfg, pool: pool, engine: engine, log: log, svc: svc}, nil
 }
 
 // Engine returns the process's engine.
@@ -165,7 +206,7 @@ func (a *App) Start(ctx context.Context) error {
 		a.started = true
 	}
 	if a.runs("inventory") {
-		if err := inventory.StartReplenishment(ctx, a.engine); err != nil {
+		if err := replenishment.Start(ctx, a.engine); err != nil {
 			return err
 		}
 	}
@@ -174,7 +215,7 @@ func (a *App) Start(ctx context.Context) error {
 		// and the consumers subscribe to the broker. The in-process bus
 		// ties them to the process running the notifications module.
 		bus := &outbox.LocalBus{}
-		notifications.Subscribe(bus, a.engine)
+		notify.Subscribe(bus, a.engine)
 		relay := &outbox.Relay{Pool: a.pool, Bus: bus, Logger: a.log}
 		var relayCtx context.Context
 		relayCtx, a.stopRelay = context.WithCancel(context.WithoutCancel(ctx))

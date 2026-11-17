@@ -6,10 +6,11 @@
 // staged events to the Bus, at least once and, per key, in staging order.
 // Consumers deduplicate on Message.EventID.
 //
-// In this example the only producer is the orders module's RunHook, which
-// stages an orders.order_* event in the transaction that records
-// the end of the fulfilment workflow: no event for an order that did not
-// end, and no lost event for one that did. See examples/outbox for the
+// In this example the only producer is the orders module (orders.Service.End),
+// called by the fulfilment process's RunHook: it stages an orders.order_*
+// event in the transaction that records the end of the fulfilment workflow:
+// no event for an order that did not end, and no lost event for one that
+// did. The package knows nothing of the engine: a module may use it. See examples/outbox for the
 // variant where activities stage events that the hook releases or drops.
 package outbox
 

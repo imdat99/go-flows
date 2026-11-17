@@ -76,9 +76,10 @@ fan-out, a transactional outbox). Start Postgres with `make up`, then run
 `go run ./examples/quickstart`.
 
 For a real system, [`examples/modulith`](examples/modulith) is a blueprint
-of a modular monolith: five modules with their own schemas and queues,
-sagas and child workflows across modules, a continue-as-new loop, locks,
-an outbox, and one binary that runs as one process or split by module
+of a modular monolith: five domain modules with their own schemas that do
+not know the engine exists, a process layer that orchestrates them (sagas
+and child workflows across modules, a continue-as-new loop, locks), an
+outbox, and one binary that runs as one process or split by module
 ([README](examples/modulith/README.md), [tiếng Việt](examples/modulith/README.vi.md)).
 
 ## Documentation

@@ -74,9 +74,10 @@ fan-out, transactional outbox). Chạy Postgres bằng
 `make up`, rồi `go run ./examples/quickstart`.
 
 Cho một hệ thống thật, [`examples/modulith`](../../examples/modulith) là
-bản mẫu một modular monolith: năm module với schema và queue riêng, saga
-và child workflow giữa các module, vòng lặp continue-as-new, lock, outbox,
-và một binary chạy thành một process hoặc tách theo module
+bản mẫu một modular monolith: năm module nghiệp vụ với schema riêng, không
+biết đến engine, một tầng process điều phối chúng (saga và child workflow
+giữa các module, vòng lặp continue-as-new, lock), outbox, và một binary
+chạy thành một process hoặc tách theo module
 ([README tiếng Việt](../../examples/modulith/README.vi.md)).
 
 ## Tài liệu

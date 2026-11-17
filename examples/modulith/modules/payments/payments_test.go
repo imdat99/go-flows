@@ -5,97 +5,114 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/imdat99/go-flows/flows"
 	"github.com/imdat99/go-flows/internal/testdb"
 )
 
-func setup(t *testing.T) {
+func setup(t *testing.T) *Service {
 	t.Helper()
 	pool := testdb.New(t)
 	if err := Migrate(t.Context(), pool); err != nil {
 		t.Fatal(err)
 	}
-	if err := Configure(Config{DB: pool, Logger: slog.New(slog.DiscardHandler)}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func state(t *testing.T, id string) string {
-	t.Helper()
-	c, _ := cfg.Get()
-	var s string
-	if err := c.DB.QueryRow(t.Context(), `SELECT state FROM payments.payments WHERE id = $1`, id).Scan(&s); err != nil {
+	s, err := NewService(pool, slog.New(slog.DiscardHandler))
+	if err != nil {
 		t.Fatal(err)
 	}
 	return s
 }
 
-// An uncertain capture (its attempt timed out, still running elsewhere)
-// lands after its refund found nothing: void, the next compensator, must
-// refund it, and a capture after that must fail.
+func (s *Service) state(t *testing.T, id string) string {
+	t.Helper()
+	var st string
+	if err := s.db.QueryRow(t.Context(), `SELECT state FROM payments.payments WHERE id = $1`, id).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// A capture whose outcome the caller did not know (it timed out, still in
+// flight elsewhere) lands after its refund found nothing: Void, the next
+// undo, must refund it, and a capture after that must fail.
 func TestLateCaptureIsRefundedByVoid(t *testing.T) {
-	setup(t)
+	s := setup(t)
 	ctx := t.Context()
-	const authKey, captureKey = flows.Key("o1:2:payments.authorize:1"), flows.Key("o1:4:payments.capture:1")
+	const authKey, captureKey = "o1:2:payments.authorize:1", "o1:4:payments.capture:1"
 
-	auth, _, err := authorize(ctx, authKey, AuthorizeRequest{OrderID: "o1", Amount: 100})
+	id, err := s.Authorize(ctx, authKey, "o1", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := refund(ctx, captureKey, ""); err != nil { // nothing captured yet
+	if changed, err := s.Refund(ctx, captureKey); err != nil || changed { // nothing captured yet
+		t.Fatalf("refund: %v, %v", changed, err)
+	}
+	if err := s.Capture(ctx, captureKey, id); err != nil { // the late attempt lands
 		t.Fatal(err)
 	}
-	if _, _, err := capture(ctx, captureKey, auth.PaymentID); err != nil { // the late attempt lands
+	if _, err := s.Void(ctx, authKey); err != nil {
 		t.Fatal(err)
 	}
-	if err := void(ctx, authKey, auth.PaymentID); err != nil {
-		t.Fatal(err)
+	if st := s.state(t, id); st != "refunded" {
+		t.Fatalf("payment is %s after the undo, want refunded", st)
 	}
-	if s := state(t, auth.PaymentID); s != "refunded" {
-		t.Fatalf("payment is %s after compensation, want refunded", s)
+	// Another late attempt now fails, as a rejection, instead of capturing.
+	if err := s.Capture(ctx, captureKey, id); !errors.Is(err, ErrNotCapturable) || !IsRejection(err) {
+		t.Fatalf("capture after void: %v, want ErrNotCapturable", err)
 	}
-	// Another late attempt now fails instead of capturing again.
-	if _, _, err := capture(ctx, captureKey, auth.PaymentID); err == nil || !flows.IsPermanent(err) {
-		t.Fatalf("capture after void: %v, want a permanent error", err)
-	}
-	if s := state(t, auth.PaymentID); s != "refunded" {
-		t.Fatalf("payment is %s, want refunded", s)
+	if st := s.state(t, id); st != "refunded" {
+		t.Fatalf("payment is %s, want refunded", st)
 	}
 }
 
-// An uncertain authorization voided before it lands: the late attempt is
-// fenced off by the tombstone.
+// An authorization voided before it lands: the late attempt is fenced off
+// by the tombstone.
 func TestLateAuthorizationIsFenced(t *testing.T) {
-	setup(t)
+	s := setup(t)
 	ctx := t.Context()
-	const authKey = flows.Key("o2:2:payments.authorize:1")
-	if err := void(ctx, authKey, ""); err != nil {
+	const authKey = "o2:2:payments.authorize:1"
+	if _, err := s.Void(ctx, authKey); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := authorize(ctx, authKey, AuthorizeRequest{OrderID: "o2", Amount: 100}); !errors.Is(err, errFenced) {
-		t.Fatalf("late authorize: %v, want errFenced", err)
+	if _, err := s.Authorize(ctx, authKey, "o2", 100); !errors.Is(err, ErrVoided) || !IsRejection(err) {
+		t.Fatalf("late authorize: %v, want ErrVoided", err)
 	}
 }
 
-// Retries of the same attempt find their own row.
+// Repeats under the same key find their own row.
 func TestAuthorizeAndCaptureAreIdempotent(t *testing.T) {
-	setup(t)
+	s := setup(t)
 	ctx := t.Context()
-	const authKey, captureKey = flows.Key("o3:2:payments.authorize:1"), flows.Key("o3:4:payments.capture:1")
-	a1, _, err := authorize(ctx, authKey, AuthorizeRequest{OrderID: "o3", Amount: 100})
+	const authKey, captureKey = "o3:2:payments.authorize:1", "o3:4:payments.capture:1"
+	a1, err := s.Authorize(ctx, authKey, "o3", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a2, _, err := authorize(ctx, authKey, AuthorizeRequest{OrderID: "o3", Amount: 100})
+	a2, err := s.Authorize(ctx, authKey, "o3", 100)
 	if err != nil || a1 != a2 {
-		t.Fatalf("retry: %+v, %v; want %+v", a2, err, a1)
+		t.Fatalf("repeat: %q, %v; want %q", a2, err, a1)
 	}
 	for range 2 {
-		if _, _, err := capture(ctx, captureKey, a1.PaymentID); err != nil {
+		if err := s.Capture(ctx, captureKey, a1); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if s := state(t, a1.PaymentID); s != "captured" {
-		t.Fatalf("payment is %s, want captured", s)
+	if st := s.state(t, a1); st != "captured" {
+		t.Fatalf("payment is %s, want captured", st)
+	}
+	// Another key cannot capture it again.
+	if err := s.Capture(ctx, "other", a1); !errors.Is(err, ErrNotCapturable) {
+		t.Fatalf("capture under another key: %v, want ErrNotCapturable", err)
+	}
+}
+
+func TestDeclinedAndInvalidAreRejections(t *testing.T) {
+	s := setup(t)
+	if _, err := s.Authorize(t.Context(), "k1", "o4", declineAbove+1); !errors.Is(err, ErrDeclined) || !IsRejection(err) {
+		t.Fatalf("over the limit: %v, want ErrDeclined", err)
+	}
+	if _, err := s.Authorize(t.Context(), "k2", "o4", 0); !errors.Is(err, ErrInvalidAmount) || !IsRejection(err) {
+		t.Fatalf("zero amount: %v, want ErrInvalidAmount", err)
+	}
+	if IsRejection(errors.New("connection reset")) {
+		t.Fatal("a transient error is not a rejection")
 	}
 }

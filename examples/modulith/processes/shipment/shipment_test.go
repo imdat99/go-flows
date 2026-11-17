@@ -1,4 +1,4 @@
-package shipping
+package shipment
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/imdat99/go-flows/examples/modulith/modules/shipping"
 	"github.com/imdat99/go-flows/flows"
 	"github.com/imdat99/go-flows/flowtest"
 )
@@ -16,7 +17,7 @@ import (
 // decisions of the real one (made under a row lock).
 type rows struct {
 	mu    sync.Mutex
-	state map[string]Decided
+	state map[string]shipping.Decided
 }
 
 // confirm is ConfirmPickup's update: label_created to pickup_confirmed.
@@ -24,17 +25,17 @@ func (r *rows) confirm(id, tracking string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.state[id]; !ok {
-		r.state[id] = Decided{State: statePickupConfirmed, Tracking: tracking}
+		r.state[id] = shipping.Decided{State: shipping.StatePickupConfirmed, Tracking: tracking}
 	}
 }
 
-func (r *rows) decide(d Decision) Decided {
+func (r *rows) decide(d shipping.Decision) shipping.Decided {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if got, ok := r.state[d.ShipmentID]; ok {
 		return got
 	}
-	r.state[d.ShipmentID] = Decided{State: d.Want, Tracking: d.Tracking}
+	r.state[d.ShipmentID] = shipping.Decided{State: d.Want, Tracking: d.Tracking}
 	return r.state[d.ShipmentID]
 }
 
@@ -51,11 +52,11 @@ func newTester(t *testing.T) *fixture {
 	t.Helper()
 	f := &fixture{
 		tst:  flowtest.New(t, flowtest.WithOptions(flows.Options{Queues: []string{Queue}})),
-		rows: &rows{state: map[string]Decided{}},
+		rows: &rows{state: map[string]shipping.Decided{}},
 	}
 	flowtest.OnActivity(f.tst, CreateLabel, func(_ context.Context, _ flows.Key, r Request) (string, string, error) {
 		if r.Address == "nowhere" {
-			return "", "", flows.Permanent(ErrUnserviceable)
+			return "", "", flows.Permanent(shipping.ErrUnserviceable)
 		}
 		return "shp_" + r.OrderID, "shp_" + r.OrderID, nil
 	})
@@ -63,7 +64,7 @@ func newTester(t *testing.T) *fixture {
 		f.canceled.Add(1)
 		return nil
 	})
-	flowtest.OnActivity(f.tst, Decide, func(_ context.Context, _ flows.Key, d Decision) (Decided, struct{}, error) {
+	flowtest.OnActivity(f.tst, Decide, func(_ context.Context, _ flows.Key, d shipping.Decision) (shipping.Decided, struct{}, error) {
 		return f.rows.decide(d), struct{}{}, nil
 	})
 	flowtest.OnActivity(f.tst, MarkPickedUp, func(context.Context, flows.Key, PickupUpdate) (struct{}, struct{}, error) {
@@ -109,7 +110,7 @@ func TestShipUnserviceable(t *testing.T) {
 	r := req("o3")
 	r.Address = "nowhere"
 	_, err := flowtest.Run(f.tst, Ship, InstanceID("o3"), r)
-	if !errors.Is(err, ErrUnserviceable) {
+	if !errors.Is(err, shipping.ErrUnserviceable) {
 		t.Fatalf("err = %v, want unserviceable", err)
 	}
 	// The label failed permanently, so there is nothing to cancel.
