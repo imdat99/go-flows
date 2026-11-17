@@ -152,6 +152,21 @@ func (c *resultCall) OnCancel() {
 	c.f.Set(Result{Err: ErrCanceled}, nil)
 }
 
+// requestCancel asks the child to cancel, leaving f to its outcome
+// (RequestCancelChild).
+func (c *resultCall) requestCancel() {
+	switch c.cmd.State {
+	case command.Pending: // never started: no outcome will come
+		coro.Unwatch(c)
+		_ = c.cmd.Cancel()
+		c.f.Set(Result{Err: ErrCanceled}, nil)
+	case command.Committed:
+		_ = c.cmd.Cancel()
+		c.st.canceled(&c.cmd)
+	case command.CancelPending, command.Canceled, command.Dropped, command.Done:
+	}
+}
+
 func (c *resultCall) resolve(ev *history.Event) error {
 	coro.Unwatch(c)
 	switch ev.Type {
@@ -423,6 +438,34 @@ func (st *State) StartChild(ctx coro.Context, instanceID, workflow string, versi
 	coro.Watch(ctx, c)
 	return &c.f
 }
+
+// RequestCancelChild asks the child workflow whose future is f (from
+// StartChild) to cancel, without resolving f: f resolves with the child's
+// real outcome, whatever it is (the child may complete anyway). The request
+// is recorded as ChildCancelRequested, and the store delivers it to the
+// child in the same checkpoint (Completion.ChildCancels), as for a canceled
+// context. A child not committed yet (started in the current task) is
+// dropped instead: it never starts, and f resolves with ErrCanceled. A
+// repeated request, or one on a child that ended, does nothing. Canceling
+// f's context still resolves f with ErrCanceled at once. A future that is
+// not a child's of this execution is an error.
+func (st *State) RequestCancelChild(f *coro.Future[Result]) error {
+	// Requests are rare: a scan (from the latest call) keeps calls small.
+	for _, issued := range slices.Backward(st.calls) {
+		c, ok := issued.(*resultCall)
+		if !ok || &c.f != f {
+			continue
+		}
+		if c.cmd.Kind != command.Child {
+			return fmt.Errorf("%w: %v %q", errNotChild, c.cmd.Kind, c.cmd.Name)
+		}
+		c.requestCancel()
+		return nil
+	}
+	return errNotChild
+}
+
+var errNotChild = errors.New("executor: cancel requested on a future that is not a child workflow's")
 
 // NewTimer issues a timer firing d after the current workflow time. The
 // future resolves when it fires, or with ErrCanceled when ctx is canceled

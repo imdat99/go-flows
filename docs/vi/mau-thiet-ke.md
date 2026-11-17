@@ -179,6 +179,24 @@ shipment, err := shipWorkflow.Child(c, "ship-"+order.ID, order).Get(c)
 - **Compensation.** Nếu sau đó cha lỗi, child đã hoàn tất được hoàn tác
   cùng.
 - **Huỷ.** Huỷ cha thì huỷ child đang chạy.
+- **Huỷ một child mà vẫn biết kết quả.** Huỷ context của child làm future
+  resolve ngay với `ErrCanceled`, dù child vẫn có thể hoàn tất. Muốn biết
+  child thực sự kết thúc thế nào thì yêu cầu huỷ:
+
+  ```go
+  ship := shipWorkflow.Child(c, "ship-"+order.ID, order)
+  // ... khách huỷ đơn:
+  ship.RequestCancel(c) // c.Err() của child giờ là ErrCanceled
+  shipment, err := ship.Get(c)
+  switch {
+  case err == nil: // vẫn giao (đã qua điểm không quay lại): hoàn tiền thay vào đó
+  case errors.Is(err, flows.ErrCanceled): // đã dừng và tự hoàn tác
+  default: // lỗi
+  }
+  ```
+
+  Trong child, làm nốt phần không dừng được trên `flows.Disconnected(c)` rồi
+  trả kết quả, hoặc trả lỗi huỷ.
 
 ## Loại trừ lẫn nhau trên một business key
 

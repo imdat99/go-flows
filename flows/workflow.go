@@ -131,7 +131,9 @@ func (w *Workflow[I, O]) Handle(e *Engine, instanceID string) *Handle[O] {
 
 // Child starts the workflow as a child of the running workflow, with
 // instance id instanceID, and returns its future. Canceling c cancels the
-// child. A child whose id is already in use fails with ErrInstanceExists.
+// child and resolves the future with ErrCanceled at once; to ask the child
+// to cancel and still get its real outcome, use Future.RequestCancel. A
+// child whose id is already in use fails with ErrInstanceExists.
 //
 // When the parent fails (or is canceled) and compensates, a child that
 // completed is compensated too, in reverse order with the parent's own

@@ -17,6 +17,12 @@ must take care of.
 
 ### Added
 
+- `Future.RequestCancel(c)`: a parent asks a child workflow to cancel and
+  its future resolves with the child's real outcome (its output if it
+  completes anyway, its error, matching `ErrCanceled`, if it honours the
+  cancel), instead of `ErrCanceled` at once as when the child's context is
+  canceled (unchanged). Recorded in the history (replay checks it) and
+  delivered to the child in the same checkpoint; no migration (T12.2).
 - `examples/modulith`: a modular monolith blueprint (five modules, cross-module sagas, split deployments by queue).
 - `flows.InstanceID(c)` and `flows.ExecutionID(c)`: workflow code reads
   its own instance id (kept by continue-as-new) and execution id;

@@ -179,6 +179,24 @@ shipment, err := shipWorkflow.Child(c, "ship-"+order.ID, order).Get(c)
 - **Compensation.** If the parent later fails, a completed child is
   compensated with it.
 - **Cancel.** Canceling the parent cancels a running child.
+- **Cancel one child, keep its outcome.** Canceling the child's context
+  resolves its future with `ErrCanceled` at once, although the child may
+  still complete. To learn how it really ended, request the cancel instead:
+
+  ```go
+  ship := shipWorkflow.Child(c, "ship-"+order.ID, order)
+  // ... the customer cancels the order:
+  ship.RequestCancel(c) // the child's c.Err() is now ErrCanceled
+  shipment, err := ship.Get(c)
+  switch {
+  case err == nil: // shipped anyway (past its point of no return): refund instead
+  case errors.Is(err, flows.ErrCanceled): // stopped and compensated itself
+  default: // failed
+  }
+  ```
+
+  In the child, finish what cannot be stopped on `flows.Disconnected(c)`
+  and return its result, or return the cancellation error.
 
 ## Mutual exclusion on a business key
 

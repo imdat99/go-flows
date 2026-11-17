@@ -160,7 +160,10 @@ trước, từng cái một**, với dữ liệu compensation mà mỗi activity
   `ContinueAsNew`.
 - **Child là workflow được bắt đầu từ một workflow.** `wf.Child(c, id, in)`
   trả về `Future`. Huỷ cha thì huỷ các child đang chạy, và cha kết thúc cũng
-  vậy. Những gì workflow bắt đầu mà không await trong task kết thúc nó:
+  vậy. Huỷ context mà child được bắt đầu với nó thì huỷ child và future
+  resolve ngay với `ErrCanceled`; `future.RequestCancel(c)` yêu cầu child
+  huỷ và để future chờ kết quả thật của child (xem "Huỷ và terminate").
+  Những gì workflow bắt đầu mà không await trong task kết thúc nó:
   - **khi kết thúc** (completed, failed, canceled): cả child lẫn activity
     đều không được chạy;
   - **khi continue-as-new:** child được tạo và chạy tiếp, tách khỏi cha,
@@ -183,6 +186,22 @@ trước, từng cái một**, với dữ liệu compensation mà mỗi activity
     lỗi của `Handle.Wait` khớp `ErrCanceled`.
   - Nếu trả lỗi khác, nó kết thúc như mọi lần lỗi: `compensated` hoặc
     `failed`. Nếu trả kết quả, nó kết thúc `completed`.
+- **Cha có thể yêu cầu một child huỷ mà vẫn nhận kết quả của nó.**
+  `future.RequestCancel(c)` huỷ context gốc của child (child tự quyết định
+  như trên: dừng, hoặc làm nốt việc trên `flows.Disconnected`), và future
+  chỉ resolve khi child kết thúc: với output nếu nó vẫn hoàn tất, với lỗi
+  của nó (khớp `ErrCanceled` nếu nó chấp nhận huỷ) trong các trường hợp
+  khác.
+  - Yêu cầu là một command ghi trong history của cha và được giao tới child
+    trong cùng checkpoint; replay phải đưa ra nó ở cùng chỗ, nếu không
+    execution bị park vì không tất định.
+  - Child bắt đầu trong cùng task (chưa checkpoint) thì không được chạy;
+    future resolve với `ErrCanceled`. Yêu cầu lặp lại, hoặc sau khi child
+    đã kết thúc, không làm gì.
+  - Child hoàn tất sau yêu cầu là một child đã hoàn tất: nó được hoàn tác
+    nếu sau đó cha lỗi.
+  - Huỷ cha (hoặc context của child) vẫn resolve future ngay với
+    `ErrCanceled`.
 - **`Engine.Terminate` kết thúc execution ngay**, không chạy code workflow
   hay compensation. Dùng cho execution bị kẹt.
 

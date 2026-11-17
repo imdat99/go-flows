@@ -54,7 +54,9 @@ func (c Ctx) Value(key any) any { return c.inner().Value(key) }
 func WithValue(c Ctx, key, val any) Ctx { return Ctx{coro.WithValue(c.inner(), key, val)} }
 
 // WithCancel returns a child of c canceled by cancel or with c. Canceling
-// the context of a running activity, timer or child cancels it.
+// the context of a running activity, timer or child cancels it, and its
+// future resolves with ErrCanceled at once (for a child whose real outcome
+// matters, see Future.RequestCancel).
 func WithCancel(c Ctx) (Ctx, func()) {
 	cc, cancel := coro.WithCancel(c.inner())
 	return Ctx{cc}, cancel
@@ -188,6 +190,37 @@ func (f *Future[T]) Ready() bool {
 		return true
 	}
 	return f.res.Ready()
+}
+
+// RequestCancel asks the child workflow f is the future of (Child) to
+// cancel, and leaves f to resolve with the child's real outcome: its
+// output if it completes anyway (it may have passed a point of no return,
+// or ignore the cancel), or its error when it fails or honours the cancel
+// (errors.Is ErrCanceled). The child sees the request as a canceled root
+// context (c.Err), and decides: stop, or finish what must be finished on a
+// Disconnected context. Canceling the context f was started with instead
+// resolves f with ErrCanceled at once, without the child's outcome.
+//
+// The request is recorded in the history and reaches the child with the
+// checkpoint that records it. A child started in the same task (not
+// checkpointed yet) is not started at all: f resolves with ErrCanceled. A
+// repeated request, or one after the child ended, does nothing; so does a
+// request on a future that failed before the child was started. A child
+// that completes after the request keeps its compensations: it is
+// compensated with its parent as any completed child. RequestCancel on the
+// future of an activity or a timer panics, failing the workflow
+// (ErrInvalidArgument).
+func (f *Future[T]) RequestCancel(c Ctx) {
+	st := c.state()
+	switch {
+	case f.err != nil:
+		return
+	case f.timer != nil || f.res == nil:
+		panic(Permanent(fmt.Errorf("%w: RequestCancel on a future that is not a child workflow's", ErrInvalidArgument)))
+	}
+	if err := st.RequestCancelChild(f.res); err != nil {
+		panic(Permanent(fmt.Errorf("%w: %w", ErrInvalidArgument, err)))
+	}
 }
 
 // SelectCase is one alternative of Select.

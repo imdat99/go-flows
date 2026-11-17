@@ -164,7 +164,11 @@ returned and its original `Key`:
   is kept. Unread signals move to the next execution on `ContinueAsNew`.
 - **Children are workflows started from a workflow.** `wf.Child(c, id, in)`
   returns a `Future`. Canceling the parent cancels its running children,
-  and so does its end. What the workflow starts without awaiting it in the
+  and so does its end. Canceling the context a child was started with
+  cancels it and resolves its future with `ErrCanceled` at once;
+  `future.RequestCancel(c)` asks the child to cancel and leaves the future
+  to the child's real outcome (see "Cancel and terminate"). What the
+  workflow starts without awaiting it in the
   task that ends it:
   - **when it ends** (completed, failed, canceled): neither children nor
     activities are started;
@@ -189,6 +193,22 @@ returned and its original `Key`:
     it ends `canceled`; `Handle.Wait`'s error matches `ErrCanceled`.
   - If it returns another error, it ends like any failure: `compensated` or
     `failed`. If it returns a result, it ends `completed`.
+- **A parent can ask one child to cancel and still get its outcome.**
+  `future.RequestCancel(c)` cancels the child's root context (the child
+  decides, as above: stop, or finish its work on `flows.Disconnected`), and
+  the future resolves only when the child ends: with its output if it
+  completed anyway, with its error (matching `ErrCanceled` if it honoured
+  the cancel) otherwise.
+  - The request is a command recorded in the parent's history and delivered
+    to the child in the same checkpoint; replay must make it at the same
+    point, or the execution parks as non-deterministic.
+  - A child started in the same task (not checkpointed yet) is not started
+    at all; its future resolves with `ErrCanceled`. A repeated request, or
+    one after the child ended, does nothing.
+  - A child that completes after the request is a completed child: it is
+    compensated if the parent later fails.
+  - Canceling the parent (or the child's context) still resolves the future
+    with `ErrCanceled` at once.
 - **`Engine.Terminate` ends the execution at once**, without running workflow
   code or compensation. It is meant for stuck executions.
 

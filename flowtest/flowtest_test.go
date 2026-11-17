@@ -624,3 +624,38 @@ func TestRunOnAChildChecksIt(t *testing.T) {
 		t.Fatalf("a sibling outside the tree was checked: %q", msgs)
 	}
 }
+
+// T12.2: Future.RequestCancel under virtual time: the parent gets the
+// child's real outcome, whether it finishes its work or honours the cancel.
+var (
+	rcKid = flows.DefineWorkflow("ft.rc-kid", 1, func(c flows.Ctx, honour bool) (string, error) {
+		err := flows.Sleep(c, time.Hour)
+		if err == nil || honour {
+			return "slept", err
+		}
+		dc, cancel := flows.Disconnected(c)
+		defer cancel()
+		if err := flows.Sleep(dc, time.Minute); err != nil { // the pivot's end
+			return "", err
+		}
+		return "finished", nil
+	})
+	rcParent = flows.DefineWorkflow("ft.rc-parent", 1, func(c flows.Ctx, honour bool) (string, error) {
+		kid := rcKid.Child(c, flows.InstanceID(c)+"-kid", honour)
+		if err := flows.Sleep(c, time.Minute); err != nil {
+			return "", err
+		}
+		kid.RequestCancel(c)
+		return kid.Get(c)
+	})
+)
+
+func TestRequestCancelChild(t *testing.T) {
+	tst := flowtest.New(t)
+	if out, err := flowtest.Run(tst, rcParent, "rc-finish", false); err != nil || out != "finished" {
+		t.Fatalf("finishing child: %q %v", out, err)
+	}
+	if _, err := flowtest.Run(tst, rcParent, "rc-honour", true); !errors.Is(err, flows.ErrCanceled) {
+		t.Fatalf("honouring child: %v", err)
+	}
+}
