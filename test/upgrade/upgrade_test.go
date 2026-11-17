@@ -31,11 +31,17 @@ import (
 	"github.com/imdat99/go-flows/test/upgrade/defs"
 )
 
+// Out of scope: an old engine that crashed with live leases, or work in
+// flight while Migrate runs. CHANGELOG says to stop old engines first.
+
 // FromTag is the release upgraded from: the last one before migration
 // 00016_key_epoch, whose executions keep the legacy activity key.
 const FromTag = "v0.1.0"
 
-const waitFor = 3 * time.Minute
+// waitFor bounds each wait for an instance; with every wait timing out
+// they stay within the go test timeout of `make upgrade`, so the dump of
+// the database (a Cleanup) still runs.
+const waitFor = time.Minute
 
 // buildOld builds olddriver against the tree of FromTag: the tag's files,
 // plus package defs and olddriver copied in at their paths (same module
@@ -43,6 +49,9 @@ const waitFor = 3 * time.Minute
 func buildOld(t *testing.T) string {
 	t.Helper()
 	root := strings.TrimSpace(runCmd(t, "", "git", "rev-parse", "--show-toplevel"))
+	if err := exec.CommandContext(t.Context(), "git", "-C", root, "rev-parse", "--verify", "--quiet", FromTag+"^{commit}").Run(); err != nil {
+		t.Fatalf("tag %s not found: fetch tags (git fetch --tags; in CI, actions/checkout with fetch-depth: 0)", FromTag)
+	}
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, FromTag)
 	if err := os.MkdirAll(src, 0o750); err != nil {
@@ -86,7 +95,7 @@ func runCmd(t *testing.T, dir, name string, args ...string) string {
 	t.Helper()
 	cmd := exec.CommandContext(t.Context(), name, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GOWORK=off")
+	cmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=") // the release's go.mod as is
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, out)
