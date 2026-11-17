@@ -1,8 +1,12 @@
 # Changelog
 
-All notable changes to go-flows. Versions follow semantic versioning; the
-release workflow tags them from the commit messages
-(`.github/scripts/next-version.sh`).
+All notable changes to go-flows. Versions follow semantic versioning; under
+0.x a breaking change bumps the minor version, anything else the patch.
+Releases are made by hand with the release workflow
+(`.github/workflows/release.yml`): its notes are the section of this file
+headed by the tag. The `otelflows` and `analyzer` modules are tagged
+`otelflows/vX.Y.Z` and `analyzer/vX.Y.Z`, with sections headed the same
+way.
 
 Each release lists the migrations it adds. `Migrate` applies them forward
 only; run it (or let the first engine run it) before the new binaries take
@@ -10,6 +14,51 @@ work. Upgrade notes say what a rolling deploy from the previous release
 must take care of.
 
 ## Unreleased
+
+## v0.1.2 (2026-11-17)
+
+A simplification of the v0.1.1 code (shared helpers, one `next_due`
+subquery in the statement that completes a workflow task). No API,
+schema or behaviour change, except:
+
+### Fixed
+
+- The memory store's `Executions` (used by `flowtest`) returns a copy of
+  each execution's trace context instead of sharing it with the store.
+
+### Migrations
+
+None (the schema is still `00001` to `00016`).
+
+## v0.1.1 (2026-11-17)
+
+> **Breaking changes, released as a patch version by mistake.** The
+> release workflow of the time derived the version from Conventional
+> Commit prefixes (`feat:`, `fix:`, `type!:`); this repository's commits
+> (`T10.x: ...`) have none, so every release was a patch. Under 0.x
+> semantic versioning this release should have been **v0.2.0**. Published
+> tags are not moved: v0.1.1 and v0.1.2 stay as they are, and **the next
+> release will be v0.2.0**. Releases are now made by hand, with the version
+> chosen when releasing (T11.4). Read the breaking changes and the upgrade
+> notes below before upgrading from v0.1.0.
+
+### Breaking changes
+
+- **`flows.Tracer`** has a new method `StartWorkflow` (its end gets whether
+  the start created the execution), and `StartWorkflowTask` returns the
+  task's context too (T10.10). Custom tracers no longer compile until they
+  implement it; `otelflows` does (it needs go-flows v0.1.1 or later).
+- **`flows.Key` format** is `instanceID:scheduleID:name:executionID` for
+  executions started after migration `00016` (T10.19). Code that parsed
+  keys by splitting on `:` must treat them as opaque. See the upgrade
+  notes: stop old engines before migrating.
+- **Migrations `00013` to `00016` are required**: `Engine.Start` reads the
+  key epoch from the database and fails if `Migrate` has not run.
+- `flowtest` reports futures abandoned by descendants (children,
+  recursively), not only by the instance it ran (T10.11): tests that
+  passed may now fail with an abandoned future.
+- `flowsvet` reports more non-deterministic code (T10.12): builds that run
+  it may report new findings.
 
 ### Added
 
@@ -25,10 +74,21 @@ must take care of.
   start whose task runs again, `flows.ErrRerun`). A trace lasts as
   long as its execution; continue-as-new starts a new trace linked to the
   previous one. The trace state (including `ot=th`) is not kept.
+- `flows.StartInfo`; `otelflows` attributes
+  `flows.execution_id`, `flows.parent_instance_id`, `flows.continued`
+  (T10.10).
+- `flowtest` reports the futures abandoned by every descendant of the
+  instance it ran, and each ended execution exactly once, at the first
+  `Run` whose tree contains it (T10.11).
+- `flowsvet` reports every `make(chan ...)` in workflow code and variables
+  whose struct type holds a channel or a sync primitive in a field; a
+  function literal held in a variable and only passed to `flows.SideEffect`
+  is no longer reported (T10.12).
+- `examples/outbox`: a transactional outbox with a stub event bus (T10.20).
 
 ### Changed
 
-- `flows.Key` carries the execution id:
+- `flows.Key` carries the execution id (breaking):
   `instanceID:scheduleID:name:executionID` (T10.19). Schedule ids restart
   at 1 in every execution, so the first activity of every execution of a
   continue-as-new chain, or of an instance id reused after retention purged
@@ -53,9 +113,12 @@ must take care of.
   returning the zero value returns no data, and the earlier data is kept.
   Previously a timeout followed by a declined attempt compensated with the
   zero value (T10.7).
-- `flows.Tracer` (breaking for custom tracers): new method `StartWorkflow`
-  (its end gets whether the start created the execution), and
-  `StartWorkflowTask` returns the task's context too (T10.10).
+- An activity claim leaves one free activity slot for eager launches
+  when more than one is free: eager launches that went through the queue
+  during a claim fell from about 3% to under 0.1% (T10.21).
+- An executor larger than `CacheBytes` is not made sticky (T10.6).
+- The memory store (`flowtest`) indexes executions by queue and by parent:
+  waking and claiming no longer scan every execution (T10.8).
 
 ### Fixed
 

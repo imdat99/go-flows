@@ -1,91 +1,151 @@
 name: release
 
-# After the ci workflow passes on a push to main (a merged pull request), tag
-# the next semantic version of that commit and publish a GitHub release, so
-# that
-#   go get github.com/imdat99/go-flows@vX.Y.Z   (or @latest)
-# installs it. Nothing is tagged if any CI job (lint, unit/integration and
-# chaos tests, performance budget) fails.
+# Deliberate releases: run this workflow by hand (Actions > release > Run
+# workflow, or `gh workflow run release.yml -f module=go-flows -f version=v0.2.0`)
+# on main. Nothing is tagged on a push.
 #
-# The version comes from the commit messages since the last tag
-# (.github/scripts/next-version.sh): feat -> minor, fix and others -> patch,
-# "type!:" or "BREAKING CHANGE" -> major (minor while below v1.0.0).
+# Modules and their tags (Go's convention for modules in subdirectories):
+#   go-flows   vX.Y.Z            go get github.com/imdat99/go-flows@vX.Y.Z
+#   otelflows  otelflows/vX.Y.Z  go get github.com/imdat99/go-flows/otelflows@vX.Y.Z
+#   analyzer   analyzer/vX.Y.Z   go install github.com/imdat99/go-flows/analyzer/cmd/flowsvet@vX.Y.Z
+#
+# Before running it, add a "## <tag>" section to CHANGELOG.md (moved from
+# "## Unreleased") and merge it: that section is the release notes. Under
+# 0.x, a breaking change bumps the minor version, anything else the patch.
+#
+# The checks (.github/scripts/release-check.sh): the version is vX.Y.Z and
+# greater than the module's latest tag, the tag does not exist, CHANGELOG.md
+# has a non-empty section for it; the ci workflow passed on the commit; for
+# otelflows and analyzer, go.mod has no replace of go-flows, requires it at a
+# released tag, and the module builds and vets against that version with the
+# workspace off (as a consumer builds it). Release go-flows first when a
+# submodule needs its new API, then raise the submodule's require.
 on:
-  workflow_run:
-    workflows: [ci]
-    types: [completed]
-    branches: [main]
-  workflow_dispatch: # re-run the release for the current main (no CI check)
+  workflow_dispatch:
+    inputs:
+      module:
+        description: Module to release
+        type: choice
+        options: [go-flows, otelflows, analyzer]
+        default: go-flows
+        required: true
+      version:
+        description: Version, vX.Y.Z (the tag is vX.Y.Z or <module>/vX.Y.Z)
+        type: string
+        required: true
+      dry_run:
+        description: Check and show the notes only, do not tag
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
-# One release at a time, in merge order: two merges in a row must not compute
-# the same next version.
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  tag:
-    # Only a successful CI run for a push to main (not a pull request run).
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push')
+  release:
     runs-on: ubuntu-latest
     permissions:
       contents: write # push the tag, create the release
+      actions: read # find the ci run of the commit
     steps:
+      - name: Releases are made from main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::run the release workflow on main, not $GITHUB_REF"
+          exit 1
+
       - uses: actions/checkout@v4
         with:
-          # The commit CI tested, not whatever main points at now.
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-          fetch-depth: 0 # history and tags, to compute the version
+          fetch-depth: 0 # the tags, to compare versions
 
-      - name: Next version
-        id: version
+      - name: Check the version and the changelog
+        id: check
+        env:
+          MODULE: ${{ inputs.module }}
+          VERSION: ${{ inputs.version }}
         run: |
-          # CI runs can finish out of order: a later commit may already be
-          # released, and its tag then contains this one.
-          if git tag --contains HEAD | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "A newer release already contains this commit; nothing to tag." >> "$GITHUB_STEP_SUMMARY"
-            echo "tag=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          tag=$(.github/scripts/next-version.sh)
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if [ -z "$tag" ]; then
-            echo "HEAD is already released; nothing to tag." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          tag=$(.github/scripts/release-check.sh "$MODULE" "$VERSION" "$RUNNER_TEMP/notes.md")
+          dir=.
+          if [ "$MODULE" != go-flows ]; then dir=$MODULE; fi
+          {
+            echo "tag=$tag"
+            echo "path=$(awk '/^module /{print $2}' "$dir/go.mod")"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Tag and publish the release
-        if: steps.version.outputs.tag != ''
+      - name: Check that ci passed on this commit
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          n=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&status=success" --jq '.total_count')
+          if [ "$n" = 0 ]; then
+            echo "::error::the ci workflow has not passed on $SHA"
+            exit 1
+          fi
+
+      - uses: actions/setup-go@v5
+        if: inputs.module != 'go-flows'
+        with:
+          go-version-file: ${{ inputs.module }}/go.mod
+
+      - name: Build as a consumer would (no workspace, no replace)
+        if: inputs.module != 'go-flows'
+        working-directory: ${{ inputs.module }}
+        env:
+          GOWORK: "off"
+        run: |
+          go mod verify
+          go build ./...
+          go vet ./...
+
+      - name: Tag and publish the release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.check.outputs.tag }}
+          MODULE: ${{ inputs.module }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "Release $TAG"
           git push origin "$TAG"
-          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          # The repository's "latest" release stays the root module's.
+          latest=true
+          if [ "$MODULE" != go-flows ]; then latest=false; fi
+          gh release create "$TAG" --verify-tag --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" --latest="$latest"
+
+      - name: Summary
+        if: always() && steps.check.outputs.tag != ''
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+          MODULE_PATH: ${{ steps.check.outputs.path }}
+          VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
           {
-            echo "Released **$TAG**:"
+            if [ "$DRY_RUN" = true ]; then echo "Dry run: **$TAG** not tagged."; else echo "Released **$TAG**:"; fi
             echo
             echo '```'
-            echo "go get $(awk '/^module /{print $2}' go.mod)@$TAG"
+            echo "go get $MODULE_PATH@$VERSION"
             echo '```'
+            echo
+            echo '### Notes'
+            echo
+            cat "$RUNNER_TEMP/notes.md"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Announce the version to the Go module proxy
-        if: steps.version.outputs.tag != ''
+        if: ${{ !inputs.dry_run }}
         # A public module is then installable at once (instead of on the first
         # `go get`). Private repositories are not on the public proxy: users
         # set GOPRIVATE=github.com/<owner>/* and this step is allowed to fail.
         continue-on-error: true
         env:
-          TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          module=$(awk '/^module /{print $2}' go.mod)
-          curl -fsS "https://proxy.golang.org/${module}/@v/${TAG}.info"
+          MODULE_PATH: ${{ steps.check.outputs.path }}
+          VERSION: ${{ inputs.version }}
+        run: curl -fsS "https://proxy.golang.org/${MODULE_PATH}/@v/${VERSION}.info"

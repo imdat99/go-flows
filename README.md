@@ -101,6 +101,31 @@ github.com/imdat99/go-flows/flows`).
 
 The root module depends on pgx and goose only.
 
+### Versions
+
+Each module is versioned and tagged on its own (Go's convention for modules
+in subdirectories):
+
+| Module | Tag | Install |
+| --- | --- | --- |
+| `github.com/imdat99/go-flows` | `vX.Y.Z` | `go get github.com/imdat99/go-flows@vX.Y.Z` |
+| `github.com/imdat99/go-flows/otelflows` | `otelflows/vX.Y.Z` | `go get github.com/imdat99/go-flows/otelflows@vX.Y.Z` |
+| `github.com/imdat99/go-flows/analyzer` | `analyzer/vX.Y.Z` | `go install github.com/imdat99/go-flows/analyzer/cmd/flowsvet@vX.Y.Z` |
+
+`otelflows` requires go-flows at the version it was built against (its
+`go.mod`); Go's minimum version selection lets an application use that
+version or a later one. Compatible versions:
+
+| go-flows | otelflows | analyzer |
+| --- | --- | --- |
+| v0.1.0 | none: the `otelflows` of v0.1.0 required an unpublished go-flows `v0.0.0` and cannot be installed | any |
+| v0.1.1, v0.1.2 | the first `otelflows` tag (requires go-flows v0.1.2; the `flows.Tracer` interface changed in v0.1.1) | any |
+
+The analyzer does not import go-flows: it recognizes the `flows` API by
+import path and name, so any analyzer version works with any go-flows
+version (a newer analyzer knows more checks). Releases are made by hand
+with the release workflow; see [CHANGELOG.md](CHANGELOG.md).
+
 ## Development
 
 ```sh
@@ -109,7 +134,17 @@ make test    # race tests on the memory and Postgres stores
 make lint
 make bench && make benchgate   # benchmarks and the allocation budget
 make chaos   # multi-process kill/freeze tests
+make modcheck  # otelflows builds against the go-flows version its go.mod requires
 ```
+
+`otelflows/go.work` puts the repository's go-flows in the workspace of
+`otelflows`, so its tests and lint (`make test`, `make lint`) run against
+the working tree, not the go-flows version its `go.mod` requires. A
+consumer never sees it: `go.work` applies only inside this repository. The
+release of `otelflows` builds it with `GOWORK=off`, as a consumer does:
+when `otelflows` starts using new go-flows API, release go-flows first,
+then raise the requirement in `otelflows/go.mod` (`make modcheck` shows
+whether it is needed).
 
 See [AGENTS.md](AGENTS.md) for the invariants and the process, and
 [TASKS.md](TASKS.md) for the task list (Vietnamese).

@@ -3,7 +3,7 @@ module github.com/imdat99/go-flows/otelflows
 go 1.27.3
 
 require (
-	github.com/imdat99/go-flows v0.0.0
+	github.com/imdat99/go-flows v0.1.2
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/metric v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
@@ -30,6 +30,3 @@ require (
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
 )
-
-// Developed in the go-flows repository; a release pins a go-flows version.
-replace github.com/imdat99/go-flows => ../
