@@ -147,13 +147,29 @@ func releaseLine(ctx context.Context, k flows.Key, id int64) error {
 	return nil
 }
 
-// checkLevelFn reads a level; reads need no idempotency.
-func checkLevelFn(ctx context.Context, _ flows.Key, sku string) (int, struct{}, error) {
-	n, err := Level(ctx, sku)
-	if errors.Is(err, ErrUnknownSKU) {
-		err = flows.Permanent(err)
+// StockLevel is the output of checkLevel.
+type StockLevel struct {
+	Available    int  `json:"available"`
+	Discontinued bool `json:"discontinued"`
+}
+
+// checkLevelFn reads a level and the discontinued flag; reads need no
+// idempotency.
+func checkLevelFn(ctx context.Context, _ flows.Key, sku string) (StockLevel, struct{}, error) {
+	c, err := cfg.Get()
+	if err != nil {
+		return StockLevel{}, struct{}{}, err
 	}
-	return n, struct{}{}, err
+	var l StockLevel
+	err = c.DB.QueryRow(ctx, `SELECT available, discontinued FROM inventory.stock WHERE sku = $1`, sku).
+		Scan(&l.Available, &l.Discontinued)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return StockLevel{}, struct{}{}, flows.Permanent(fmt.Errorf("%w: %s", ErrUnknownSKU, sku))
+	}
+	if err != nil {
+		return StockLevel{}, struct{}{}, fmt.Errorf("level of %s: %w", sku, err)
+	}
+	return l, struct{}{}, nil
 }
 
 // placePurchaseOrderFn orders stock from the supplier. The stub supplier

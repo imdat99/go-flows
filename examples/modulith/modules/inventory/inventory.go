@@ -216,7 +216,9 @@ func StartReplenishment(ctx context.Context, e *flows.Engine) error {
 // StopReplenishment discontinues sku: its replenishment loop ends at its
 // next cycle and is not started again. The flag is stored in the module's
 // table, because the engine's memory of the ended loop (Start finding the
-// instance id used) lasts only until retention purges it.
+// instance id used) lasts only until retention purges it. The loop also
+// reads the flag every cycle, so a loop started concurrently (after
+// startReplenish read the flag, before it was set) ends by itself.
 func StopReplenishment(ctx context.Context, e *flows.Engine, sku string) error {
 	c, err := cfg.Get()
 	if err != nil {

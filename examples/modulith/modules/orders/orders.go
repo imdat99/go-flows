@@ -194,9 +194,14 @@ func validate(r PlaceRequest) error {
 // Cancel asks for the cancellation of an order. It is honored until the
 // carrier picks the parcel up; after that the order completes anyway (the
 // fulfilment forwards the cancel to the shipment, which decides). It fails
-// with flows.ErrNotActive once the order has ended. Use it, not
-// Engine.Cancel, for customers: Engine.Cancel is an operator's tool that
-// cancels the shipment without waiting for its outcome.
+// with flows.ErrNotActive once the order has ended.
+//
+// Use it, not Engine.Cancel, for customers. Engine.Cancel is an operator's
+// tool: it cancels the order's context, so the shipment child's future
+// resolves at once with ErrCanceled and the order compensates (refund,
+// release, void) without waiting for the shipment's outcome. After a
+// pickup that means the money is refunded and the stock released while the
+// parcel ships (the shipment itself still completes: its decision stands).
 func Cancel(ctx context.Context, e *flows.Engine, orderID, reason string) error {
 	return e.Signal(ctx, InstanceID(orderID), SignalCancel, CancelRequest{Reason: reason})
 }

@@ -53,11 +53,11 @@ func TestReplenishLoop(t *testing.T) {
 	// The level drops by 4 per cycle, from 12; a purchase order adds 20.
 	var mu sync.Mutex
 	level, orders := 12, 0
-	flowtest.OnActivity(tst, checkLevel, func(context.Context, flows.Key, string) (int, struct{}, error) {
+	flowtest.OnActivity(tst, checkLevel, func(context.Context, flows.Key, string) (StockLevel, struct{}, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		level -= 4
-		return level, struct{}{}, nil
+		return StockLevel{Available: level}, struct{}{}, nil
 	})
 	flowtest.OnActivity(tst, placePurchaseOrder, func(_ context.Context, _ flows.Key, po PurchaseOrder) (int64, struct{}, error) {
 		mu.Lock()
@@ -90,14 +90,14 @@ func TestReplenishFailedCycleGoesOn(t *testing.T) {
 	tst := newTester(t)
 	calls := 0
 	var mu sync.Mutex
-	flowtest.OnActivity(tst, checkLevel, func(context.Context, flows.Key, string) (int, struct{}, error) {
+	flowtest.OnActivity(tst, checkLevel, func(context.Context, flows.Key, string) (StockLevel, struct{}, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		calls++
 		if calls == 1 {
-			return 0, struct{}{}, flows.Permanent(errors.New("db down"))
+			return StockLevel{}, struct{}{}, flows.Permanent(errors.New("db down"))
 		}
-		return 100, struct{}{}, nil
+		return StockLevel{Available: 100}, struct{}{}, nil
 	})
 	tst.SignalAfter(2*time.Hour+time.Minute, replenishID("sku-b"), SignalStopReplenish, struct{}{})
 
@@ -109,6 +109,38 @@ func TestReplenishFailedCycleGoesOn(t *testing.T) {
 	}
 	if st.Cycles != 2 || st.LastError != "" {
 		t.Fatalf("state %+v, want 2 cycles, the second clean", st)
+	}
+}
+
+// A SKU discontinued while its loop runs (the stop signal missed it): the
+// loop sees the flag at its next cycle and ends without ordering.
+func TestReplenishStopsWhenDiscontinued(t *testing.T) {
+	tst := newTester(t)
+	var mu sync.Mutex
+	cycles := 0
+	flowtest.OnActivity(tst, checkLevel, func(context.Context, flows.Key, string) (StockLevel, struct{}, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		cycles++
+		return StockLevel{Available: 0, Discontinued: cycles >= 2}, struct{}{}, nil
+	})
+	ordered := 0
+	flowtest.OnActivity(tst, placePurchaseOrder, func(context.Context, flows.Key, PurchaseOrder) (int64, struct{}, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		ordered++
+		return int64(ordered), struct{}{}, nil
+	})
+	st, err := flowtest.Run(tst, replenish, replenishID("sku-c"), ReplenishState{
+		SKU: "sku-c", Every: time.Hour, ReorderPoint: 5, ReorderQty: 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if st.Cycles != 2 || ordered != 1 {
+		t.Fatalf("state %+v, %d orders; want the loop ended at its 2nd cycle after 1 order", st, ordered)
 	}
 }
 

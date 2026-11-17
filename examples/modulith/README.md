@@ -48,7 +48,7 @@ everything else, its tables included, is private.
 | orders | `orders` | `orders` | `Place`, `Cancel`, `Get`, `Hook`, events `TopicCompleted`/`TopicCanceled`/`TopicFailed` + `Event` |
 | payments | `payments` | `payments` | activities `Authorize`, `Capture`; `Find`, `ErrDeclined` |
 | inventory | `inventory` | `inventory` | workflow `Reserve` (+ `ReserveID`), `Adjust`, `Level`, `StartReplenishment`, `StopReplenishment` |
-| shipping | `shipping` | `shipping` | workflow `Ship` (+ `InstanceID`), `ConfirmPickup`, `Cancel`, `Find`, `ErrPickupTimeout`, `ErrCanceled` |
+| shipping | `shipping` | `shipping` | workflow `Ship` (+ `InstanceID`), `ConfirmPickup`, `Cancel`, `Find`, `ErrPickupTimeout`, `ErrCanceled`, `ErrPickupRefused`, `ErrNoShipment` |
 | notifications | `notifications` | `notifications` | `Subscribe`, `Sent` |
 
 Every module also exports `Queue`, `Configure` and `Migrate`.
@@ -63,6 +63,8 @@ HTTP POST /orders ──> orders.Place ──> workflow orders.fulfil (queue ord
    4. payments.Capture             activity      payments       undo: refund
    5. shipping.Ship                child         shipping       undo: cancel label
         label, then Select { signal picked-up | signal shipping.cancel | timer PickupWithin }
+        then Decide in shipping.shipments (first decision wins, carrier or workflow)
+        picked up: MarkPickedUp, retried until it succeeds
       the order: Select { shipment done | signal orders.cancel -> forward to the shipment }
                  then wait for the shipment's real outcome
  end ──> RunHook (same transaction): orders.orders.state + outbox event
@@ -75,10 +77,30 @@ HTTP POST /orders ──> orders.Place ──> workflow orders.fulfil (queue ord
   `inventory.Reserve` child to release its lines, and voids the
   authorization. Each compensator runs on its module's queue, so on the
   processes running that module. Nothing needs the `fulfil` function.
-- **The pivot.** Once the carrier has the parcel, nothing is undone:
-  `MarkPickedUp` has no compensator and runs on `flows.Disconnected`, so
-  nothing cancels it. Once the order has ended, `orders.Cancel` returns
-  `ErrNotActive` (HTTP 409).
+- **The pivot is a row, not a signal.** Whether the carrier has the
+  parcel is decided once, in `shipping.shipments`, under a row lock: the
+  row leaves `label_created` for `pickup_confirmed` or `canceled`, and
+  whoever comes first wins.
+  - The carrier's webhook (`ConfirmPickup`, `POST
+    /shipments/{order}/pickup`) moves the row to `pickup_confirmed`
+    before it signals the workflow. 202 means the pickup is recorded for
+    good: the order will complete. If the shipment was canceled first
+    (the customer, or the timeout), it gets 409 `ErrPickupRefused`
+    (return the parcel); before the label exists, 404 `ErrNoShipment`
+    (retry). A pickup is never accepted and then dropped.
+  - The workflow, woken by the first signal or its timer, asks for the
+    outcome it wants (`Decide`) and gets the row's state. Signals only
+    wake it: if the carrier's signal is lost, the timer wakes it and the
+    row still says `pickup_confirmed`.
+  - From the decision on, the shipment cannot fail into the saga: `Decide`
+    and `MarkPickedUp` run on `flows.Disconnected` and are retried until
+    they succeed (rounds of attempts, a durable 5-minute sleep between
+    rounds; the observer's failed attempts are the alert). With the
+    shipping database down for hours after a pickup, the order completes
+    late; it is never undone. `MarkPickedUp` has no compensator, and
+    `cancelLabel` only cancels a row still `label_created`.
+  - Once the order has ended, `orders.Cancel` returns `ErrNotActive` (HTTP
+    409).
 - **Who decides on a cancel.** `orders.Cancel` signals the order. Sent
   during steps 1 to 4, the signal waits in the channel and the order stops
   itself before the capture or before starting the shipment. During step 5
@@ -88,13 +110,27 @@ HTTP POST /orders ──> orders.Place ──> workflow orders.fulfil (queue ord
   cancel to the shipment (an activity calling `shipping.Cancel`, because a
   workflow cannot signal another one) and waits for the shipment's
   outcome: canceled, the order is undone; picked up, the order completes
-  and the cancel is ignored. When both signals are waiting, the shipment
-  takes the pickup. Tests: `TestFulfilCancelAfterPickup`,
-  `TestFulfilCancelBeforeShipping`, `TestShipPickupBeatsCancel`, and the
-  "cancel after pickup" case of the integration test.
+  and the cancel is ignored.
+- **Tests of these paths.**
+  - flowtest: `TestFulfilCancelAfterPickup` (the cancel reaches the order
+    after the pickup reached the shipment), `TestFulfilCancelBeforeShipping`,
+    `TestFulfilCancelDuringCapture`, `TestFulfilPickupRecordFailsForLong`,
+    `TestShipPickupBeatsCancel`, `TestShipConfirmedPickupBeatsCancelSignal`,
+    `TestShipPickupRecordedDespiteFailures`.
+  - Postgres: `TestPickupAfterCancelIsRefused`,
+    `TestCancelAfterPickupKeepsThePickup`, and `TestDecisionRace` (the
+    carrier and the workflow decide at the same time, 20 times: they
+    always agree).
+  - The integration test confirms a pickup and then cancels through the
+    API (the order completes whatever the timing, because the 202 of the
+    pickup is final), and posts a pickup after a cancel (409).
 - **`Engine.Cancel` is an operator's tool, not a customer cancel.** It
-  cancels the order's context, and with it the shipment's, without
-  waiting for the shipment's outcome.
+  cancels the order's context: the shipment child's future resolves at
+  once with `ErrCanceled`, and the order compensates without waiting for
+  the shipment's outcome. After a pickup, that refunds the payment and
+  releases the stock while the parcel ships (the shipment itself still
+  completes). Use it only for an order that must be stopped whatever it
+  costs, and reconcile by hand.
 
 Other features, where to find them:
 
@@ -103,7 +139,7 @@ Other features, where to find them:
 | Activities with compensators, idempotent by `flows.Key` (unique key column, tombstone fencing) | `payments/payments.go`, `shipping/shipping.go` |
 | Exactly-once effects with `idem.Do`, uncertain undo with `idem.Abort` | `inventory/activities.go` |
 | Child workflows across modules, compensated by reopening | `orders/fulfil.go`, `inventory/workflows.go` (`Reserve`), `shipping/shipping.go` (`Ship`) |
-| `Select` over two signals and a timeout timer; a step that cannot be canceled (`Disconnected`) | `shipping/shipping.go` |
+| `Select` over two signals and a timeout timer; a decision made once in a table row; steps retried until they succeed on `Disconnected` | `shipping/shipping.go` |
 | `Select` over a child and a signal; forwarding a signal to a child through an activity | `orders/fulfil.go` |
 | Long-running loop with `ContinueAsNew` and a stop signal | `inventory/workflows.go` (`replenishCycle`) |
 | `flows.Lock` with `LockWait` on a business key | `inventory/workflows.go` (`checkAndOrder`, `adjustStock`) |
@@ -323,10 +359,17 @@ What go-flows made hard here, and how the example works around it:
 - **One `RunHook` per engine, and `RunInfo` has no input or output.** The
   composition root chains the modules' hooks; the orders hook reads its
   table, and tells a customer cancel by parsing `RunInfo.ErrorKinds`.
-- **A signal before the instance exists fails** (`ErrNotFound`): a pickup
-  confirmation that arrives before the shipment starts gets 404, and the
-  carrier's webhook must retry. A pickup after the shipment ended gets
-  409 (the parcel must go back).
+- **Signals are not decisions.** A signal is accepted while the execution
+  is running, compensating or parked, read or not: a workflow that has
+  chosen another branch never reads it, and the sender got nil. A signal
+  before the instance exists fails (`ErrNotFound`). Anything a sender
+  must know was accepted (the carrier's pickup) is decided in the module's
+  table first (`shipping.ConfirmPickup`), and the signal only wakes the
+  workflow.
+- **No "retry forever" policy.** A step that must succeed (after a pivot)
+  is a workflow loop over a finite retry policy with a durable sleep
+  (`untilDone` in `shipping/shipping.go`); its failed attempts reach the
+  observer.
 - **Outbox order is by sequence, not commit.** See
   `internal/platform/outbox`: fine for one event per key per
   transaction, not for concurrent producers of one key.

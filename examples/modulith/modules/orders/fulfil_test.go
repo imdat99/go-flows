@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,7 +74,13 @@ func newTester(t *testing.T) (*flowtest.Tester, *undoLog) {
 		undo.add("void " + id)
 		return nil
 	})
-	flowtest.OnActivity(tst, payments.Capture, func(_ context.Context, _ flows.Key, id string) (string, string, error) {
+	flowtest.OnActivity(tst, payments.Capture, func(ctx context.Context, _ flows.Key, id string) (string, string, error) {
+		if id == "pay_o8" {
+			// The customer cancels while the payment is being captured.
+			if err := tst.Engine().Signal(ctx, InstanceID("o8"), SignalCancel, CancelRequest{Reason: "during capture"}); err != nil {
+				return "", "", err
+			}
+		}
 		return id, id, nil
 	})
 	flowtest.OnCompensator(tst, payments.Capture, func(_ context.Context, _ flows.Key, id string) error {
@@ -97,7 +104,24 @@ func newTester(t *testing.T) (*flowtest.Tester, *undoLog) {
 		undo.add("cancel label " + id)
 		return nil
 	})
+	// The shipments table's decision: first wins (see shipping's tests).
+	var decMu sync.Mutex
+	decided := map[string]shipping.Decided{}
+	flowtest.OnActivity(tst, shipping.Decide, func(_ context.Context, _ flows.Key, d shipping.Decision) (shipping.Decided, struct{}, error) {
+		decMu.Lock()
+		defer decMu.Unlock()
+		if got, ok := decided[d.ShipmentID]; ok {
+			return got, struct{}{}, nil
+		}
+		decided[d.ShipmentID] = shipping.Decided{State: d.Want, Tracking: d.Tracking}
+		return decided[d.ShipmentID], struct{}{}, nil
+	})
+	var markFailures atomic.Int32
+	markFailures.Store(35) // for TRK-FLAKY: more than three rounds of attempts
 	flowtest.OnActivity(tst, shipping.MarkPickedUp, func(ctx context.Context, _ flows.Key, u shipping.PickupUpdate) (struct{}, struct{}, error) {
+		if u.Tracking == "TRK-FLAKY" && markFailures.Add(-1) >= 0 {
+			return struct{}{}, struct{}{}, errors.New("shipping database down")
+		}
 		if u.Tracking == "TRK-RACE" {
 			// The customer cancels just after the pickup reached the
 			// shipment, while the order still waits for it.
@@ -225,6 +249,39 @@ func TestFulfilCancelBeforeShipping(t *testing.T) {
 		t.Fatalf("compensations %v, want %v", got, want)
 	}
 	if types := tst.EventTypes(shipping.InstanceID("o7")); len(types) != 0 {
+		t.Fatalf("a shipment was started: %v", types)
+	}
+}
+
+// After the pickup, the shipment cannot record it for hours (its database
+// is down). It keeps trying instead of failing, so the order is never
+// undone: no label canceled, no refund; it completes once the record lands.
+func TestFulfilPickupRecordFailsForLong(t *testing.T) {
+	tst, undo := newTester(t)
+	tst.SignalAfter(time.Hour, shipping.InstanceID("o9"), shipping.SignalPickedUp, shipping.Pickup{Tracking: "TRK-FLAKY"})
+
+	res, err := flowtest.Run(tst, fulfil, InstanceID("o9"), order("o9"))
+	if err != nil || res.Tracking != "TRK-FLAKY" {
+		t.Fatalf("result %+v, err %v; want the order completed", res, err)
+	}
+	if got := undo.get(); len(got) != 0 {
+		t.Fatalf("compensations ran after the pickup: %v", got)
+	}
+}
+
+// A cancel that arrives while the payment is captured: the order stops
+// before the shipment, and the capture is refunded.
+func TestFulfilCancelDuringCapture(t *testing.T) {
+	tst, undo := newTester(t)
+	_, err := flowtest.Run(tst, fulfil, InstanceID("o8"), order("o8"))
+	if !errors.Is(err, ErrCanceledByCustomer) {
+		t.Fatalf("err = %v, want canceled by the customer", err)
+	}
+	want := []string{"refund pay_o8", "release 2", "void pay_o8"}
+	if got := undo.get(); !slices.Equal(got, want) {
+		t.Fatalf("compensations %v, want %v", got, want)
+	}
+	if types := tst.EventTypes(shipping.InstanceID("o8")); len(types) != 0 {
 		t.Fatalf("a shipment was started: %v", types)
 	}
 }

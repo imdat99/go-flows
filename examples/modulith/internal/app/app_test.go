@@ -302,6 +302,15 @@ func (s split) canceled(t *testing.T) {
 		t.Fatalf("stock %d, want 8 after the release", n)
 	}
 	s.sent(t, "o-cancel", "order_canceled")
+
+	// The carrier comes after the cancel: refused, return the parcel.
+	code = call(t, s.api, "POST", "/shipments/o-cancel/pickup", shipping.Pickup{Tracking: "TRK-LATE"}, nil)
+	if code != http.StatusConflict {
+		t.Fatalf("pickup after the cancel: %d, want 409", code)
+	}
+	if code := call(t, s.api, "POST", "/shipments/o-none/pickup", shipping.Pickup{Tracking: "T"}, nil); code != http.StatusNotFound {
+		t.Fatalf("pickup without a shipment: %d, want 404", code)
+	}
 }
 
 func (s split) outOfStock(t *testing.T) {
@@ -314,8 +323,12 @@ func (s split) outOfStock(t *testing.T) {
 	s.sent(t, "o-big", "order_failed")
 }
 
-// The carrier confirms the pickup, then the customer cancels at once: the
-// pickup reached the shipment first, so the order completes, captured.
+// The carrier confirms the pickup, then the customer cancels at once. The
+// 202 of the pickup means the shipments table recorded it, so however the
+// cancel's arrival interleaves with the workflows (it may reach the order
+// while it still waits, or after it completed), the order completes,
+// captured. The interleavings themselves are forced in flowtest
+// (TestFulfilCancelAfterPickup) and on Postgres (TestDecisionRace).
 func (s split) cancelAfterPickup(t *testing.T) {
 	s.place(t, "o-race", 1)
 	eventually(t, "the label", func() bool { return s.view(t, "o-race").Shipment == "label_created" })

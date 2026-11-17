@@ -188,11 +188,12 @@ func (a *App) fail(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, orders.ErrInvalidOrder), errors.Is(err, flows.ErrInvalidArgument):
 		status = http.StatusBadRequest
-	case errors.Is(err, flows.ErrNotFound), errors.Is(err, inventory.ErrUnknownSKU):
+	case errors.Is(err, flows.ErrNotFound), errors.Is(err, inventory.ErrUnknownSKU),
+		errors.Is(err, shipping.ErrNoShipment):
 		status = http.StatusNotFound
 	case errors.Is(err, flows.ErrNotActive), errors.Is(err, flows.ErrInstanceConflict),
 		errors.Is(err, inventory.ErrOutOfStock), errors.Is(err, orders.ErrOrderConflict),
-		errors.Is(err, inventory.ErrRequestConflict):
+		errors.Is(err, inventory.ErrRequestConflict), errors.Is(err, shipping.ErrPickupRefused):
 		status = http.StatusConflict
 	}
 	msg := err.Error()

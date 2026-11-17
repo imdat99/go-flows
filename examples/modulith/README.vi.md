@@ -47,7 +47,7 @@ nó; mọi thứ khác, kể cả các bảng, là riêng tư.
 | orders | `orders` | `orders` | `Place`, `Cancel`, `Get`, `Hook`, event `TopicCompleted`/`TopicCanceled`/`TopicFailed` + `Event` |
 | payments | `payments` | `payments` | activity `Authorize`, `Capture`; `Find`, `ErrDeclined` |
 | inventory | `inventory` | `inventory` | workflow `Reserve` (+ `ReserveID`), `Adjust`, `Level`, `StartReplenishment`, `StopReplenishment` |
-| shipping | `shipping` | `shipping` | workflow `Ship` (+ `InstanceID`), `ConfirmPickup`, `Cancel`, `Find`, `ErrPickupTimeout`, `ErrCanceled` |
+| shipping | `shipping` | `shipping` | workflow `Ship` (+ `InstanceID`), `ConfirmPickup`, `Cancel`, `Find`, `ErrPickupTimeout`, `ErrCanceled`, `ErrPickupRefused`, `ErrNoShipment` |
 | notifications | `notifications` | `notifications` | `Subscribe`, `Sent` |
 
 Module nào cũng export thêm `Queue`, `Configure` và `Migrate`.
@@ -62,6 +62,8 @@ HTTP POST /orders ──> orders.Place ──> workflow orders.fulfil (queue ord
    4. payments.Capture             activity      payments       hoàn tác: refund
    5. shipping.Ship                child         shipping       hoàn tác: huỷ nhãn
         tạo nhãn, rồi Select { signal picked-up | signal shipping.cancel | timer PickupWithin }
+        rồi Decide trong shipping.shipments (quyết định đầu tiên thắng, hãng hay workflow)
+        đã lấy hàng: MarkPickedUp, retry đến khi thành công
       đơn hàng: Select { giao hàng xong | signal orders.cancel -> chuyển tiếp cho shipment }
                 rồi chờ kết quả thật của shipment
  kết thúc ──> RunHook (cùng transaction): orders.orders.state + event outbox
@@ -74,10 +76,29 @@ HTTP POST /orders ──> orders.Place ──> workflow orders.fulfil (queue ord
   xong để trả lại các dòng hàng, và void authorization. Mỗi compensator
   chạy trên queue của module nó, tức là trên các process chạy module đó.
   Không cần đến hàm `fulfil`.
-- **Điểm không quay lại (pivot).** Khi hãng đã nhận hàng thì không hoàn
-  tác gì nữa: `MarkPickedUp` không có compensator và chạy trên
-  `flows.Disconnected`, nên không gì huỷ được nó. Khi đơn đã kết thúc,
-  `orders.Cancel` trả về `ErrNotActive` (HTTP 409).
+- **Pivot là một dòng dữ liệu, không phải một signal.** Việc hãng đã có
+  kiện hàng hay chưa được quyết định một lần, trong `shipping.shipments`,
+  dưới khoá dòng: dòng rời `label_created` sang `pickup_confirmed` hoặc
+  `canceled`, ai đến trước thắng.
+  - Webhook của hãng (`ConfirmPickup`, `POST /shipments/{order}/pickup`)
+    chuyển dòng sang `pickup_confirmed` trước khi gửi signal cho workflow.
+    202 nghĩa là việc lấy hàng đã được ghi nhận vĩnh viễn: đơn sẽ hoàn
+    tất. Nếu shipment đã bị huỷ trước (khách huỷ hoặc hết hạn), webhook
+    nhận 409 `ErrPickupRefused` (trả lại kiện hàng); trước khi có nhãn,
+    404 `ErrNoShipment` (thử lại). Không có chuyện nhận lấy hàng rồi bỏ
+    rơi.
+  - Workflow, được đánh thức bởi signal đầu tiên hoặc timer, xin kết quả
+    nó muốn (`Decide`) và nhận trạng thái của dòng. Signal chỉ để đánh
+    thức: nếu signal của hãng bị mất, timer đánh thức workflow và dòng
+    vẫn ghi `pickup_confirmed`.
+  - Từ lúc quyết định, shipment không thể fail vào saga: `Decide` và
+    `MarkPickedUp` chạy trên `flows.Disconnected` và được retry đến khi
+    thành công (từng đợt attempt, ngủ durable 5 phút giữa các đợt; các
+    attempt lỗi tới observer là cảnh báo). Nếu database của shipping chết
+    hàng giờ sau khi lấy hàng, đơn hoàn tất muộn; nó không bao giờ bị hoàn
+    tác. `MarkPickedUp` không có compensator, và `cancelLabel` chỉ huỷ
+    dòng còn `label_created`.
+  - Khi đơn đã kết thúc, `orders.Cancel` trả về `ErrNotActive` (HTTP 409).
 - **Ai quyết định việc huỷ.** `orders.Cancel` gửi signal cho đơn hàng.
   Gửi trong bước 1 đến 4 thì signal chờ trong channel và đơn tự dừng trước
   khi capture hoặc trước khi khởi shipment. Trong bước 5 chỉ shipment biết
@@ -86,14 +107,25 @@ HTTP POST /orders ──> orders.Place ──> workflow orders.fulfil (queue ord
   không có kết quả thật). Đơn chuyển tiếp lệnh huỷ cho shipment (một
   activity gọi `shipping.Cancel`, vì workflow không gửi signal cho workflow
   khác được) và chờ kết quả của shipment: bị huỷ thì đơn được hoàn tác;
-  đã lấy hàng thì đơn hoàn tất và lệnh huỷ bị bỏ qua. Khi cả hai signal
-  cùng đang chờ, shipment chọn việc lấy hàng. Test:
-  `TestFulfilCancelAfterPickup`, `TestFulfilCancelBeforeShipping`,
-  `TestShipPickupBeatsCancel`, và trường hợp "cancel after pickup" của
-  test tích hợp.
+  đã lấy hàng thì đơn hoàn tất và lệnh huỷ bị bỏ qua.
+- **Test cho các đường này.**
+  - flowtest: `TestFulfilCancelAfterPickup` (lệnh huỷ tới đơn sau khi việc
+    lấy hàng đã tới shipment), `TestFulfilCancelBeforeShipping`,
+    `TestFulfilCancelDuringCapture`, `TestFulfilPickupRecordFailsForLong`,
+    `TestShipPickupBeatsCancel`, `TestShipConfirmedPickupBeatsCancelSignal`,
+    `TestShipPickupRecordedDespiteFailures`.
+  - Postgres: `TestPickupAfterCancelIsRefused`,
+    `TestCancelAfterPickupKeepsThePickup`, và `TestDecisionRace` (hãng và
+    workflow quyết định cùng lúc, 20 lần: luôn thống nhất).
+  - Test tích hợp xác nhận lấy hàng rồi huỷ qua API (đơn hoàn tất dù thời
+    điểm thế nào, vì 202 của việc lấy hàng là cuối cùng), và gửi xác nhận
+    lấy hàng sau khi huỷ (409).
 - **`Engine.Cancel` là công cụ của người vận hành, không phải lệnh huỷ
-  của khách.** Nó huỷ context của đơn, kéo theo context của shipment, mà
-  không chờ kết quả của shipment.
+  của khách.** Nó huỷ context của đơn: future của child shipment trả về
+  `ErrCanceled` ngay, và đơn compensate mà không chờ kết quả của shipment.
+  Sau khi hãng đã lấy hàng, điều đó nghĩa là hoàn tiền và trả hàng về kho
+  trong khi kiện hàng vẫn được giao (bản thân shipment vẫn hoàn tất). Chỉ
+  dùng cho đơn buộc phải dừng bằng mọi giá, và đối soát bằng tay.
 
 Các tính năng khác, nằm ở đâu:
 
@@ -102,7 +134,7 @@ Các tính năng khác, nằm ở đâu:
 | Activity có compensator, idempotent theo `flows.Key` (cột key unique, fence bằng tombstone) | `payments/payments.go`, `shipping/shipping.go` |
 | Hiệu ứng đúng một lần với `idem.Do`, hoàn tác không chắc chắn với `idem.Abort` | `inventory/activities.go` |
 | Child workflow giữa các module, được compensate bằng cách mở lại | `orders/fulfil.go`, `inventory/workflows.go` (`Reserve`), `shipping/shipping.go` (`Ship`) |
-| `Select` giữa hai signal và một timer timeout; một bước không huỷ được (`Disconnected`) | `shipping/shipping.go` |
+| `Select` giữa hai signal và một timer timeout; quyết định một lần trong một dòng của bảng; các bước retry đến khi thành công trên `Disconnected` | `shipping/shipping.go` |
 | `Select` giữa child và signal; chuyển tiếp signal cho child qua một activity | `orders/fulfil.go` |
 | Vòng lặp dài hạn với `ContinueAsNew` và signal dừng | `inventory/workflows.go` (`replenishCycle`) |
 | `flows.Lock` với `LockWait` trên khoá nghiệp vụ | `inventory/workflows.go` (`checkAndOrder`, `adjustStock`) |
@@ -318,10 +350,17 @@ Những gì go-flows làm khó ở đây, và cách ví dụ xoay xở:
 - **Mỗi engine một `RunHook`, và `RunInfo` không có input hay output.**
   Composition root nối hook của các module; hook của orders đọc bảng của
   nó, và nhận ra lệnh huỷ của khách bằng cách tách `RunInfo.ErrorKinds`.
-- **Signal gửi trước khi instance tồn tại sẽ lỗi** (`ErrNotFound`): xác
-  nhận lấy hàng đến trước khi shipment khởi động nhận 404, webhook của
-  hãng phải retry. Xác nhận sau khi shipment đã kết thúc nhận 409 (hàng
-  phải được trả lại).
+- **Signal không phải quyết định.** Signal được nhận khi execution đang
+  chạy, đang compensate hay bị park, dù có được đọc hay không: workflow đã
+  chọn nhánh khác sẽ không bao giờ đọc nó, còn bên gửi nhận nil. Signal
+  gửi trước khi instance tồn tại thì lỗi (`ErrNotFound`). Điều gì bên gửi
+  cần biết là đã được nhận (việc lấy hàng của hãng) thì được quyết định
+  trong bảng của module trước (`shipping.ConfirmPickup`), signal chỉ để
+  đánh thức workflow.
+- **Không có retry policy "mãi mãi".** Bước bắt buộc phải thành công (sau
+  pivot) là một vòng lặp trong workflow quanh một retry policy hữu hạn
+  với giấc ngủ durable (`untilDone` trong `shipping/shipping.go`); các
+  attempt lỗi tới observer.
 - **Thứ tự outbox theo sequence, không theo commit.** Xem
   `internal/platform/outbox`: ổn với một event mỗi key mỗi transaction,
   không ổn với nhiều producer đồng thời cho cùng một key.

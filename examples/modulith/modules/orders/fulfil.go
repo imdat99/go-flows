@@ -146,9 +146,11 @@ func fulfilOrder(c flows.Ctx, o Order) (Result, error) {
 	}
 }
 
-// canceled is the error that ends a canceled order: the customer's reason,
-// or the error of the signal channel (the workflow itself was canceled with
-// Engine.Cancel: it then ends canceled rather than compensated).
+// canceled is the error that ends a canceled order: the customer's reason
+// (the order ends compensated), or the error of the signal channel: the
+// workflow itself was canceled with Engine.Cancel, and returning that error
+// ends it with status canceled. Either way its completed activities are
+// compensated (refund, release, void).
 func canceled(req CancelRequest, err error) error {
 	if err != nil {
 		return err

@@ -102,28 +102,35 @@ func replenishCycle(c flows.Ctx, st ReplenishState) (ReplenishState, error) {
 	st.LastError = ""
 	// Forward recovery: a failed cycle is recorded and the loop goes on;
 	// failing the workflow would end the loop for good.
-	if err := checkAndOrder(c, &st); err != nil {
+	discontinued, err := checkAndOrder(c, &st)
+	if err != nil {
 		st.LastError = err.Error()
+	}
+	if discontinued {
+		// Discontinued after this loop was started (StopReplenishment's
+		// signal can miss a loop started concurrently): end it here.
+		return st, nil
 	}
 	return st, flows.ContinueAsNew(c, st)
 }
 
 // checkAndOrder reads the level and decides on a purchase order under the
 // SKU's lock: an adjustment (adjustStock) cannot land between the read and
-// the order, so the decision is never made on a stale level.
-func checkAndOrder(c flows.Ctx, st *ReplenishState) error {
+// the order, so the decision is never made on a stale level. It reports a
+// discontinued SKU, which ends the loop.
+func checkAndOrder(c flows.Ctx, st *ReplenishState) (discontinued bool, err error) {
 	if err := flows.Lock(c, stockLock(st.SKU), stockLockTTL, lockWait); err != nil {
-		return err
+		return false, err
 	}
-	n, err := checkLevel.Run(c, st.SKU)
-	if err != nil || n >= st.ReorderPoint {
-		return err
+	l, err := checkLevel.Run(c, st.SKU)
+	if err != nil || l.Discontinued || l.Available >= st.ReorderPoint {
+		return l.Discontinued, err
 	}
 	if _, err := placePurchaseOrder.Run(c, PurchaseOrder{SKU: st.SKU, Qty: st.ReorderQty}); err != nil {
-		return err
+		return false, err
 	}
 	st.Ordered++
-	return nil
+	return false, nil
 }
 
 func adjustStock(c flows.Ctx, a Adjustment) (int, error) {

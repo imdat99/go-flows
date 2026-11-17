@@ -181,6 +181,10 @@ func capture(ctx context.Context, k flows.Key, paymentID string) (string, string
 	if err != nil {
 		return "", "", err
 	}
+	// The stub's row lock stands in for the gateway's own idempotency and
+	// ordering: a real gateway has no FOR UPDATE. Pass it the Key as the
+	// idempotency key, and rely on its rules (a capture of a voided or
+	// refunded authorization fails) for what the lock does here.
 	err = pgx.BeginFunc(ctx, c.DB, func(tx pgx.Tx) error {
 		var state string
 		var key *string
