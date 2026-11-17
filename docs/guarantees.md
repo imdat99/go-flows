@@ -22,6 +22,16 @@ attempt whose lease was lost (its process paused, partitioned or died) is
 run again elsewhere, and its late result is refused by fencing (chaos test B).
 Use the `Key` to make the effect happen once (`idem.Do`).
 
+**Work that crashes its process is not retried forever.** A lost attempt
+counts against the activity's retry policy: once its attempts reach the
+policy's limit and the last one was lost (the activity kills its process:
+out of memory, `os.Exit`, a fatal runtime error), the next engine does not
+run it again but fails it permanently with `ErrAttemptsExhausted`,
+uncertain (it is compensated), as any final failure (chaos test I). A
+workflow task claimed more than `MaxTaskClaims` times in a row (default
+10) without completing parks its execution (`ErrCrashLoop`), never fails
+it; `Engine.Resume` runs it again once the cause is fixed.
+
 **Fencing.** Every write made for a running execution or an activity task
 checks `owner_id` and `lease_version` on the locked row:
 

@@ -49,6 +49,20 @@ var (
 	// Its goroutine cannot be stopped and stays until the process exits.
 	// Engine.Resume resumes it once fixed code is deployed.
 	ErrStuck = coro.ErrStuck
+	// ErrCrashLoop is the reason of an execution parked as needs_attention
+	// because its workflow task was claimed more than
+	// Options.MaxTaskClaims times in a row without ever completing: the
+	// processes running it crashed (out of memory, os.Exit, a fatal runtime
+	// error), or lost their lease, each time. Engine.Resume resumes it once
+	// the cause is fixed.
+	ErrCrashLoop = worker.ErrCrashLoop
+	// ErrAttemptsExhausted is the error of an activity (or compensator)
+	// whose attempts reached its retry policy's limit while the last one
+	// was lost: its process crashed (out of memory, os.Exit, a fatal
+	// runtime error) or lost its lease without recording a result. It is
+	// not run again: it fails permanently, uncertain (it may have had its
+	// effect, so it is compensated), as any final failure.
+	ErrAttemptsExhausted = worker.ErrAttemptsExhausted
 	// ErrCanceled is the error of an activity, timer, child or workflow whose
 	// context was canceled.
 	ErrCanceled = executor.ErrCanceled
@@ -120,6 +134,8 @@ var kinds = struct {
 	{"invalid_argument", ErrInvalidArgument},
 	{"lock_held", ErrLockHeld},
 	{"lock_lost", ErrLockLost},
+	{"attempts_exhausted", ErrAttemptsExhausted},
+	{store.KindCrashLoop, ErrCrashLoop},
 }}
 
 type errorKind struct {

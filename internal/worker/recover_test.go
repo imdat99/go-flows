@@ -214,7 +214,8 @@ func TestCrashedEngineWorkIsRecoveredWithinLeaseTTL(t *testing.T) {
 				running := make(chan struct{}, 1)
 				newReg := func(crashing bool) *registry {
 					reg := newRegistry()
-					reg.addActivity("work", &worker.Activity{Run: func(ctx context.Context, _ *store.ActivityTask) ([]byte, []byte, error) {
+					// A lost attempt counts (T11.3): a second one is allowed.
+					reg.addActivity("work", &worker.Activity{Retry: worker.RetryPolicy{Attempts: 2}, Run: func(ctx context.Context, _ *store.ActivityTask) ([]byte, []byte, error) {
 						if crashing { // runs until the engine is gone
 							running <- struct{}{}
 							<-ctx.Done()

@@ -84,6 +84,11 @@ const (
 	// fixed code is deployed.
 	KindNonDeterministic = "non_deterministic"
 	KindStuck            = "stuck"
+	// KindCrashLoop marks the reason of an execution parked because its
+	// workflow task was claimed again and again without completing
+	// (WorkflowTask.Claims: its engines crashed or lost the lease mid-task,
+	// T11.3); ReopenParked resumes those too.
+	KindCrashLoop = "crash_loop"
 )
 
 // Status of an execution. Values are stored: never change them.
@@ -185,6 +190,11 @@ type WorkflowTask struct {
 	Pending []PendingEvent
 	// Now is the store time at the claim: the time of the TaskStarted event.
 	Now time.Time
+	// Claims counts the claims of the execution since its last completion
+	// or release, this one included: 1 normally, more when the tasks claimed
+	// before were lost (their engine crashed or lost the lease mid-task,
+	// T11.3). 0 for a task returned under a kept lease (resumed).
+	Claims int32
 }
 
 // PendingEvent is an event waiting for the next workflow task.
@@ -340,6 +350,9 @@ type NewActivityTask struct {
 	// completing owner for this long (eager execution). The resulting
 	// leases are returned by CompleteWorkflowTask.
 	ClaimFor time.Duration
+	// MaxAttempts is the total attempts the activity's retry policy allows
+	// (ActivityTask.Exhausted); 0: unknown, no limit.
+	MaxAttempts int32
 }
 
 // ActivityTask is a claimed activity task.
@@ -369,6 +382,12 @@ type ActivityTask struct {
 	// before this attempt: the worker records the cancel instead of running
 	// it.
 	CancelRequested bool
+	// Exhausted reports that this attempt is beyond the task's MaxAttempts
+	// and the previous one was lost: its lease expired without a result
+	// (its process crashed, perhaps because of the activity, or lost the
+	// lease). The worker records a final failure instead of running it
+	// (T11.3): an activity that crashes its process is not run forever.
+	Exhausted bool
 	// Trace is the trace context of the task's execution (Execution.Trace).
 	Trace []byte
 	// LegacyKey: the task's execution started before the store's key epoch
@@ -494,7 +513,9 @@ type Store interface {
 	// oldest ready ones, for ttl. Executions sticky to another owner are
 	// skipped until the stickiness expires. An execution whose kept lease
 	// (Completion.KeepFor) expired may be claimed with no pending events
-	// (a task that delivers nothing): its holder died.
+	// (a task that delivers nothing): its holder died. Each claim
+	// increments the execution's claim count (WorkflowTask.Claims), which
+	// CompleteWorkflowTask and ReleaseWorkflowTask reset.
 	ClaimWorkflowTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]WorkflowTask, error)
 	// LoadHistory returns the history events with Seq > afterSeq.
 	LoadHistory(ctx context.Context, executionID, afterSeq int64) ([]history.Event, error)
@@ -516,7 +537,8 @@ type Store interface {
 
 	// ClaimActivityTasks claims up to limit visible, unclaimed (or expired)
 	// activity tasks of the given queues, oldest first, for ttl. Each claim
-	// increments Attempt.
+	// increments Attempt, and sets Exhausted when the attempt is beyond
+	// MaxAttempts (> 0) after one whose lease expired without a result.
 	ClaimActivityTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]ActivityTask, error)
 	// ExtendActivityTask extends lease l by ttl from now.
 	ExtendActivityTask(ctx context.Context, l Lease, ttl time.Duration) error
@@ -568,7 +590,8 @@ type Store interface {
 	// process is not wrong code). ErrLeaseLost when l is no longer held.
 	NoteStuck(ctx context.Context, l Lease, seq int64) (again bool, err error)
 	// ReopenParked resumes an execution parked because its code was wrong
-	// (its ErrKinds hold KindNonDeterministic or KindStuck): it becomes
+	// (its ErrKinds hold KindNonDeterministic or KindStuck) or because its
+	// tasks never completed (KindCrashLoop): it becomes
 	// running again, its reason and stall count (NoteStuck) cleared, ready
 	// to be claimed (and replayed by the code deployed since). ErrNotFound for an unknown id,
 	// ErrNotActive when the latest execution is not parked that way.

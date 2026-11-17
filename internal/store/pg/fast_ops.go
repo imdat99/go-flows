@@ -167,6 +167,7 @@ func (s *Store) completeFast(ctx context.Context, l store.Lease, c *store.Comple
 			fb.Ints(n, func(i int) int64 { return micros(acts[i].ClaimFor) })
 			fb.Str(l.Owner)
 			fb.Bools(n, func(i int) bool { return acts[i].Uncertain })
+			fb.Ints(n, func(i int) int64 { return int64(acts[i].MaxAttempts) })
 		})
 	}
 	childAt := fb.stmts
@@ -624,14 +625,19 @@ func (s *Store) claimFast(ctx context.Context, owner string, queues []string, li
 		if i == 1 {
 			return decodeDue(v, &next)
 		}
-		if len(v) != taskWidth+claimedArrays {
+		if len(v) != taskWidth+claimedArrays+1 {
 			return fmt.Errorf("%w: %d claim columns", errBadValue, len(v))
 		}
 		var t store.WorkflowTask
 		if err := decodeTask(v[:taskWidth], &t, owner, ""); err != nil {
 			return err
 		}
-		pending, err := fb.decodePendingArrays(v[taskWidth:])
+		claims, err := decodeInt(v[taskWidth+claimedArrays])
+		if err != nil {
+			return err
+		}
+		t.Claims = int32(claims) // an int4 column
+		pending, err := fb.decodePendingArrays(v[taskWidth : taskWidth+claimedArrays])
 		if err != nil {
 			return err
 		}
@@ -777,7 +783,7 @@ func (s *Store) claimActivitiesFast(ctx context.Context, owner string, queues []
 		if i == 1 {
 			return decodeDue(v, &next)
 		}
-		if len(v) != 14 {
+		if len(v) != 15 {
 			return fmt.Errorf("%w: %d activity task columns", errBadValue, len(v))
 		}
 		t := store.ActivityTask{Lease: store.Lease{Owner: owner}}
@@ -798,6 +804,7 @@ func (s *Store) claimActivitiesFast(ctx context.Context, owner string, queues []
 		t.Uncertain = len(v[11]) == 1 && v[11][0] == 1
 		t.CompData = cloneBytes(v[12]) // NULL: nil, no allocation
 		t.Trace = cloneBytes(v[13])    // NULL without a tracer: nil
+		t.Exhausted = len(v[14]) == 1 && v[14][0] == 1
 		out = append(out, t)
 		return nil
 	})

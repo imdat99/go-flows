@@ -152,6 +152,9 @@ func Run(t *testing.T, h Harness) {
 		{"GW13_CancelBeforeRetry", testCancelBeforeRetry},
 		{"TraceContext", testTraceContext},
 		{"TraceOnCompensation", testTraceOnCompensation},
+		{"ActivityLostAttemptsExhaust", testActivityLostAttemptsExhaust},
+		{"ActivityExhaustEdges", testActivityExhaustEdges},
+		{"WorkflowClaimsCount", testWorkflowClaimsCount},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

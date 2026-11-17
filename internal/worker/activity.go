@@ -73,6 +73,18 @@ func (w *Worker) startAttempt(ctx context.Context, t *store.ActivityTask) (actx 
 // which the activity may still have had its effect (its compensator runs).
 var ErrUncertain = errors.New("outcome uncertain")
 
+// ErrAttemptsExhausted is the error of an activity whose attempts reached
+// its retry policy's limit while the last ones were lost: their lease
+// expired without a result, as when the activity crashes its process (out
+// of memory, os.Exit, a fatal runtime error). It is permanent and
+// uncertain (T11.3).
+var ErrAttemptsExhausted = errors.New("activity attempts exhausted without a result (the process running it crashed or lost its lease)")
+
+// ErrCrashLoop is the reason of an execution parked because its workflow
+// task was claimed more than Options.MaxTaskClaims times in a row without
+// completing: its engines crashed or lost the lease mid-task (T11.3).
+var ErrCrashLoop = errors.New("workflow task never completes (the process running it crashed or lost its lease each time)")
+
 // nullData is the compensation data recorded for an uncertain failure of an
 // activity that has a compensator but returned no data: it marks the
 // outcome compensable (the compensator gets the zero value). Whether an
@@ -170,6 +182,18 @@ func (w *Worker) attemptOnce(ctx, runCtx context.Context, a *Activity, t *store.
 		// if none). Before any attempt, certain.
 		return attemptOutcome{err: ErrActivityCanceled, ev: history.Event{
 			Type: history.ActivityFailed, Err: ErrActivityCanceled.Error(), ErrKinds: w.opts.Errors.Kinds(ErrActivityCanceled),
+			Permanent: true, Uncertain: t.Uncertain && !t.Compensate,
+		}}
+	}
+	if t.Exhausted {
+		// Its attempts reached the limit and the last one was lost (its
+		// process crashed, perhaps because of the activity): not run again,
+		// it fails for good (T11.3). The lost attempt may have had its
+		// effect: uncertain (the claim marked it), compensated with the
+		// kept data of such an attempt (the zero value if none).
+		err := fmt.Errorf("%w: %d attempts", ErrAttemptsExhausted, t.Attempt-1)
+		return attemptOutcome{err: err, ev: history.Event{
+			Type: history.ActivityFailed, Err: w.opts.Errors.Text(err), ErrKinds: w.opts.Errors.Kinds(err),
 			Permanent: true, Uncertain: t.Uncertain && !t.Compensate,
 		}}
 	}

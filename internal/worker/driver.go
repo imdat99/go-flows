@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"time"
 
@@ -321,6 +322,7 @@ func (d *driver) nextResumeBuffer() *store.WorkflowTask {
 func (d *driver) complete(pollCtx context.Context, task *store.WorkflowTask, c *store.Completion) *store.WorkflowTask {
 	w := d.w
 	stopping := pollCtx.Err() != nil
+	w.attemptLimits(c)
 	eager := d.eager(c, stopping)
 	for i := range c.Locks {
 		// A lock outlives a lease of this worker (saga: raised to LeaseTTL).
@@ -411,6 +413,9 @@ func (d *driver) stickyTimer(c *store.Completion) time.Time {
 // task was handed back or parked.
 func (d *driver) execute(task *store.WorkflowTask) *store.Completion {
 	w := d.w
+	if task.Claims > 1 && d.crashLoop(task) {
+		return nil
+	}
 	if d.compensating || task.Execution.Status == store.StatusCompensating {
 		d.compensating = true
 		d.evict()
@@ -562,6 +567,19 @@ func (d *driver) eager(c *store.Completion, stopping bool) []int {
 	return idx
 }
 
+// attemptLimits records with each activity task its retry policy's total
+// attempts (store.NewActivityTask.MaxAttempts), as this binary defines it:
+// a claim beyond it after a lost attempt ends the task (T11.3). Unknown
+// here (defined only where it runs): 0, no limit.
+func (w *Worker) attemptLimits(c *store.Completion) {
+	for i := range c.Activities {
+		t := &c.Activities[i]
+		if a, ok := w.acts.Activity(t.Name, t.Compensate); ok {
+			t.MaxAttempts = int32(min(max(a.Retry.Attempts, 1), math.MaxInt32))
+		}
+	}
+}
+
 // runsQueue reports whether the worker runs tasks of queue q.
 func (w *Worker) runsQueue(q string) bool { return slices.Contains(w.opts.Queues, q) }
 
@@ -700,24 +718,53 @@ func (d *driver) fail(task *store.WorkflowTask, err error) {
 	if park {
 		w.log.LogAttrs(d.ctx, slog.LevelError, "flows: workflow code is wrong, parking",
 			slog.String("instance", task.Execution.InstanceID), slog.Any("error", err))
-		c := &store.Completion{Status: store.StatusNeedsAttention, Err: w.opts.Errors.Text(err), ErrKinds: w.opts.Errors.Kinds(err)}
-		_, cerr := w.st.CompleteWorkflowTask(d.ctx, d.lease, c)
-		if cerr != nil && !errors.Is(cerr, store.ErrLeaseLost) {
-			w.log.LogAttrs(d.ctx, slog.LevelError, "flows: park", slog.Any("error", cerr))
-			d.release(w.opts.HandBack)
-			return
-		}
-		d.held = false
-		d.untrack()
-		if cerr == nil {
-			d.taskStatus = c.Status
-			w.ended(&task.Execution, c.Status, c.Err, c.ErrKinds)
-		}
+		d.park(task, err, w.opts.Errors.Kinds(err))
 		return
 	}
 	w.log.LogAttrs(d.ctx, slog.LevelError, "flows: workflow task failed, handing back",
 		slog.String("instance", task.Execution.InstanceID), slog.Any("error", err))
 	d.release(w.opts.HandBack)
+}
+
+// park parks the task's execution as needs_attention for err (its kinds
+// recorded), handing it back if the park is not stored.
+func (d *driver) park(task *store.WorkflowTask, err error, kinds string) {
+	w := d.w
+	c := &store.Completion{Status: store.StatusNeedsAttention, Err: w.opts.Errors.Text(err), ErrKinds: kinds}
+	_, cerr := w.st.CompleteWorkflowTask(d.ctx, d.lease, c)
+	if cerr != nil && !errors.Is(cerr, store.ErrLeaseLost) {
+		w.log.LogAttrs(d.ctx, slog.LevelError, "flows: park", slog.Any("error", cerr))
+		d.release(w.opts.HandBack)
+		return
+	}
+	d.held = false
+	d.untrack()
+	if cerr == nil {
+		d.taskStatus = c.Status
+		w.ended(&task.Execution, c.Status, c.Err, c.ErrKinds)
+	}
+}
+
+// crashLoop parks, instead of running it, a task of a running execution
+// claimed more than MaxTaskClaims times in a row without completing: the
+// tasks before were lost mid-way, their engine crashed (perhaps because of
+// this workflow: its replay or its code exhausts the memory, exits) or lost
+// the lease every time (T11.3). Parked, never failed (as wrong code): it is
+// resumed by ReopenParked. Compensations run no workflow code: never
+// parked so.
+func (d *driver) crashLoop(task *store.WorkflowTask) bool {
+	w := d.w
+	if w.opts.MaxTaskClaims <= 0 || int(task.Claims) <= w.opts.MaxTaskClaims ||
+		d.compensating || task.Execution.Status != store.StatusRunning {
+		return false
+	}
+	err := fmt.Errorf("%w: claimed %d times without completing", ErrCrashLoop, task.Claims)
+	d.taskErr = err
+	d.evict()
+	w.log.LogAttrs(d.ctx, slog.LevelError, "flows: workflow task never completes, parking",
+		slog.String("instance", task.Execution.InstanceID), slog.Int("claims", int(task.Claims)))
+	d.park(task, err, store.KindCrashLoop) // whatever the codec: ReopenParked looks for it
+	return true
 }
 
 // ended tells the observer of a committed end or park.

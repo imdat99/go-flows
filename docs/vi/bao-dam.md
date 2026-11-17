@@ -23,6 +23,16 @@ của execution, với `(execution, seq)` duy nhất.
 khác, và kết quả đến muộn của nó bị fencing từ chối (chaos test B). Dùng
 `Key` để hiệu ứng xảy ra một lần (`idem.Do`).
 
+**Việc làm sập process không bị thử lại vô hạn.** Attempt bị mất được tính
+vào retry policy của activity: khi số attempt chạm giới hạn của policy mà
+attempt cuối bị mất (activity làm chết process: hết bộ nhớ, `os.Exit`, lỗi
+fatal của runtime), engine tiếp theo không chạy lại mà cho nó thất bại
+vĩnh viễn với `ErrAttemptsExhausted`, không chắc chắn (vẫn được bù trừ),
+như mọi thất bại cuối cùng (chaos test I). Workflow task bị claim quá
+`MaxTaskClaims` lần liên tiếp (mặc định 10) mà không hoàn tất thì execution
+bị park (`ErrCrashLoop`), không bao giờ fail; `Engine.Resume` cho nó chạy
+lại khi nguyên nhân đã được sửa.
+
 **Fencing.** Mọi lần ghi cho một execution đang chạy hoặc một activity task
 đều kiểm tra `owner_id` và `lease_version` trên dòng đã khoá:
 

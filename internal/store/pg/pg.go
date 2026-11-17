@@ -176,9 +176,10 @@ const executionColumns = `id, instance_id, workflow, version, queue, status, par
 
 // taskColumns are executionColumns without input and output: tasks do
 // not carry them (store.WorkflowTask). A claim's row (taskColumns, three
-// more, then the pending arrays) stays within 32 columns: pgx reallocates
-// a row's values whenever row widths on a connection differ by more than
-// 32 (pgproto3.DataRow.Decode), as against the one-column due rows.
+// more, the pending arrays, then the claim count) stays within 33 columns:
+// pgx reallocates a row's values whenever their capacity (the widest row so
+// far, at least 32) exceeds a row's width by more than 32
+// (pgproto3.DataRow.Decode), as the one-column due rows would then.
 const taskColumns = `id, instance_id, workflow, version, queue, status, parent_id, parent_sched,
 	err, err_kinds, created_at, ended_at, trace`
 
@@ -461,13 +462,16 @@ var claimTail = `
 	, u AS (
 		UPDATE flows.execution e
 		SET owner_id = $2, lease_version = e.lease_version + 1,
-		    locked_until = now() + $4::bigint * interval '1 microsecond', not_before = NULL
+		    locked_until = now() + $4::bigint * interval '1 microsecond', not_before = NULL,
+		    -- Claims since the last completion or release (T11.3).
+		    claims = e.claims + 1
 		WHERE e.id = ANY(ARRAY(SELECT id FROM c)) -- a join may scan the table (generic plans)
 		RETURNING e.id, e.instance_id, e.workflow, e.version, e.queue, e.status, e.parent_id, e.parent_sched,
 		          e.err, e.err_kinds, e.created_at, e.ended_at, e.trace,
-		          e.lease_version, e.last_seq
+		          e.lease_version, e.last_seq, e.claims
 	)
-	SELECT u.*, now(), a.*
+	SELECT u.id, u.instance_id, u.workflow, u.version, u.queue, u.status, u.parent_id, u.parent_sched,
+	       u.err, u.err_kinds, u.created_at, u.ended_at, u.trace, u.lease_version, u.last_seq, now(), a.*, u.claims
 	FROM u CROSS JOIN LATERAL ( -- an aggregate without GROUP BY: one row, even without events
 		SELECT ` + pendingAggs + `
 		FROM flows.pending_event p WHERE p.execution_id = u.id AND p.visible_at <= now()
@@ -616,7 +620,8 @@ type claimedEvents struct {
 }
 
 // readClaimed reads claimWorkflow's rows: the execution, the lease version,
-// last seq and store time, then its pending events as arrays.
+// last seq and store time, its pending events as arrays, then the claim
+// count.
 func readClaimed(rows pgx.Rows, owner string) ([]store.WorkflowTask, error) {
 	defer rows.Close()
 	var tasks []store.WorkflowTask
@@ -625,7 +630,7 @@ func readClaimed(rows pgx.Rows, owner string) ([]store.WorkflowTask, error) {
 		var t store.WorkflowTask
 		e, err := scanTask(rows, &t.Lease.Version, &t.LastSeq, &t.Now,
 			&a.ids, &a.types, &a.scheds, &a.attempts, &a.names, &a.versions, &a.refs, &a.queues, &a.hashes,
-			&a.payloads, &a.comps, &a.errs, &a.kinds, &a.uncertain, &a.permanent, &a.ats)
+			&a.payloads, &a.comps, &a.errs, &a.kinds, &a.uncertain, &a.permanent, &a.ats, &t.Claims)
 		if err != nil {
 			return nil, err
 		}
@@ -768,7 +773,7 @@ func (s *Store) ReleaseWorkflowTask(ctx context.Context, l store.Lease, delay ti
 
 const releaseWorkflow = `
 	UPDATE flows.execution
-	SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL, due_owner = '',
+	SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL, due_owner = '', claims = 0,
 	    ready_at = (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
 	    not_before = CASE WHEN $2::bigint > 0 THEN now() + $2::bigint * interval '1 microsecond' END
 	WHERE id = $1
@@ -923,19 +928,20 @@ const deletePending = `
 	  AND (id = ANY($2::bigint[]) OR (type = ` + typeTimerFired + ` AND schedule_id = ANY($3::int[])))`
 
 // insertActivities creates activity tasks; those with a claim duration are
-// created leased to $8 (eager execution).
+// created leased to $8 (eager execution). $10 are their MaxAttempts.
 const insertActivities = `
 	INSERT INTO flows.activity_task (execution_id, instance_id, schedule_id, compensate, name, queue, input,
-	                                 attempt, owner_id, lease_version, locked_until, visible_at, uncertain, trace)
+	                                 attempt, owner_id, lease_version, locked_until, visible_at, uncertain, trace,
+	                                 max_attempts)
 	SELECT $1, e.instance_id, u.sched, u.comp, u.name, u.queue, u.input,
 	       CASE WHEN u.claim > 0 THEN 1 ELSE 0 END,
 	       CASE WHEN u.claim > 0 THEN $8 ELSE '' END,
 	       CASE WHEN u.claim > 0 THEN 1 ELSE 0 END,
 	       CASE WHEN u.claim > 0 THEN now() + u.claim * interval '1 microsecond' END,
-	       now() + greatest(u.claim, 0) * interval '1 microsecond', u.uncertain, e.trace
+	       now() + greatest(u.claim, 0) * interval '1 microsecond', u.uncertain, e.trace, u.max_attempts
 	FROM flows.execution e,
-	     unnest($2::int[], $3::boolean[], $4::text[], $5::text[], $6::bytea[], $7::bigint[], $9::boolean[])
-	       AS u(sched, comp, name, queue, input, claim, uncertain)
+	     unnest($2::int[], $3::boolean[], $4::text[], $5::text[], $6::bytea[], $7::bigint[], $9::boolean[], $10::int[])
+	       AS u(sched, comp, name, queue, input, claim, uncertain, max_attempts)
 	WHERE e.id = $1
 	RETURNING id, schedule_id, compensate, owner_id,
 	          CASE WHEN owner_id = '' THEN ` + notifyA + "queue)" + ` END`
@@ -1222,6 +1228,7 @@ const updateRunning = `
 	UPDATE flows.execution e
 	SET last_seq = CASE WHEN $2::bigint > 0 THEN $2::bigint ELSE e.last_seq END,
 	    status = v.status,
+	    claims = 0, -- completed: the claims start over (T11.3)
 	    err = CASE WHEN $3::text IN ('needs_attention', 'compensating') THEN $7::text ELSE e.err END,
 	    err_kinds = CASE WHEN $3::text IN ('needs_attention', 'compensating') THEN $8::text ELSE e.err_kinds END,
 	    -- A kept lease is claimable at its expiry: events delivered under it
@@ -1507,13 +1514,13 @@ func (s *Store) queueCompletion(b *pgx.Batch, l store.Lease, c *store.Completion
 		scheds, comps := make([]int32, n), make([]bool, n)
 		names, queues := make([]string, n), make([]string, n)
 		inputs, claims := make([][]byte, n), make([]int64, n)
-		uncertain := make([]bool, n)
+		uncertain, maxAttempts := make([]bool, n), make([]int32, n)
 		for i, a := range c.Activities {
 			scheds[i], comps[i], names[i], queues[i], inputs[i], claims[i] = a.ScheduleID, a.Compensate, a.Name, a.Queue, a.Input, micros(a.ClaimFor)
-			uncertain[i] = a.Uncertain
+			uncertain[i], maxAttempts[i] = a.Uncertain, a.MaxAttempts
 		}
 		sh.activityAt = sh.statements
-		queue(insertActivities, l.ID, scheds, comps, names, queues, inputs, claims, l.Owner, uncertain)
+		queue(insertActivities, l.ID, scheds, comps, names, queues, inputs, claims, l.Owner, uncertain, maxAttempts)
 	}
 	sh.childAt = sh.statements
 	for _, ch := range c.Children {
@@ -1636,9 +1643,14 @@ func readCompletion(br pgx.BatchResults, sh completionShape, children []store.Ne
 // Each queue (deduplicated) is read on its own, as in claimWorkflow.
 const claimActivities = `
 	WITH c AS (
-		SELECT x.id, x.execution_id FROM (SELECT DISTINCT unnest($1::text[])) AS q(name)
+		SELECT x.id, x.execution_id, x.exhausted FROM (SELECT DISTINCT unnest($1::text[])) AS q(name)
 		CROSS JOIN LATERAL (
-			SELECT id, execution_id, visible_at FROM flows.activity_task
+			-- The row as locked (FOR UPDATE re-reads a row updated meanwhile).
+			-- A lease that expired without a result was a lost attempt: the
+			-- one beyond max_attempts after it is not run (T11.3).
+			SELECT id, execution_id, visible_at,
+			       owner_id <> '' AND max_attempts > 0 AND attempt >= max_attempts AS exhausted
+			FROM flows.activity_task
 			WHERE queue = q.name AND visible_at <= now()
 			ORDER BY visible_at, id
 			LIMIT $3::bigint
@@ -1661,7 +1673,8 @@ const claimActivities = `
 	    visible_at = now() + $4::bigint * interval '1 microsecond'
 	WHERE t.id = ANY(ARRAY(SELECT id FROM c)) -- a join may scan the table (generic plans)
 	RETURNING t.id, t.lease_version, t.execution_id, t.instance_id, t.schedule_id, t.name, t.queue,
-	          t.input, t.compensate, t.attempt, t.cancel_requested, t.uncertain, t.comp_data, t.trace`
+	          t.input, t.compensate, t.attempt, t.cancel_requested, t.uncertain, t.comp_data, t.trace,
+	          (SELECT c.exhausted FROM c WHERE c.id = t.id)`
 
 // ClaimActivityTasks implements store.Store.
 func (s *Store) ClaimActivityTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]store.ActivityTask, error) {
@@ -1700,7 +1713,8 @@ func (s *Store) claimActivityTasks(ctx context.Context, owner string, queues []s
 		for rows.Next() {
 			var t store.ActivityTask
 			if err := rows.Scan(&t.Lease.ID, &t.Lease.Version, &t.ExecutionID, &t.InstanceID, &t.ScheduleID,
-				&t.Name, &t.Queue, &t.Input, &t.Compensate, &t.Attempt, &t.CancelRequested, &t.Uncertain, &t.CompData, &t.Trace); err != nil {
+				&t.Name, &t.Queue, &t.Input, &t.Compensate, &t.Attempt, &t.CancelRequested, &t.Uncertain, &t.CompData, &t.Trace,
+				&t.Exhausted); err != nil {
 				rows.Close()
 				return err
 			}

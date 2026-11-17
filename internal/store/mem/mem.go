@@ -137,6 +137,8 @@ type execution struct {
 	// stuckSeq is the history position of the last stall (NoteStuck).
 	stuckSeq   int64
 	stuckNoted bool
+	// claims since the last completion or release (WorkflowTask.Claims).
+	claims int32
 }
 
 type pending struct {
@@ -152,6 +154,7 @@ type activityTask struct {
 	lockedUntil     time.Time
 	created         int64
 	cancelRequested bool
+	maxAttempts     int32 // store.NewActivityTask.MaxAttempts
 }
 
 var (
@@ -468,8 +471,11 @@ func (s *Store) ClaimWorkflowTasks(_ context.Context, owner string, queues []str
 		e := c.e
 		e.lease = store.Lease{ID: e.ID, Owner: owner, Version: e.lease.Version + 1}
 		e.lockedUntil, e.forceReady = now.Add(ttl), false
+		e.claims++
 		s.extendLocks(e.ID, now)
-		out = append(out, e.task(now))
+		task := e.task(now)
+		task.Claims = e.claims
+		out = append(out, task)
 	}
 	return out, nil
 }
@@ -519,6 +525,7 @@ func (s *Store) CompleteWorkflowTask(ctx context.Context, l store.Lease, c *stor
 			return nil, err
 		}
 	}
+	e.claims = 0 // completed: the claims start over
 	for _, ev := range c.History {
 		e.history = append(e.history, cloneEvent(ev))
 	}
@@ -676,7 +683,8 @@ func (s *Store) createActivities(e *execution, owner string, acts []store.NewAct
 		t := &activityTask{
 			ExecutionID: e.ID, InstanceID: e.InstanceID, ScheduleID: a.ScheduleID, Name: a.Name,
 			Queue: a.Queue, Input: clone(a.Input), Compensate: a.Compensate, Uncertain: a.Uncertain, visibleAt: now,
-			Trace: e.Trace, // never modified: shared, copied out by claims
+			Trace:       e.Trace, // never modified: shared, copied out by claims
+			maxAttempts: a.MaxAttempts,
 		}
 		t.Lease.ID = s.id()
 		t.created = t.Lease.ID
@@ -785,6 +793,7 @@ func (s *Store) ReleaseWorkflowTask(_ context.Context, l store.Lease, delay time
 	e.lockedUntil, e.lease.Owner = time.Time{}, ""
 	e.stickyOwner, e.stickyUntil = "", time.Time{}
 	e.notBefore = now.Add(delay)
+	e.claims = 0            // given back by a live owner: not lost
 	if len(e.pending) > 0 { // now or after the delay: announced (T9.1)
 		s.hint(store.WorkflowWork, e.Queue)
 	}
@@ -827,8 +836,9 @@ func (s *Store) ClaimActivityTasks(_ context.Context, owner string, queues []str
 		if len(out) == limit {
 			break
 		}
-		if t.Lease.Owner != "" && !t.Compensate {
-			t.Uncertain = true // its lease expired without a result: the attempt may have run
+		lost := t.Lease.Owner != "" // its lease expired without a result
+		if lost && !t.Compensate {
+			t.Uncertain = true // the attempt may have run
 		}
 		t.Lease.Owner, t.Lease.Version = owner, t.Lease.Version+1
 		t.Attempt++
@@ -837,6 +847,7 @@ func (s *Store) ClaimActivityTasks(_ context.Context, owner string, queues []str
 		at := t.ActivityTask
 		at.Input, at.CompData, at.Trace = clone(at.Input), clone(at.CompData), clone(at.Trace)
 		at.CancelRequested = t.cancelRequested
+		at.Exhausted = lost && t.maxAttempts > 0 && t.Attempt > t.maxAttempts
 		out = append(out, at)
 	}
 	return out, nil
@@ -1181,7 +1192,8 @@ func (s *Store) ReopenParked(_ context.Context, instanceID string) error {
 	e := s.executions[id]
 	kinds := strings.Split(e.ErrKinds, ",")
 	if e.Status != store.StatusNeedsAttention ||
-		!slices.Contains(kinds, store.KindNonDeterministic) && !slices.Contains(kinds, store.KindStuck) {
+		!slices.Contains(kinds, store.KindNonDeterministic) && !slices.Contains(kinds, store.KindStuck) &&
+			!slices.Contains(kinds, store.KindCrashLoop) {
 		return store.ErrNotActive
 	}
 	s.setStatus(e, store.StatusRunning)

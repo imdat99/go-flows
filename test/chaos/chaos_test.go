@@ -34,7 +34,7 @@ import (
 
 // Child process protocol, passed through the environment.
 const (
-	envMode  = "FLOWS_CHAOS_CHILD" // hang | pause | many | comp-hang | lock-hang | wf-pause | wf-short | tree
+	envMode  = "FLOWS_CHAOS_CHILD" // hang | pause | many | comp-hang | lock-hang | wf-pause | wf-short | tree | exit
 	envDSN   = "FLOWS_CHAOS_DSN"
 	envRuns  = "FLOWS_CHAOS_RUNS"
 	envTTL   = "FLOWS_CHAOS_TTL" // the child's LeaseTTL (default leaseTTL)
@@ -229,6 +229,8 @@ func child(mode string) int {
 		childFenced(ctx, eng)
 	case "tree":
 		childTrees(ctx, eng)
+	case "exit":
+		childExit(ctx, eng)
 	default:
 		childOrders(ctx, eng)
 	}

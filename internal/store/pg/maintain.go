@@ -234,12 +234,13 @@ const reopenCompensation = `
 	SELECT ` + notifyW + "queue)" + ` FROM e`
 
 // reopenParked makes the latest execution of $1, parked because its code
-// was wrong, running and ready again; its stall count starts over (T9.3).
+// was wrong or its tasks never completed (T11.3), running and ready again;
+// its stall count starts over (T9.3), as its claim count did with the park.
 const reopenParked = `
 	UPDATE flows.execution SET status = 'running', err = '', err_kinds = '', stuck_seq = NULL, ready_at = now()
 	WHERE id = ` + latestOf + `
 	  AND status = 'needs_attention'
-	  AND string_to_array(err_kinds, ',') && ARRAY['` + store.KindNonDeterministic + `', '` + store.KindStuck + `']
+	  AND string_to_array(err_kinds, ',') && ARRAY['` + store.KindNonDeterministic + `', '` + store.KindStuck + `', '` + store.KindCrashLoop + `']
 	RETURNING ` + notifyW + "queue)"
 
 // ReopenParked implements store.Store.

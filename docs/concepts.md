@@ -33,7 +33,7 @@ Statuses of an execution:
 | --- | --- |
 | `running` | Workflow code runs or waits (activities, timers, signals, children). |
 | `compensating` | It failed or was canceled; compensators are running. |
-| `needs_attention` | Parked: its code is wrong (replay diverged from the history, `ErrNonDeterministic`; or it ran without yielding, `ErrStuck`), or a compensator failed after its retries (`ErrCompensationFailed`). Nothing runs until an operator acts: `Engine.Resume` after deploying fixed code, `Engine.RetryCompensation` after fixing the compensation's cause. |
+| `needs_attention` | Parked: its code is wrong (replay diverged from the history, `ErrNonDeterministic`; or it ran without yielding, `ErrStuck`), its task never completes (its engines crash mid-task, `ErrCrashLoop`), or a compensator failed after its retries (`ErrCompensationFailed`). Nothing runs until an operator acts: `Engine.Resume` after deploying fixed code (or fixing the crash), `Engine.RetryCompensation` after fixing the compensation's cause. |
 | `completed` | The workflow returned a result. |
 | `compensated` | It failed, and at least one compensator ran (its completed activities were undone). A child reopened for its parent's compensation also ends here. |
 | `failed` | It failed with nothing to compensate. |

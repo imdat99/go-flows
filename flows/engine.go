@@ -71,6 +71,16 @@ type Options struct {
 	// count is in the database). Each attempt leaves a goroutine running
 	// until its process exits.
 	StuckTimeout time.Duration
+	// MaxTaskClaims bounds how many times in a row a workflow task may be
+	// claimed without completing (default 10; negative: no bound): a task
+	// whose process crashes mid-way (out of memory while replaying a large
+	// history, os.Exit, a fatal runtime error in workflow code) is claimed
+	// again by another engine once its lease expires, and would take down
+	// one engine after another. Past the bound the execution is parked
+	// (ErrCrashLoop) until Engine.Resume. A completion or a hand-back
+	// starts the count over, so a task merely slow on an overloaded engine
+	// (completed by the engine that took it over) does not count.
+	MaxTaskClaims int
 	// LockHold bounds how long, past its ttl, an execution keeps a lock
 	// (Lock) while none of its code or activities runs but one of its
 	// activities waits (in its queue, for a retry, or for another engine
@@ -161,7 +171,7 @@ func newEngineWith(st store.Store, acts worker.Activities, opts Options) (*Engin
 		MaxWorkflowTasks: opts.MaxWorkflowTasks, MaxActivities: opts.MaxActivities,
 		Eager: !opts.DisableEager, EagerWindow: opts.EagerWindow, StickyFor: opts.StickyFor,
 		PollMax: opts.PollMax, CacheSize: opts.CacheSize, CacheBytes: opts.CacheBytes, Errors: errorCodec{}, Logger: opts.Logger,
-		Observer: obs, Tracer: tr, StuckTimeout: opts.StuckTimeout, LockHold: opts.LockHold,
+		Observer: obs, Tracer: tr, StuckTimeout: opts.StuckTimeout, LockHold: opts.LockHold, MaxTaskClaims: opts.MaxTaskClaims,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("flows: %w", err)
@@ -242,8 +252,10 @@ func (e *Engine) RetryCompensation(ctx context.Context, instanceID string) error
 // because its workflow code was wrong (errors.Is ErrNonDeterministic or
 // ErrStuck), once fixed code is deployed: it runs again from its history,
 // replayed by the code now registered (parked again if that still does
-// not match). ErrNotActive when the execution is not parked that way; a
-// failed compensation resumes with RetryCompensation.
+// not match). It also resumes an execution parked because its tasks never
+// completed (ErrCrashLoop), once the cause is fixed. ErrNotActive when the
+// execution is not parked that way; a failed compensation resumes with
+// RetryCompensation.
 func (e *Engine) Resume(ctx context.Context, instanceID string) error {
 	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
 		return err

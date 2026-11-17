@@ -78,6 +78,13 @@ func (plainErrors) Permanent(error) bool  { return false }
 // 256 KiB each.
 const DefaultCacheBytes = 256 << 20
 
+// DefaultMaxTaskClaims is the default Options.MaxTaskClaims: ten lost
+// tasks in a row (each one LeaseTTL, so about five minutes with the
+// default 30s) is no longer a crash or a stall that the next engine gets
+// past; a task merely slow on a busy engine is completed by the engine
+// that took it over, which starts the count over.
+const DefaultMaxTaskClaims = 10
+
 // Options configure a worker.
 type Options struct {
 	// Owner identifies this worker in leases; unique per process.
@@ -112,6 +119,11 @@ type Options struct {
 	EagerWindow time.Duration
 	// StuckTimeout bounds workflow code running without yielding.
 	StuckTimeout time.Duration
+	// MaxTaskClaims parks a running execution whose workflow task is
+	// claimed more than this many times in a row without being completed
+	// or released (ErrCrashLoop; default DefaultMaxTaskClaims, negative:
+	// never).
+	MaxTaskClaims int
 	// LockHold is store.LockRequest.Hold for the locks this worker takes
 	// (0: default 1h; negative: none).
 	LockHold time.Duration
@@ -193,6 +205,9 @@ func (o *Options) defaults() {
 	}
 	if o.EagerWindow <= 0 {
 		o.EagerWindow = 200 * time.Millisecond
+	}
+	if o.MaxTaskClaims == 0 {
+		o.MaxTaskClaims = DefaultMaxTaskClaims
 	}
 	if o.CacheSize == 0 {
 		o.CacheSize = 1000
