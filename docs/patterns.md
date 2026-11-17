@@ -4,7 +4,9 @@
 
 Each pattern is short code against the public API. Runnable programs are in
 [`examples/`](../examples): `quickstart` (activity, signal), `order`
-(compensation), `fanout` (concurrency), `outbox` (publishing events).
+(compensation), `fanout` (concurrency), `outbox` (publishing events),
+`modulith` (a modular monolith combining these across five modules, split
+into deployments by queue: [README](../examples/modulith/README.md)).
 
 ## Exactly-once effects with `idem`
 

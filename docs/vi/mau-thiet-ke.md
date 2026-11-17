@@ -4,7 +4,9 @@
 
 Mỗi mẫu là một đoạn code ngắn dùng API công khai. Chương trình chạy được nằm
 trong [`examples/`](../../examples): `quickstart` (activity, signal),
-`order` (compensation), `fanout` (đồng thời), `outbox` (phát event).
+`order` (compensation), `fanout` (đồng thời), `outbox` (phát event),
+`modulith` (modular monolith ghép các mẫu trên qua năm module, tách
+deployment theo queue: [README](../../examples/modulith/README.vi.md)).
 
 ## Hiệu ứng đúng một lần với `idem`
 

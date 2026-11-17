@@ -17,6 +17,7 @@ must take care of.
 
 ### Added
 
+- `examples/modulith`: a modular monolith blueprint (five modules, cross-module sagas, split deployments by queue).
 - `flows.InstanceID(c)` and `flows.ExecutionID(c)`: workflow code reads
   its own instance id (kept by continue-as-new) and execution id;
   deterministic under replay, no allocation (T11.9).

@@ -73,6 +73,12 @@ Bản chạy được nằm trong [`examples/`](../../examples) (quickstart, sag
 fan-out, transactional outbox). Chạy Postgres bằng
 `make up`, rồi `go run ./examples/quickstart`.
 
+Cho một hệ thống thật, [`examples/modulith`](../../examples/modulith) là
+bản mẫu một modular monolith: năm module với schema và queue riêng, saga
+và child workflow giữa các module, vòng lặp continue-as-new, lock, outbox,
+và một binary chạy thành một process hoặc tách theo module
+([README tiếng Việt](../../examples/modulith/README.vi.md)).
+
 ## Tài liệu
 
 - [Khái niệm](khai-niem.md): workflow, replay, activity, compensation, lease.
