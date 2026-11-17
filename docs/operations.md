@@ -107,13 +107,18 @@ Measured costs and their causes are in [benchmarks.md](benchmarks.md).
   expire, and another engine resumes them. Sticky executions are released at
   once, so the next engine does not wait `StickyFor`.
 - **`Stop` is bounded by `ctx`.** Once `ctx` is done, `Stop` waits at most
-  1 second more for the canceled tasks. A task blocked on a database that
-  stopped answering (a failover, a partition without RST) is abandoned:
-  its leases expire and another engine resumes it. Writes a task makes
-  after its context ends (an activity's outcome, a lease release) are bounded by
-  about `LeaseTTL`, so an abandoned task ends by itself within that time.
-  Until then it holds its pool connection: `pool.Close()` after `Stop`
-  may wait that long.
+  1 second more for the canceled tasks, then abandons those still running:
+  tasks blocked on a database that stopped answering (a failover, a
+  partition without RST), and activities that ignore their context's
+  cancellation. Before T11.2, `Stop` waited for such activities
+  indefinitely. An abandoned task's leases expire and another engine
+  resumes it, so an activity that ignores cancellation may run again while
+  it is still running in the stopped process. Writes a task makes after its
+  context ends (an activity's outcome, a lease release) are bounded by about
+  `LeaseTTL`, so a task blocked on the database ends by itself within that
+  time. Until then it holds its pool connection: `pool.Close()` after `Stop`
+  may wait that long. Sticky executions are still handed over (with a
+  budget of their own, up to 5 seconds).
 - **Claims at `Stop`.** No new claim is started after `Stop` has begun,
   apart from one already being issued (bounded by the grace period below).
   A claim already in flight may commit in the database even if canceled, so `Stop`

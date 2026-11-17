@@ -34,6 +34,20 @@ schema or behaviour change, except:
 
 - The memory store's `Executions` (used by `flowtest`) returns a copy of
   each execution's trace context instead of sharing it with the store.
+- `Engine.Stop(ctx)` honours ctx's deadline when the database stops
+  answering (a failover, a partition without RST) (T11.2). Once ctx is
+  done, Stop waits at most about 1 second more; tasks still blocked are
+  abandoned, their leases expire, and another instance resumes them.
+  Writes made after a task's context ends (activity outcomes, lease
+  releases) are now bounded by about `LeaseTTL` instead of having no
+  deadline, so an abandoned task ends by itself within that time; until
+  then `pool.Close()` may wait for its connection. An outcome given up this
+  way is redelivered (the activity runs again once its lease expires).
+  Behaviour change: Stop likewise gives up, 1 second after the deadline, on
+  activities that ignore their context's cancellation, where it used to
+  wait for them indefinitely; such an activity may run again elsewhere
+  while it still runs in the stopped process. Sticky executions are still
+  handed over at Stop (with a budget of their own, up to 5 seconds).
 
 ### Migrations
 

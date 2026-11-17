@@ -378,9 +378,10 @@ type boundedCtx struct {
 // writeCtx returns the context of a write detached from its task's (the
 // outcome of an activity, the release of a lease): Stop's deadline does not
 // cancel it, so that what is done is recorded, but it ends between
-// 3/4 LeaseTTL and LeaseTTL from now (T11.2). Past LeaseTTL the lease is
-// lost and the write would be fenced anyway, and a database that stopped
-// answering (no RST) would otherwise hold it, and its task, forever.
+// 3/4 LeaseTTL and LeaseTTL from now (T11.2): a database that stopped
+// answering (no RST) would otherwise hold it, and its task, forever. An
+// outcome given up this way is not lost but redelivered (at least once):
+// the activity's lease expires and the activity runs again.
 //
 // The context is shared by the writes of a quarter of LeaseTTL, renewed by the
 // first write after that: no allocation per write, and the store watches
@@ -428,12 +429,14 @@ var errStopping = errors.New("worker stopping")
 // continue at once.
 //
 // Once ctx is done, Stop waits stopGrace at most for the canceled tasks
-// and the rest of the shutdown: a task blocked on a database that stopped
-// answering (a failover, a partition without RST) is abandoned (T11.2). It
-// ends by itself within about LeaseTTL (writes detached from their task are
-// bounded, writeCtx; the others were canceled), and its leases expire
-// meanwhile, so another instance takes its work over. Until it ends it
-// holds its pool connection: closing the pool waits for it.
+// and the rest of the shutdown (T11.2): a task blocked on a database that
+// stopped answering (a failover, a partition without RST), or an activity
+// that ignores its context's cancellation, is abandoned (before T11.2 Stop
+// waited for it indefinitely). Its leases expire, so another instance takes
+// its work over. A task blocked on the store ends by itself within about
+// LeaseTTL (writes detached from their task are bounded, writeCtx; the
+// others were canceled); until then it holds its pool connection, and
+// closing the pool waits for it.
 func (w *Worker) Stop(ctx context.Context) error {
 	w.mu.Lock()
 	pollCancel, taskCancel := w.pollCancel, w.taskCancel
@@ -447,8 +450,27 @@ func (w *Worker) Stop(ctx context.Context) error {
 	// done.
 	over, overCancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer overCancel()
-	stopOver := context.AfterFunc(ctx, func() { time.AfterFunc(stopGrace, overCancel) })
-	defer stopOver()
+	var (
+		graceMu  sync.Mutex
+		grace    *time.Timer
+		returned bool
+	)
+	stopOver := context.AfterFunc(ctx, func() {
+		graceMu.Lock()
+		defer graceMu.Unlock()
+		if !returned {
+			grace = time.AfterFunc(stopGrace, overCancel)
+		}
+	})
+	defer func() {
+		stopOver()
+		graceMu.Lock()
+		returned = true
+		if grace != nil {
+			grace.Stop()
+		}
+		graceMu.Unlock()
+	}()
 	// A claim in flight completes (claimCtx), within stopGrace and the
 	// deadline; canceled after, it returns promptly.
 	gctx, gcancel := context.WithTimeout(ctx, stopGrace)
@@ -480,7 +502,7 @@ func (w *Worker) Stop(ctx context.Context) error {
 		w.beat.Wait()
 	})
 	if !drained {
-		w.log.LogAttrs(ctx, slog.LevelWarn, "flows: stop: tasks abandoned, blocked on the store (their leases expire)",
+		w.log.LogAttrs(ctx, slog.LevelWarn, "flows: stop: tasks abandoned, still running after the stop deadline (blocked on the store, or ignoring cancellation); their leases expire",
 			slog.Int("workflow_slots", len(w.wfSlots)), slog.Int("activity_slots", len(w.actSlots)))
 	} else if b := w.writes.Load(); b != nil {
 		b.cancel() // no write is left: free its timer
@@ -488,12 +510,40 @@ func (w *Worker) Stop(ctx context.Context) error {
 	// The cached executions are sticky to this worker: hand them over now,
 	// not when their stickiness expires.
 	w.cache.close()
-	uctx, cancel := context.WithTimeout(over, 5*time.Second)
-	if uerr := w.st.Unstick(uctx, w.opts.Owner); uerr != nil {
-		w.log.LogAttrs(uctx, slog.LevelWarn, "flows: unstick on stop", slog.Any("error", uerr))
-	}
-	cancel()
+	w.unstick(ctx, over)
 	return err
+}
+
+// unstickWait is how long Stop waits for Unstick once its own deadline
+// (over) has passed.
+const unstickWait = 250 * time.Millisecond
+
+// unstick hands the executions sticky to this worker over (Unstick), with
+// a budget of its own (min(5s, LeaseTTL)), detached from Stop's: tasks
+// abandoned at the deadline do not make it fail, and sticky executions are
+// not left waiting StickyFor. Stop waits for it until over is done, and
+// unstickWait more; on a store that does not answer, it goes on alone,
+// within its budget.
+func (w *Worker) unstick(ctx, over context.Context) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), min(5*time.Second, w.opts.LeaseTTL))
+		defer cancel()
+		if err := w.st.Unstick(uctx, w.opts.Owner); err != nil {
+			w.log.LogAttrs(uctx, slog.LevelWarn, "flows: unstick on stop", slog.Any("error", err))
+		}
+	}()
+	t := time.NewTimer(unstickWait)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-over.Done():
+		select {
+		case <-done:
+		case <-t.C:
+		}
+	}
 }
 
 // waitUntilDone runs wait and reports whether it returned before ctx was

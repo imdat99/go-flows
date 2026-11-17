@@ -186,11 +186,14 @@ func (e *Engine) Start(ctx context.Context) error { return e.w.Start(ctx) }
 // passes returns nil.
 //
 // Once ctx is done, Stop returns within about a second more even if tasks
-// are blocked on a database that stopped answering (a failover, a network
-// partition without RST): those tasks are abandoned, their leases expire
-// and another instance resumes their work. An abandoned task ends by
-// itself within about LeaseTTL (its writes are bounded by it); until then
-// it holds its pool connection, so closing the pool may wait that long.
+// are still running: tasks blocked on a database that stopped answering (a
+// failover, a network partition without RST), and activities that ignore
+// their context's cancellation, are abandoned (Stop used to wait for
+// such activities indefinitely). Their leases expire and another instance
+// resumes their work: an abandoned activity may run again while it is still
+// running here. A task blocked on the database ends by itself within about
+// LeaseTTL (its writes are bounded by it); until then it holds its pool
+// connection, so closing the pool may wait that long.
 func (e *Engine) Stop(ctx context.Context) error { return e.w.Stop(ctx) }
 
 // Signal sends a signal called name with payload (JSON-encoded) to the

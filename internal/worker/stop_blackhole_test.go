@@ -11,10 +11,78 @@ import (
 
 	"github.com/imdat99/go-flows/internal/coro"
 	"github.com/imdat99/go-flows/internal/store"
+	"github.com/imdat99/go-flows/internal/store/mem"
 	"github.com/imdat99/go-flows/internal/store/pg"
 	"github.com/imdat99/go-flows/internal/testdb"
 	"github.com/imdat99/go-flows/internal/worker"
 )
+
+// unstickSpy reports the context error Unstick was called with.
+type unstickSpy struct {
+	*mem.Store
+	called chan error
+}
+
+func (s *unstickSpy) Unstick(ctx context.Context, owner string) error {
+	s.called <- ctx.Err()
+	return s.Store.Unstick(ctx, owner)
+}
+
+// T11.2: an activity that ignores its context's cancellation is abandoned
+// stopGrace after Stop's deadline (Stop no longer waits for it
+// indefinitely), and the sticky executions are still handed over: Unstick
+// gets a budget of its own, not what is left of Stop's.
+func TestStopAbandonsActivityIgnoringCancellation(t *testing.T) {
+	const deadline = 300 * time.Millisecond
+	st := &unstickSpy{Store: mem.New(nil), called: make(chan error, 2)}
+	running, release := make(chan struct{}), make(chan struct{})
+	reg := newRegistry()
+	reg.addActivity("deaf", &worker.Activity{Run: func(context.Context, *store.ActivityTask) ([]byte, []byte, error) {
+		close(running)
+		<-release // ignores ctx
+		return nil, nil, nil
+	}})
+	reg.addWorkflow("w", func(ctx coro.Context, _ []byte) ([]byte, error) { return activity(ctx, "deaf", nil) })
+	w, err := worker.New(st, reg, reg, worker.Options{Owner: "w1", Queues: []string{q}, Eager: true, LeaseTTL: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		close(release)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = w.Stop(ctx)
+	})
+	create(t, st, "w", "w", "")
+	select {
+	case <-running:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the activity did not run")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+	start := time.Now()
+	err = w.Stop(ctx)
+	d := time.Since(start)
+	t.Logf("Stop returned after %v: %v", d, err)
+	if err == nil {
+		t.Fatal("Stop abandoned a task and returned nil")
+	}
+	if d > deadline+3*time.Second {
+		t.Fatalf("Stop returned after %v, deadline %v", d, deadline)
+	}
+	select {
+	case cerr := <-st.called:
+		if cerr != nil {
+			t.Fatalf("Unstick called with a done context: %v", cerr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Unstick not called")
+	}
+}
 
 // logTap records the time of the first log record whose message contains
 // want (it never calls t.Logf: abandoned tasks may log after the test).

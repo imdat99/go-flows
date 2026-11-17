@@ -106,6 +106,17 @@ Chi phí đo được và nguyên nhân nằm trong [benchmarks.md](../benchmark
   chạy cho tới khi `ctx` kết thúc, rồi huỷ phần còn lại. Lease của chúng được
   nhả hoặc để hết hạn, và engine khác chạy tiếp. Các execution đang sticky
   được nhả ngay, nên engine kế tiếp không phải chờ `StickyFor`.
+- **`Stop` bị giới hạn bởi `ctx`.** Khi `ctx` đã kết thúc, `Stop` chờ thêm
+  tối đa 1 giây cho các task đã bị huỷ, rồi bỏ lại những task vẫn còn chạy:
+  task đang kẹt vì database ngừng trả lời (failover, mạng rớt không có RST),
+  và activity bỏ qua việc context bị huỷ. Trước T11.2, `Stop` chờ những
+  activity như vậy vô hạn. Lease của task bị bỏ lại sẽ hết hạn và engine khác
+  chạy tiếp, nên activity bỏ qua việc huỷ có thể chạy lại trong khi vẫn còn
+  chạy ở process đã dừng. Các lần ghi sau khi context của task kết thúc (kết
+  quả activity, nhả lease) bị giới hạn khoảng `LeaseTTL`, nên task kẹt vì
+  database tự kết thúc trong khoảng đó. Tới lúc ấy nó vẫn giữ kết nối của
+  pool: `pool.Close()` sau `Stop` có thể phải chờ chừng đó. Các execution
+  sticky vẫn được nhả (với thời hạn riêng, tối đa 5 giây).
 - **Claim lúc `Stop`.** Khi `Stop` đã bắt đầu thì không claim mới nào được
   bắt đầu nữa, trừ một claim đang được gửi đi (giới hạn bởi thời gian chờ
   bên dưới). Claim đang chạy dở có thể đã commit trong database dù bị huỷ, nên

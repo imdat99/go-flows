@@ -16,24 +16,25 @@ import (
 // on reads that never return. Thaw resumes forwarding (what was held is
 // delivered).
 type Proxy struct {
-	l      net.Listener
-	target string
+	l          net.Listener
+	targetHost string
+	targetPort uint16
 
 	mu     sync.Mutex
 	thawed chan struct{} // closed while forwarding; replaced by Freeze
-	conns  []net.Conn
+	conns  map[net.Conn]struct{}
 	closed bool
 	wg     sync.WaitGroup
 }
 
-func newProxy(tb testing.TB, target string) *Proxy {
+func newProxy(tb testing.TB, host string, port uint16) *Proxy {
 	tb.Helper()
 	var lc net.ListenConfig
 	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		tb.Fatalf("testdb: proxy listen: %v", err)
 	}
-	p := &Proxy{l: l, target: target, thawed: make(chan struct{})}
+	p := &Proxy{l: l, targetHost: host, targetPort: port, thawed: make(chan struct{}), conns: make(map[net.Conn]struct{})}
 	close(p.thawed)
 	p.wg.Go(p.accept)
 	return p
@@ -43,6 +44,15 @@ func newProxy(tb testing.TB, target string) *Proxy {
 func (p *Proxy) Port() uint16 {
 	a, _ := p.l.Addr().(*net.TCPAddr) // a TCP listener
 	return uint16(a.Port)
+}
+
+// DirectConfig returns a copy of cfg (a proxied pool's) that connects to
+// the server directly, bypassing the proxy: another engine on the same
+// database that a freeze does not affect.
+func (p *Proxy) DirectConfig(cfg *pgxpool.Config) *pgxpool.Config {
+	c := cfg.Copy()
+	c.ConnConfig.Host, c.ConnConfig.Port = p.targetHost, p.targetPort
+	return c
 }
 
 // Freeze stops forwarding (idempotent).
@@ -84,10 +94,10 @@ func (p *Proxy) Close() {
 	p.mu.Lock()
 	p.closed = true
 	conns := p.conns
-	p.conns = nil
+	p.conns = make(map[net.Conn]struct{})
 	p.mu.Unlock()
 	_ = p.l.Close()
-	for _, c := range conns {
+	for c := range conns {
 		_ = c.Close()
 	}
 	p.wg.Wait()
@@ -99,11 +109,20 @@ func (p *Proxy) track(c net.Conn) bool {
 	if p.closed {
 		return false
 	}
-	p.conns = append(p.conns, c)
+	p.conns[c] = struct{}{}
 	return true
 }
 
+func (p *Proxy) untrack(cs ...net.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, c := range cs {
+		delete(p.conns, c)
+	}
+}
+
 func (p *Proxy) accept() {
+	target := net.JoinHostPort(p.targetHost, strconv.Itoa(int(p.targetPort)))
 	for {
 		c, err := p.l.Accept()
 		if err != nil {
@@ -115,12 +134,13 @@ func (p *Proxy) accept() {
 				return
 			}
 			var d net.Dialer
-			u, err := d.DialContext(context.Background(), "tcp", p.target)
+			u, err := d.DialContext(context.Background(), "tcp", target)
 			if err != nil || !p.track(u) {
 				_ = c.Close()
 				if u != nil {
 					_ = u.Close()
 				}
+				p.untrack(c, u)
 				return
 			}
 			p.wg.Go(func() { p.pipe(u, c) })
@@ -129,7 +149,8 @@ func (p *Proxy) accept() {
 	}
 }
 
-// pipe copies src to dst, holding what it read while frozen.
+// pipe copies src to dst, holding what it read while frozen; it closes
+// both ends when either fails (the other direction's pipe then ends too).
 func (p *Proxy) pipe(dst, src net.Conn) {
 	buf := make([]byte, 32<<10)
 	for {
@@ -148,6 +169,7 @@ func (p *Proxy) pipe(dst, src net.Conn) {
 	}
 	_ = dst.Close()
 	_ = src.Close()
+	p.untrack(dst, src)
 }
 
 // NewProxied returns a pool as New does, whose connections go through a
@@ -164,8 +186,8 @@ func NewProxied(tb testing.TB, configure ...func(*pgxpool.Config)) (*pgxpool.Poo
 	if err != nil {
 		tb.Fatalf("testdb: parse dsn: %v", err)
 	}
-	target := net.JoinHostPort(cfg.ConnConfig.Host, strconv.Itoa(int(cfg.ConnConfig.Port)))
-	p := newProxy(tb, target)
+	p := newProxy(tb, cfg.ConnConfig.Host, cfg.ConnConfig.Port)
+	tb.Cleanup(p.Close) // runs last: after the pool's cleanup below
 	name := createDB(tb)
 	cfg.ConnConfig.Database = name
 	cfg.ConnConfig.Host = "127.0.0.1"
@@ -176,13 +198,12 @@ func NewProxied(tb testing.TB, configure ...func(*pgxpool.Config)) (*pgxpool.Poo
 	}
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
-		p.Close()
+		dropDB(name)
 		tb.Fatalf("testdb: pool: %v", err)
 	}
 	tb.Cleanup(func() {
 		p.Thaw()
 		pool.Close()
-		p.Close()
 		dropDB(name)
 	})
 	return pool, p
