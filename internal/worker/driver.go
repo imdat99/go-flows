@@ -746,12 +746,15 @@ func (d *driver) park(task *store.WorkflowTask, err error, kinds string) {
 }
 
 // crashLoop parks, instead of running it, a task of a running execution
-// claimed more than MaxTaskClaims times in a row without completing: the
+// claimed more than MaxTaskClaims times without completing (hand-backs aside): the
 // tasks before were lost mid-way, their engine crashed (perhaps because of
 // this workflow: its replay or its code exhausts the memory, exits) or lost
 // the lease every time (T11.3). Parked, never failed (as wrong code): it is
-// resumed by ReopenParked. Compensations run no workflow code: never
-// parked so.
+// resumed by ReopenParked. A compensating execution is not parked so (a
+// known gap, docs/guarantees.md): its tasks run no workflow code (its
+// compensators are activity tasks, bounded by their attempts), and
+// ReopenParked, which makes the execution running again to replay its
+// code, has no way back to compensating.
 func (d *driver) crashLoop(task *store.WorkflowTask) bool {
 	w := d.w
 	if w.opts.MaxTaskClaims <= 0 || int(task.Claims) <= w.opts.MaxTaskClaims ||

@@ -8,9 +8,10 @@
 -- in the scheduling binary), no limit.
 ALTER TABLE flows.activity_task ADD COLUMN IF NOT EXISTS max_attempts integer NOT NULL DEFAULT 0;
 
--- Workflow task claims since the execution's last completion or release
--- (store.WorkflowTask.Claims, T11.3): an execution claimed again and again
--- without its task ever completing (its engine crashes mid-task) is parked.
+-- Workflow task claims since the execution's last completed task, less its
+-- releases (store.WorkflowTask.Claims, T11.3): an execution claimed again
+-- and again without its task ever completing (its engine crashes mid-task)
+-- is parked.
 ALTER TABLE flows.execution ADD COLUMN IF NOT EXISTS claims integer NOT NULL DEFAULT 0;
 
 -- +goose Down

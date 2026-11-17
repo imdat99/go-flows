@@ -190,10 +190,11 @@ type WorkflowTask struct {
 	Pending []PendingEvent
 	// Now is the store time at the claim: the time of the TaskStarted event.
 	Now time.Time
-	// Claims counts the claims of the execution since its last completion
-	// or release, this one included: 1 normally, more when the tasks claimed
-	// before were lost (their engine crashed or lost the lease mid-task,
-	// T11.3). 0 for a task returned under a kept lease (resumed).
+	// Claims counts the claims of the execution since its last completion,
+	// less its releases (a release undoes its own claim, never the ones
+	// lost before it), this one included: 1 normally, more when the tasks
+	// claimed before were lost (their engine crashed or lost the lease
+	// mid-task, T11.3). 0 for a task returned under a kept lease (resumed).
 	Claims int32
 }
 
@@ -514,8 +515,9 @@ type Store interface {
 	// skipped until the stickiness expires. An execution whose kept lease
 	// (Completion.KeepFor) expired may be claimed with no pending events
 	// (a task that delivers nothing): its holder died. Each claim
-	// increments the execution's claim count (WorkflowTask.Claims), which
-	// CompleteWorkflowTask and ReleaseWorkflowTask reset.
+	// increments the execution's claim count (WorkflowTask.Claims):
+	// CompleteWorkflowTask resets it, ReleaseWorkflowTask decrements it
+	// (not below 0), ReopenParked resets it.
 	ClaimWorkflowTasks(ctx context.Context, owner string, queues []string, limit int, ttl time.Duration) ([]WorkflowTask, error)
 	// LoadHistory returns the history events with Seq > afterSeq.
 	LoadHistory(ctx context.Context, executionID, afterSeq int64) ([]history.Event, error)

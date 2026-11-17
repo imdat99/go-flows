@@ -81,7 +81,7 @@ var ErrUncertain = errors.New("outcome uncertain")
 var ErrAttemptsExhausted = errors.New("activity attempts exhausted without a result (the process running it crashed or lost its lease)")
 
 // ErrCrashLoop is the reason of an execution parked because its workflow
-// task was claimed more than Options.MaxTaskClaims times in a row without
+// task was claimed more than Options.MaxTaskClaims times without
 // completing: its engines crashed or lost the lease mid-task (T11.3).
 var ErrCrashLoop = errors.New("workflow task never completes (the process running it crashed or lost its lease each time)")
 
@@ -290,8 +290,14 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 			// the next engine run it past its limit: its lease lapses
 			// instead (not renewed), and it stays lost and exhausted for
 			// the next claim.
-			w.log.LogAttrs(ctx, slog.LevelWarn, "flows: exhausted activity not defined here, leaving it to an engine that defines it",
-				slog.String("activity", t.Name))
+			// Every LeaseTTL on every such engine until one that defines
+			// it claims it: a warning once per worker, then info.
+			level := slog.LevelInfo
+			if w.exhaustedWarned.CompareAndSwap(false, true) {
+				level = slog.LevelWarn
+			}
+			w.log.LogAttrs(ctx, level, "flows: exhausted activity not defined here, leaving it to an engine that defines it",
+				slog.String("activity", t.Name), slog.String("instance", t.InstanceID))
 			return
 		}
 		// Another instance may have it: give the task back for a while.

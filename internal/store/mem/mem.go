@@ -137,7 +137,7 @@ type execution struct {
 	// stuckSeq is the history position of the last stall (NoteStuck).
 	stuckSeq   int64
 	stuckNoted bool
-	// claims since the last completion or release (WorkflowTask.Claims).
+	// claims since the last completion, less releases (WorkflowTask.Claims).
 	claims int32
 }
 
@@ -793,7 +793,9 @@ func (s *Store) ReleaseWorkflowTask(_ context.Context, l store.Lease, delay time
 	e.lockedUntil, e.lease.Owner = time.Time{}, ""
 	e.stickyOwner, e.stickyUntil = "", time.Time{}
 	e.notBefore = now.Add(delay)
-	e.claims = 0            // given back by a live owner: not lost
+	if e.claims > 0 {
+		e.claims-- // undoes only its own claim: claims lost before it still count
+	}
 	if len(e.pending) > 0 { // now or after the delay: announced (T9.1)
 		s.hint(store.WorkflowWork, e.Queue)
 	}
@@ -1199,6 +1201,7 @@ func (s *Store) ReopenParked(_ context.Context, instanceID string) error {
 	s.setStatus(e, store.StatusRunning)
 	e.Err, e.ErrKinds = "", ""
 	e.stuckNoted = false // the stall count starts over (T9.3)
+	e.claims = 0         // and the claim count (T11.3)
 	e.forceReady = true
 	s.hint(store.WorkflowWork, e.Queue)
 	return nil

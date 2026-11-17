@@ -82,7 +82,8 @@ const DefaultCacheBytes = 256 << 20
 // tasks in a row (each one LeaseTTL, so about five minutes with the
 // default 30s) is no longer a crash or a stall that the next engine gets
 // past; a task merely slow on a busy engine is completed by the engine
-// that took it over, which starts the count over.
+// that took it over, which starts the count over (a hand-back only undoes
+// its own claim).
 const DefaultMaxTaskClaims = 10
 
 // Options configure a worker.
@@ -120,9 +121,9 @@ type Options struct {
 	// StuckTimeout bounds workflow code running without yielding.
 	StuckTimeout time.Duration
 	// MaxTaskClaims parks a running execution whose workflow task is
-	// claimed more than this many times in a row without being completed
-	// or released (ErrCrashLoop; default DefaultMaxTaskClaims, negative:
-	// never).
+	// claimed more than this many times without being completed (a release
+	// undoes only its own claim; ErrCrashLoop; default
+	// DefaultMaxTaskClaims, negative: never).
 	MaxTaskClaims int
 	// LockHold is store.LockRequest.Hold for the locks this worker takes
 	// (0: default 1h; negative: none).
@@ -283,6 +284,9 @@ type Worker struct {
 	// detached counts the recorders of detached eager outcomes (driver
 	// detach): the only tasks that hold no slot (Busy).
 	detached atomic.Int64
+	// exhaustedWarned: an exhausted activity this worker does not define
+	// was logged at warning level once (later ones at info: T11.3).
+	exhaustedWarned atomic.Bool
 	// eagerStats counts eager launches and misses (T10.21).
 	eagerStats eagerStats
 	started    bool

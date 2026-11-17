@@ -100,7 +100,7 @@ defer engine.Stop(shutdownCtx)
 | `ListenDSN` | (pool) | Connection string for the engine's `LISTEN` connection (one connection), for pools behind PgBouncer in transaction mode. |
 | `LockHold` | 1h | How long past its `ttl` an execution keeps a lock while one of its activities waits (in its queue, for a retry, or for another engine after a crash), or while its next task waits in the queue (events delivered, not claimed yet). Bounds how long a forgotten workflow keeps others out; negative: the lock lapses after its `ttl`. |
 | `StuckTimeout` | 10s | How long workflow code may run without yielding. Once: handed back; twice at the same point, on any engine (counted in the database): parked (`ErrStuck`); `Resume` resets the count. Raise it if workflow code legitimately computes for long. |
-| `MaxTaskClaims` | 10 | How many times in a row a workflow task may be claimed without completing (its engine crashed or lost the lease mid-task each time) before its execution is parked (`ErrCrashLoop`). A completion or a hand-back starts the count over; negative: no bound. |
+| `MaxTaskClaims` | 10 | How many times a workflow task may be claimed without completing (its engine crashed or lost the lease mid-task each time) before its execution is parked (`ErrCrashLoop`). A completed task starts the count over; a hand-back (an engine that does not define the workflow's version, a transient error) undoes only its own claim, so the crashes before it still count. Compensating executions are not counted. Negative: no bound. |
 | `EagerWindow` | 200ms | How long an execution waits for its eager activities before letting signals and timers in. |
 
 Measured costs and their causes are in [benchmarks.md](benchmarks.md).

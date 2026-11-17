@@ -29,6 +29,7 @@ type crashStore struct {
 	mu       sync.Mutex
 	acts     map[int64]bool // lease ids of crashing activity attempts
 	wfs      map[int64]bool // execution ids of instance
+	parkAt   int32          // the claim (MaxTaskClaims+1) from which tasks no longer crash
 }
 
 func newCrashStore(activity, instance string) *crashStore {
@@ -53,6 +54,9 @@ func (s *crashStore) ClaimWorkflowTasks(ctx context.Context, owner string, queue
 	for _, t := range out {
 		if t.Execution.InstanceID == s.instance {
 			s.wfs[t.Execution.ID] = true
+			if s.parkAt > 0 && t.Claims >= s.parkAt {
+				s.wfCrash.Store(false) // the claim that parks it does not crash
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -194,6 +198,7 @@ func TestCrashingWorkflowTaskParks(t *testing.T) {
 			st := newCrashStore("", id)
 			st.Store = open(t)
 			st.wfCrash.Store(true)
+			st.parkAt = 3
 			e := startedEngine(t, st, Options{InstanceID: id, LeaseTTL: 300 * time.Millisecond, MaxTaskClaims: 2, CacheSize: -1})
 			h, err := crashLoopWF.Start(bg, e, id, "ok")
 			if err != nil {
@@ -201,9 +206,7 @@ func TestCrashingWorkflowTaskParks(t *testing.T) {
 			}
 			_, err = h.Wait(waitCtx(t))
 			parkedWith(t, err, ErrCrashLoop)
-			// At claim 3 (MaxTaskClaims 2), or later if the park itself was cut
-			// off (this store reports the lease lost while it crashes).
-			if !strings.Contains(err.Error(), "times without completing") || strings.Contains(err.Error(), "claimed 2 times") {
+			if !strings.Contains(err.Error(), "claimed 3 times") { // MaxTaskClaims 2
 				t.Fatalf("reason %v", err)
 			}
 			if hist, err := st.LoadHistory(bg, st.execID(), 0); err != nil || len(hist) != 0 {

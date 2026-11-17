@@ -773,7 +773,9 @@ func (s *Store) ReleaseWorkflowTask(ctx context.Context, l store.Lease, delay ti
 
 const releaseWorkflow = `
 	UPDATE flows.execution
-	SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL, due_owner = '', claims = 0,
+	SET owner_id = '', locked_until = NULL, sticky_owner = '', sticky_until = NULL, due_owner = '',
+	    -- Undoes only its own claim: claims lost before it still count (T11.3).
+	    claims = greatest(claims - 1, 0),
 	    ready_at = (SELECT min(visible_at) FROM flows.pending_event WHERE execution_id = $1),
 	    not_before = CASE WHEN $2::bigint > 0 THEN now() + $2::bigint * interval '1 microsecond' END
 	WHERE id = $1

@@ -43,9 +43,16 @@ below), and its late result is refused by fencing (chaos test B). Use the
   the binary that schedules the activity. If that binary does not define
   the activity (it runs elsewhere, `WithQueue`), there is no limit: lost
   attempts are retried as before.
-- A workflow task claimed more than `MaxTaskClaims` times in a row
-  (default 10) without completing parks its execution (`ErrCrashLoop`),
-  never fails it; `Engine.Resume` runs it again once the cause is fixed.
+- A workflow task claimed more than `MaxTaskClaims` times (default 10)
+  without completing parks its execution (`ErrCrashLoop`), never fails it;
+  `Engine.Resume` runs it again once the cause is fixed. A completed task
+  starts the count over; a hand-back (an engine that does not define the
+  workflow's version) undoes only its own claim, so a rolling deploy whose
+  new version crashes the new engines still parks.
+- Known gap: a compensating execution is not counted. Its tasks run no
+  workflow code (its compensators are activity tasks, bounded as above),
+  but planning a compensation loads the history; if that crashes the
+  engines (a history too large for their memory), it is retried forever.
 
 **Fencing.** Every write made for a running execution or an activity task
 checks `owner_id` and `lease_version` on the locked row:

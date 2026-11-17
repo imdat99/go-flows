@@ -235,9 +235,10 @@ const reopenCompensation = `
 
 // reopenParked makes the latest execution of $1, parked because its code
 // was wrong or its tasks never completed (T11.3), running and ready again;
-// its stall count starts over (T9.3), as its claim count did with the park.
+// its stall count (T9.3) and claim count (T11.3, already reset by a park
+// this release made) start over.
 const reopenParked = `
-	UPDATE flows.execution SET status = 'running', err = '', err_kinds = '', stuck_seq = NULL, ready_at = now()
+	UPDATE flows.execution SET status = 'running', err = '', err_kinds = '', stuck_seq = NULL, claims = 0, ready_at = now()
 	WHERE id = ` + latestOf + `
 	  AND status = 'needs_attention'
 	  AND string_to_array(err_kinds, ',') && ARRAY['` + store.KindNonDeterministic + `', '` + store.KindStuck + `', '` + store.KindCrashLoop + `']

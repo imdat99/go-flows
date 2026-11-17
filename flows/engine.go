@@ -71,15 +71,19 @@ type Options struct {
 	// count is in the database). Each attempt leaves a goroutine running
 	// until its process exits.
 	StuckTimeout time.Duration
-	// MaxTaskClaims bounds how many times in a row a workflow task may be
+	// MaxTaskClaims bounds how many times a workflow task may be
 	// claimed without completing (default 10; negative: no bound): a task
 	// whose process crashes mid-way (out of memory while replaying a large
 	// history, os.Exit, a fatal runtime error in workflow code) is claimed
 	// again by another engine once its lease expires, and would take down
 	// one engine after another. Past the bound the execution is parked
-	// (ErrCrashLoop) until Engine.Resume. A completion or a hand-back
-	// starts the count over, so a task merely slow on an overloaded engine
-	// (completed by the engine that took it over) does not count.
+	// (ErrCrashLoop) until Engine.Resume. A completed task starts the count
+	// over, so a task merely slow on an overloaded engine (completed by the
+	// engine that took it over) does not count. A hand-back (an engine that
+	// does not define the workflow's version, a transient error) undoes
+	// only its own claim: the lost claims before it still count. Executions
+	// that are compensating are not counted (their tasks run no workflow
+	// code).
 	MaxTaskClaims int
 	// LockHold bounds how long, past its ttl, an execution keeps a lock
 	// (Lock) while none of its code or activities runs but one of its

@@ -33,9 +33,13 @@ must take care of.
     final failure (a compensator so exhausted parks the execution as
     `compensation_failed`);
   - `Options.MaxTaskClaims` (default 10, negative: no bound): a workflow
-    task claimed more than that many times in a row without completing
-    parks its execution as `needs_attention` with `flows.ErrCrashLoop`
-    (kind `crash_loop`), never fails it; `Engine.Resume` resumes it.
+    task claimed more than that many times without completing parks its
+    execution as `needs_attention` with `flows.ErrCrashLoop` (kind
+    `crash_loop`), never fails it; `Engine.Resume` resumes it. A completed
+    task starts the count over; a hand-back (an engine that does not
+    define the workflow's version) undoes only its own claim. Compensating
+    executions are not counted (a known gap: planning a compensation loads
+    the history).
 
 ### Changed
 
@@ -84,7 +88,7 @@ must take care of.
 
 | Migration | Adds | For |
 |---|---|---|
-| `00017_crash_loops` | `activity_task.max_attempts`, `execution.claims` | the attempt limit of a task, and the claims of an execution since its last completed task (T11.3) |
+| `00017_crash_loops` | `activity_task.max_attempts`, `execution.claims` | the attempt limit of a task, and the claims of an execution since its last completed task, less its releases (T11.3) |
 
 ### Upgrade notes
 
@@ -93,10 +97,11 @@ must take care of.
 - Activity tasks inserted by earlier binaries (and by binaries that do not
   define the activity) have `max_attempts` 0: no limit, the earlier
   behaviour.
-- Earlier binaries neither count nor reset `execution.claims`. Each task
-  lost by a new engine and then completed by an old one leaves the count
-  one higher; this is harmless during a rolling deploy (the default bound
-  is 10, and the first task a new engine completes resets it).
+- Earlier binaries neither count, decrement nor reset `execution.claims`.
+  Each task lost by a new engine and then completed by an old one leaves
+  the count one higher; this is harmless during a rolling deploy (the
+  default bound is 10, and the first task a new engine completes resets
+  it).
 - If engines are killed mid-activity during deploys, give the activities
   that must survive that at least two attempts.
 

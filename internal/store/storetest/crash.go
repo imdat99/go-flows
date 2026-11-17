@@ -94,22 +94,30 @@ func testActivityExhaustEdges(t *testing.T, h Harness) {
 }
 
 // T11.3: a workflow task claimed again and again without completing (its
-// engine crashes mid-task) is counted: Claims grows with each claim and
-// starts over at a completion or a release. A parked crash loop is
-// reopened by ReopenParked.
+// engine crashes mid-task) is counted: Claims grows with each claim, a
+// release undoes only its own claim (a hand-back, by an engine that cannot
+// run the task, must not hide the claims lost before it), and a completion
+// starts the count over. A parked crash loop is reopened by ReopenParked.
 func testWorkflowClaimsCount(t *testing.T, h Harness) {
 	s := h.New(t)
 	mustCreate(t, s, "i1")
-	for want := int32(1); want <= 2; want++ {
-		task := claimOne(t, s, owner, h.TTL)
-		if task.Claims != want {
-			t.Fatalf("claim %d: Claims %d", want, task.Claims)
+	if task := claimOne(t, s, owner, h.TTL); task.Claims != 1 {
+		t.Fatalf("first claim: Claims %d", task.Claims)
+	}
+	h.Advance(t, s, h.TTL+h.TTL/2) // lost
+	for range 2 {
+		task := claimOne(t, s, other, h.TTL)
+		if task.Claims != 2 {
+			t.Fatalf("after a lost claim: Claims %d, want 2", task.Claims)
 		}
-		h.Advance(t, s, h.TTL+h.TTL/2) // lost
+		// Handed back: the lost claim before it still counts.
+		if err := s.ReleaseWorkflowTask(ctx, task.Lease, 0); err != nil {
+			t.Fatal(err)
+		}
 	}
 	task := claimOne(t, s, other, h.TTL)
-	if task.Claims != 3 {
-		t.Fatalf("Claims %d, want 3", task.Claims)
+	if task.Claims != 2 {
+		t.Fatalf("after hand-backs: Claims %d, want 2", task.Claims)
 	}
 	started(t, s, task, nil)
 	if err := s.Signal(ctx, "i1", "go", nil); err != nil {
@@ -126,7 +134,8 @@ func testWorkflowClaimsCount(t *testing.T, h Harness) {
 	if task.Claims != 1 {
 		t.Fatalf("after a release: Claims %d", task.Claims)
 	}
-	// Kept and resumed: no claim.
+	// Kept and resumed: no claim; releasing the kept lease does not go
+	// below zero.
 	c := &store.Completion{Consumed: pendingIDs(task), KeepFor: h.TTL}
 	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, c); err != nil {
 		t.Fatal(err)
@@ -134,6 +143,16 @@ func testWorkflowClaimsCount(t *testing.T, h Harness) {
 	resumed, err := s.ResumeWorkflowTask(ctx, task.Lease, h.TTL)
 	if err != nil || resumed.Claims != 0 {
 		t.Fatalf("resumed: Claims %d, %v", resumed.Claims, err)
+	}
+	if err := s.ReleaseWorkflowTask(ctx, task.Lease, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Signal(ctx, "i1", "again", nil); err != nil {
+		t.Fatal(err)
+	}
+	task = claimOne(t, s, owner, h.TTL)
+	if task.Claims != 1 {
+		t.Fatalf("after releasing a kept lease: Claims %d", task.Claims)
 	}
 	park := &store.Completion{Status: store.StatusNeedsAttention, Err: "crash loop", ErrKinds: store.KindCrashLoop}
 	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, park); err != nil {

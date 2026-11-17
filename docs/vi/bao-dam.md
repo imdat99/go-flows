@@ -43,9 +43,17 @@ ra một lần (`idem.Do`).
   lịch activity. Nếu binary đó không định nghĩa activity (activity chạy ở
   nơi khác, `WithQueue`), không có giới hạn: attempt bị mất được thử lại
   như trước.
-- Workflow task bị claim quá `MaxTaskClaims` lần liên tiếp (mặc định 10)
-  mà không hoàn tất thì execution bị park (`ErrCrashLoop`), không bao giờ
-  fail; `Engine.Resume` cho nó chạy lại khi nguyên nhân đã được sửa.
+- Workflow task bị claim quá `MaxTaskClaims` lần (mặc định 10) mà không
+  hoàn tất thì execution bị park (`ErrCrashLoop`), không bao giờ fail;
+  `Engine.Resume` cho nó chạy lại khi nguyên nhân đã được sửa. Một task
+  hoàn tất đặt lại số đếm; một lần trả lại (engine không định nghĩa
+  version của workflow) chỉ bỏ claim của chính nó, nên một lần rolling
+  deploy mà version mới làm sập các engine mới vẫn bị park.
+- Hạn chế đã biết: execution đang compensating không được đếm. Task của nó
+  không chạy code workflow (compensator là activity task, bị giới hạn như
+  trên), nhưng việc lập kế hoạch compensation phải nạp history; nếu việc
+  đó làm sập các engine (history quá lớn so với bộ nhớ), nó được thử lại
+  vô hạn.
 
 **Fencing.** Mọi lần ghi cho một execution đang chạy hoặc một activity task
 đều kiểm tra `owner_id` và `lease_version` trên dòng đã khoá:

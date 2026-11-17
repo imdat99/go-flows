@@ -51,7 +51,7 @@ var (
 	ErrStuck = coro.ErrStuck
 	// ErrCrashLoop is the reason of an execution parked as needs_attention
 	// because its workflow task was claimed more than
-	// Options.MaxTaskClaims times in a row without ever completing: the
+	// Options.MaxTaskClaims times without ever completing: the
 	// processes running it crashed (out of memory, os.Exit, a fatal runtime
 	// error), or lost their lease, each time. Engine.Resume resumes it once
 	// the cause is fixed.
