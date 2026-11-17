@@ -89,7 +89,7 @@ examples/modulith/
     payment/                    activities Authorize, Capture (void, refund)        queue payments
     reservation/                child workflow Reserve (release by name)            queue inventory
     replenishment/              per-SKU loop (ContinueAsNew, Lock), Adjust          queue inventory
-    shipment/                   child workflow Ship, pivot, WakeOnPickup, Cancel    queue shipping
+    shipment/                   child workflow Ship, pivot, WakeOnPickup            queue shipping
     notify/                     orders events -> notifications, one workflow each   queue notifications
 ```
 
@@ -149,11 +149,11 @@ HTTP POST /orders ──> fulfilment.Place ──> workflow orders.fulfil (queue
    3. inventory.reserve            child         inventory     Inventory.Reserve     undo: Release (per line)
    4. payments.capture             activity      payments      Payments.Capture      undo: Refund
    5. shipping.ship                child         shipping      Shipping.CreateLabel  undo: CancelLabel
-        label, then Select { signal picked-up | signal shipping.cancel | timer PickupWithin }
+        label, then Select { signal picked-up | canceled (timer resolves at once) | timer PickupWithin }
         then Shipping.Decide on the shipment row (first decision wins, carrier or workflow)
         picked up: Shipping.MarkPickedUp, retried until it succeeds
-      the order: Select { shipment done | signal orders.cancel -> forward to the shipment }
-                 then wait for the shipment's real outcome
+      the order: Select { shipment done | signal orders.cancel -> shipped.RequestCancel(c) }
+                 then wait for the shipment's real outcome (shipped.Get)
  end ──> RunHook (same transaction): Orders.End -> orders.orders.state + outbox event
      ──> relay ──> bus ──> notify consumer ──> workflow notifications.send ──> Notifications.Deliver
 ```
@@ -178,10 +178,11 @@ HTTP POST /orders ──> fulfilment.Place ──> workflow orders.fulfil (queue
     customer, or the timeout), it gets 409 `ErrPickupRefused` (return the
     parcel); before the label exists, 404 `ErrNoShipment` (retry). A pickup
     is never accepted and then dropped.
-  - The workflow, woken by the first signal or its timer, asks for the
-    outcome it wants (`Shipping.Decide`) and gets the row's state. Signals
-    only wake it: if the carrier's signal is lost, the timer wakes it and
-    the row still says `pickup_confirmed`.
+  - The workflow, woken by the carrier's signal, a cancel or its timer,
+    asks for the outcome it wants (`Shipping.Decide`) and gets the row's
+    state. Signals and cancels only wake it: if the carrier's signal is
+    lost, the timer or the cancel wakes it and the row still says
+    `pickup_confirmed`.
   - From the decision on, the shipment cannot fail into the saga: the
     decide and mark-picked-up activities run on `flows.Disconnected` and are
     retried until they succeed (rounds of attempts, a durable 5-minute
@@ -196,26 +197,43 @@ HTTP POST /orders ──> fulfilment.Place ──> workflow orders.fulfil (queue
   during steps 1 to 4, the signal waits in the channel and the order stops
   itself before the capture or before starting the shipment. During step 5
   only the shipment knows whether the pickup came first, so the order does
-  not cancel the child (in go-flows, canceling a child resolves its future
-  at once with `ErrCanceled`, without its real outcome). It forwards the
-  cancel to the shipment (an activity calling `shipment.Cancel`, because a
-  workflow cannot signal another one) and waits for the shipment's
-  outcome: canceled, the order is undone; picked up, the order completes
-  and the cancel is ignored.
+  not cancel the child's context (that would resolve its future at once
+  with `ErrCanceled`, without its real outcome). It requests the cancel
+  (`shipped.RequestCancel(c)`, recorded in the order's history and sent
+  with its checkpoint) and waits for the shipment's outcome:
+  - the shipment sees its root context canceled (its timer resolves at
+    once), asks the row for `canceled`, cancels its label and fails with
+    `shipment.ErrCanceled`: the order is undone (refund, release, void);
+  - the row says `pickup_confirmed` (the carrier came first, its signal
+    lost or not), or the decision was already made: the shipment
+    completes, and so does the order; the cancel is ignored.
+
+  Further cancels stay unread in the order's channel (the shipment is asked
+  once). The label, the decision and the record of a pickup run on
+  `flows.Disconnected`, so a cancel during the label's creation waits for
+  the label and is then decided on the row like any other. The shipment
+  has no cancel signal of its own: an operator who must stop a shipment
+  uses `Engine.Cancel` on it, which is the same root-context cancel (the
+  order still gets its real outcome).
 - **Tests of these paths.**
   - Process layer (flowtest, activities mocked): `TestFulfilShipped`,
-    `TestFulfilCanceledByCustomer`, `TestFulfilPickupTimeout`,
+    `TestFulfilCanceledByCustomer` (cancel while the parcel waits),
+    `TestFulfilDuplicateCancels`, `TestFulfilPickupTimeout`,
     `TestFulfilOutOfStock`, `TestFulfilCancelAfterPickup` (the cancel
-    reaches the order after the pickup reached the shipment),
-    `TestFulfilCancelBeforeShipping`, `TestFulfilCancelDuringCapture`,
-    `TestFulfilPickupRecordFailsForLong`, `TestShipPickupBeatsCancel`,
-    `TestShipConfirmedPickupBeatsCancelSignal`,
-    `TestShipPickupRecordedDespiteFailures`, `TestShipUnserviceable`,
+    reaches the order after the pickup reached the shipment: requested,
+    and the order completes), `TestFulfilCancelBeforeShipping`,
+    `TestFulfilCancelDuringCapture`, `TestFulfilPickupRecordFailsForLong`;
+    the shipment on its own: `TestShipCanceled` (a parent's
+    `RequestCancel`), `TestShipCanceledDuringLabel`,
+    `TestShipPickupBeatsCancel`, `TestShipConfirmedPickupBeatsCancel` (the
+    root-context cancel racing a pickup), `TestShipCancelAfterPickupDecision`,
+    `TestShipPickupRecordedDespiteFailures`, `TestShipUnserviceable`;
     `TestReserveReleasesOnFailure`, the replenishment loop tests,
-    `TestAdjustWaitsForTheLock`, `TestSendRetriesTheMailServer`. The
-    adapters themselves run on the real modules in
-    `TestAdaptersCompensateByKey`, `TestDeclineIsPermanent` (payment) and
-    `TestAdaptersOnTheModule` (reservation).
+    `TestAdjustWaitsForTheLock`, `TestSendRetriesTheMailServer`,
+    `TestRedeliveryAfterPurge`. The adapters themselves run on the real
+    modules in `TestAdaptersCompensateByKey`, `TestDeclineIsPermanent`
+    (payment) and `TestAdaptersOnTheModule` (reservation), and
+    `TestPlaceAfterPurge` runs `Place` on Postgres after `PurgeEnded`.
   - Domain (Postgres, no engine): `TestPickupAfterCancelIsRefused`,
     `TestCancelAfterPickupKeepsThePickup`, `TestDecisionRace` (the carrier
     and the workflow decide at the same time, 20 times: they always agree),
@@ -226,7 +244,10 @@ HTTP POST /orders ──> fulfilment.Place ──> workflow orders.fulfil (queue
     back: payments, inventory, shipping) and checks which engine ran which
     workflow and activity. It confirms a pickup and then cancels through the
     API (the order completes whatever the timing, because the 202 of the
-    pickup is final), and posts a pickup after a cancel (409).
+    pickup is final), posts a pickup after a cancel (409), then runs the
+    retention job and places the purged orders again (no-op, or 409 for
+    other contents; nothing starts; `GET /orders/{id}` still answers from
+    the orders table).
 - **`Engine.Cancel` is an operator's tool, not a customer cancel.** It
   cancels the order's context: the shipment child's future resolves at
   once with `ErrCanceled`, and the order compensates without waiting for
@@ -243,8 +264,9 @@ Other features, where to find them:
 | Exactly-once effects in the module's transaction, uncertain undo that fences the key | `modules/inventory/requests.go`, `SettleReservation` |
 | Domain errors classified by the module, translated to `flows.Permanent` by the adapter | `modules/*/IsRejection`, `processes/internal/adapt` |
 | Child workflows across modules, compensated by reopening | `processes/fulfilment`, `processes/reservation`, `processes/shipment` |
-| `Select` over two signals and a timeout timer; a decision made once in a table row; steps retried until they succeed on `Disconnected` | `processes/shipment`, `modules/shipping` |
-| `Select` over a child and a signal; forwarding a signal to a child through an activity | `processes/fulfilment` |
+| `Select` over a signal and a timeout timer that a cancel resolves; a decision made once in a table row; steps retried until they succeed on `Disconnected` | `processes/shipment`, `modules/shipping` |
+| `Select` over a child and a signal; `Future.RequestCancel`: cancel a child and get its real outcome | `processes/fulfilment` |
+| Instance ids kept past retention (`Options.KeepPurgedIDs`, `ErrInstancePurged`); the retention job | `internal/app` (`purgeOnce`), `fulfilment.Place`, `replenishment.Adjust`, `processes/notify` |
 | Long-running loop with `ContinueAsNew` and a stop signal | `processes/replenishment` (`cycle`) |
 | `flows.Lock` with `LockWait` on a business key | `processes/replenishment` (`checkAndOrder`, `adjustStock`) |
 | RunHook ending the order (read model and event) in the end's transaction | `processes/fulfilment` (`Hook`), `modules/orders` (`End`) |
@@ -340,6 +362,38 @@ Run `flowsvet` (module `analyzer/`) in CI to catch mistakes.
   retried.
 - Keep inputs and outputs small (ids, not documents).
 
+### Idempotency past retention
+
+A request that comes back (a client retrying "place order 42", an event
+redelivered by the relay) meets two layers:
+
+| Layer | Answers | For how long |
+| --- | --- | --- |
+| The module's table (`orders.Service.Placed`, `inventory.Service.Applied`, the discontinued flag) | same contents: done (no-op); other contents under the id: conflict | for good |
+| The engine's instance id (`Start` finds the execution; then, with `KeepPurgedIDs`, a tombstone: `flows.ErrInstancePurged`) | this id was used: do not run it again | while the execution exists, then `KeepPurgedIDs` |
+
+Ask the module first; map `ErrInstancePurged` to what the module would
+say:
+
+- `fulfilment.Place`: the orders table answers for every order it
+  recorded. A purged id without a row (a saga whose first step failed for
+  good) is `orders.ErrOrderConflict` (409); a row recorded meanwhile is a
+  no-op.
+- `replenishment.Adjust`: the same with `inventory.adjustments` and
+  `ErrRequestConflict`.
+- `processes/notify`: an event whose workflow was purged was handled:
+  nil. Returning the error would make the relay retry the event, and
+  block its key, forever.
+- `replenishment.Start` at startup: a purged loop id (a loop an operator
+  terminated) is skipped, not an error; `Engine.ForgetInstance` restarts
+  it.
+
+Without `KeepPurgedIDs`, the module checks alone keep orders and
+adjustments right, but a failed order's id runs again, and a redelivered
+event starts a new workflow (the notifications module still sends once
+per event id). Every caller of `Start` must handle `ErrInstancePurged`
+once it is on.
+
 ### Registration in every binary
 
 Definitions are package-level values in a global registry: a process
@@ -361,7 +415,7 @@ go run ./examples/modulith/cmd/modulith
 
 # split: same binary, two deployments
 go run ./examples/modulith/cmd/modulith -modules=orders,notifications -http=:8080 -id=front-1
-go run ./examples/modulith/cmd/modulith -modules=payments,inventory,shipping -http= -id=back-1
+go run ./examples/modulith/cmd/modulith -modules=payments,inventory,shipping -http= -id=back-1 -purge-every=0
 ```
 
 Scale each group independently by running more replicas. Rules:
@@ -429,11 +483,16 @@ var (
 - Alert on `needs_attention` executions (the observer logs them at error
   level), on a growing number of `compensating` ones, and on outbox rows
   with high `attempts`.
-- Periodic jobs on one process: `engine.PurgeEnded`,
-  `inventory.Service.PurgeRequests` for `inventory.processed_requests`,
-  deletion of old sent outbox rows. A purge frees the instance ids it
-  deletes: whatever must stay idempotent after it is checked in the
-  module's tables (see "API friction").
+- The retention job (`App.purgeOnce`, every `-purge-every`, default 1h;
+  one process is enough, set `-purge-every=0` on the others; concurrent
+  runs are safe): `engine.PurgeEnded` of the workflows ended more than
+  `-retention` ago (default 30 days), and
+  `inventory.Service.PurgeRequests` for `inventory.processed_requests`
+  older than retention plus `-keep-purged-ids`. Not done yet: deletion of
+  old sent outbox rows (add a job of your own).
+- `-keep-purged-ids` (default 90 days, the same on every process): the
+  instance ids the purge deletes stay used that long (see "Idempotency
+  past retention"). `engine.ForgetInstance` frees one by hand.
 - Bound request sizes at the API (`maxBody`): the engine stores inputs and
   signals as given.
 - A parked execution: fix the cause, then `engine.Resume` (code) or
@@ -452,24 +511,12 @@ What go-flows made hard here, and how the example works around it:
   the only package-level mutable state of the example. Two engines in one
   process share the definitions and these holders (the integration test
   configures twice; the second call wins, which changes nothing there).
-- **No "cancel a child and get its real outcome".** Canceling a child's
-  context resolves its future at once with `ErrCanceled`; the child may
-  still have completed (here: been picked up). Route the cancel to the
-  child as a signal and let it decide (`processes/fulfilment`).
-- **No workflow-to-workflow signal.** A workflow cannot call
-  `Engine.Signal`. The order forwards a cancel with an activity
-  (`orders.forward-cancel`), which needs an engine in the process's
-  services and runs at least once (the shipment ignores repeats).
-- **Instance-id idempotency ends at retention.** `Start` with a used id
-  returns the existing execution only until `PurgeEnded` deletes it; then
-  the same id starts a new execution. Keep idempotency that must last in
-  the module's tables: `fulfilment.Place` asks `orders.Service.Placed`
-  (other contents under a used id: `ErrOrderConflict`, 409),
-  `replenishment.Adjust` asks `inventory.Service.Applied`
-  (`inventory.adjustments.request_id`, `ErrRequestConflict`), and a
-  discontinued SKU is a column, so its replenishment loop is not started
-  again after a purge. Two different orders racing for a new id both get
-  202; the second one's contents are dropped.
+- **Instance-id idempotency is bounded and blind to contents.** With
+  `KeepPurgedIDs` a purged id stays used for that window only, and the
+  engine compares ids, not inputs: what must last for good, or tell other
+  contents apart, stays in the modules' tables (see "Idempotency past
+  retention"). Two different orders racing for a new id both get 202; the
+  second one's contents are dropped.
 - **`idem` would tie the domain to go-flows.** Package `idem` gives
   exactly-once effects keyed by `flows.Key`, but a module importing it
   would depend on go-flows. The inventory module keeps its own small

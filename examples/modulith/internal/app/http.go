@@ -68,8 +68,8 @@ func (a *App) placeOrder(w http.ResponseWriter, r *http.Request) {
 type orderView struct {
 	orders.View
 	// Status is the saga's status (running, completed, compensating,
-	// compensated, needs_attention...).
-	Status   flows.Status `json:"status"`
+	// compensated, needs_attention...); empty once retention purged it.
+	Status   flows.Status `json:"status,omitempty"`
 	Payment  string       `json:"payment,omitempty"`
 	Shipment string       `json:"shipment,omitempty"`
 }
@@ -77,15 +77,21 @@ type orderView struct {
 func (a *App) getOrder(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	st, err := fulfilment.Status(r.Context(), a.engine, id)
-	if err != nil {
+	if err != nil && !errors.Is(err, flows.ErrNotFound) {
 		a.fail(w, r, err)
 		return
 	}
-	v, _, err := a.svc.orders.Get(r.Context(), id) // State "" before the saga recorded it
-	if err != nil {
+	v, found, gerr := a.svc.orders.Get(r.Context(), id) // State "" before the saga recorded it
+	switch {
+	case gerr != nil:
+		a.fail(w, r, gerr)
+		return
+	case err != nil && !found: // no saga, no order
 		a.fail(w, r, err)
 		return
 	}
+	// No saga but an order: retention purged the saga; the order's state
+	// is final. Status is empty.
 	out := orderView{View: v, Status: st}
 	if p, err := a.svc.payments.Find(r.Context(), id); err == nil {
 		out.Payment = p.State

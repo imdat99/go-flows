@@ -12,7 +12,10 @@
 //     (WakeOnPickup);
 //   - the workflow, woken by the first of pickup, cancel or timeout, asks
 //     the module for the outcome it wants (Decide) and gets the row's
-//     state: signals only wake it;
+//     state: signals and cancels only wake it;
+//   - a cancel is the workflow's canceled root context: the saga asks for
+//     it with Future.RequestCancel and gets the shipment's real outcome
+//     (an operator's Engine.Cancel of the shipment works the same way);
 //   - from the decision on, the workflow cannot fail into the caller's saga
 //     by accident: Decide and MarkPickedUp run on a disconnected context and
 //     are retried until they succeed (untilDone).
@@ -32,20 +35,17 @@ import (
 // run the shipping module serve it.
 const Queue = "shipping"
 
-// Signals of Ship. They wake it; the shipment's row decides.
-const (
-	// SignalPickedUp follows a confirmed pickup (WakeOnPickup).
-	SignalPickedUp = "shipping.picked-up"
-	// SignalCancel asks for the shipment to be stopped (Cancel).
-	SignalCancel = "shipping.cancel"
-)
+// SignalPickedUp follows a confirmed pickup (WakeOnPickup). It wakes Ship;
+// the shipment's row decides.
+const SignalPickedUp = "shipping.picked-up"
 
 var (
 	// ErrPickupTimeout is the error of a shipment the carrier did not pick
 	// up in time.
 	ErrPickupTimeout = errors.New("shipping: carrier did not pick up in time")
-	// ErrCanceled is the error of a shipment stopped by Cancel before the
-	// carrier picked it up.
+	// ErrCanceled is the error of a shipment canceled (its context: the
+	// saga's Future.RequestCancel, or Engine.Cancel) before the carrier
+	// picked it up.
 	ErrCanceled = errors.New("shipping: canceled before pickup")
 )
 
@@ -93,11 +93,6 @@ type Pickup struct {
 	Tracking string `json:"tracking"`
 }
 
-// CancelRequest is the payload of SignalCancel.
-type CancelRequest struct {
-	Reason string `json:"reason"`
-}
-
 // PickupUpdate is the input of MarkPickedUp.
 type PickupUpdate struct {
 	ShipmentID string `json:"shipment_id"`
@@ -118,14 +113,6 @@ func WakeOnPickup(ctx context.Context, e *flows.Engine, orderID, tracking string
 		return nil
 	}
 	return err
-}
-
-// Cancel asks the shipment of an order to stop. The shipment decides: if
-// the carrier's pickup was confirmed first, it completes anyway (the caller
-// sees that in its outcome); otherwise it cancels its label and fails with
-// ErrCanceled. flows.ErrNotActive once the shipment has ended.
-func Cancel(ctx context.Context, e *flows.Engine, orderID, reason string) error {
-	return e.Signal(ctx, InstanceID(orderID), SignalCancel, CancelRequest{Reason: reason})
 }
 
 var activityOpts = []flows.ActivityOption{
@@ -156,59 +143,65 @@ var (
 		flows.WithQueue(Queue), flows.WithTimeout(10*time.Second), pivotRetry)
 
 	// Ship creates a label, then waits for the first of the carrier's
-	// pickup, a cancel, or PickupWithin, and has the module decide. Pickup:
-	// it completes. Cancel: it cancels the label and fails with
-	// ErrCanceled. Timeout: the same with ErrPickupTimeout.
+	// pickup, a cancel (its context), or PickupWithin, and has the module
+	// decide. Pickup: it completes. Cancel: it cancels the label and fails
+	// with ErrCanceled. Timeout: the same with ErrPickupTimeout. A saga
+	// cancels it with Future.RequestCancel, to get that outcome: canceling
+	// the context the child was started with would resolve the saga's
+	// future at once, without it.
 	Ship = flows.DefineWorkflow("shipping.ship", 1, ship, flows.WithWorkflowQueue(Queue))
 )
 
 func ship(c flows.Ctx, r Request) (Shipment, error) {
 	// Listen first: a signal sent before the workflow listens is kept.
 	pickups := flows.Signals[Pickup](c, SignalPickedUp)
-	cancels := flows.Signals[CancelRequest](c, SignalCancel)
 
-	id, err := CreateLabel.Run(c, r)
+	// The label, the decision, and after a pickup the record of it, run
+	// disconnected from cancellation. A cancel that arrives while the label
+	// is created waits for it, then is decided on the row like any other
+	// (a label abandoned midway would be compensated without a decision).
+	// Decide and MarkPickedUp must not fail into the caller's saga: they
+	// are retried until they succeed.
+	dc, done := flows.Disconnected(c)
+	defer done()
+
+	id, err := CreateLabel.Run(dc, r)
 	if err != nil {
 		return Shipment{}, err
 	}
 
+	// The timer is on the root context: a cancel resolves it at once, with
+	// flows.ErrCanceled.
 	tc, stopTimer := flows.WithCancel(c)
 	timeout := flows.NewTimer(tc, r.PickupWithin)
 	// What the workflow asks for, and the error it ends with if canceled.
 	want := shipping.Decision{ShipmentID: id, Want: shipping.StateCanceled}
 	var why error
-	// An error from a case is flows.ErrCanceled: the workflow itself was
-	// canceled (Engine.Cancel of the order). It ends canceled, unless the
-	// carrier confirmed the pickup first.
-	canceledBy := func(reason string, err, def error) {
-		want.Reason, why = reason, def
-		if err != nil {
-			want.Reason, why = "canceled", err
-		}
-	}
 	flows.Select(c,
 		flows.OnSignal(pickups, func(_ flows.Ctx, p Pickup, err error) {
-			if err != nil {
-				canceledBy("canceled", err, err)
+			if err != nil { // malformed: stop, unless the row says picked up
+				want.Reason, why = "bad pickup signal", err
 				return
 			}
 			want.Want, want.Tracking = shipping.StatePickupConfirmed, p.Tracking
 		}),
-		flows.OnSignal(cancels, func(_ flows.Ctx, _ CancelRequest, err error) { canceledBy("customer", err, ErrCanceled) }),
-		flows.OnFuture(timeout, func(_ flows.Ctx, _ struct{}, err error) { canceledBy("timeout", err, ErrPickupTimeout) }),
+		flows.OnFuture(timeout, func(_ flows.Ctx, _ struct{}, err error) {
+			want.Reason, why = "timeout", ErrPickupTimeout
+			if err != nil {
+				// The root context is canceled: the saga asked
+				// (RequestCancel), or an operator (Engine.Cancel).
+				want.Reason, why = "canceled", ErrCanceled
+			}
+		}),
 	)
 	stopTimer()
 
-	// The decision, and after a pickup the record of it, must not fail into
-	// the caller's saga: they run disconnected from cancellation, and are
-	// retried until they succeed.
-	dc, done := flows.Disconnected(c)
-	defer done()
 	d := untilDone(dc, Decide, want)
 	if d.State == shipping.StateCanceled {
 		return Shipment{}, orElse(why, ErrCanceled) // the label is canceled: nothing for the carrier
 	}
-	// The pivot: the carrier has the parcel. Nothing is undone from here.
+	// The pivot: the carrier has the parcel. Nothing is undone from here,
+	// whatever cancel arrives now.
 	untilDone(dc, MarkPickedUp, PickupUpdate{ShipmentID: id, Tracking: d.Tracking})
 	return Shipment{ID: id, Tracking: d.Tracking}, nil
 }

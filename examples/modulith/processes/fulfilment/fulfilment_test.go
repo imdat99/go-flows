@@ -59,16 +59,6 @@ func newTester(t *testing.T) (*flowtest.Tester, *undoLog) {
 		}
 		return struct{}{}, struct{}{}, nil
 	})
-	// The real forwardCancel signals through the configured engine: here,
-	// the tester's.
-	flowtest.OnActivity(tst, forwardCancel, func(ctx context.Context, _ flows.Key, f ForwardedCancel) (struct{}, struct{}, error) {
-		undo.add("forward cancel")
-		err := shipment.Cancel(ctx, tst.Engine(), f.OrderID, f.Reason)
-		if errors.Is(err, flows.ErrNotActive) {
-			err = nil
-		}
-		return struct{}{}, struct{}{}, err
-	})
 	flowtest.OnActivity(tst, payment.Authorize,
 		func(_ context.Context, _ flows.Key, r payment.AuthorizeRequest) (payment.Authorization, string, error) {
 			return payment.Authorization{PaymentID: "pay_" + r.OrderID}, "pay_" + r.OrderID, nil
@@ -171,12 +161,47 @@ func TestFulfilCanceledByCustomer(t *testing.T) {
 	if !errors.Is(err, ErrCanceledByCustomer) || !errors.Is(err, flows.ErrCompensated) {
 		t.Fatalf("err = %v, want canceled by the customer and compensated", err)
 	}
-	// The fulfilment forwards the cancel to the shipment, which cancels its
-	// own label and fails; then the fulfilment undoes its steps, latest
+	// The fulfilment requests the shipment's cancel, the shipment cancels
+	// its own label and fails; then the fulfilment undoes its steps, latest
 	// first, each in its module.
-	want := []string{"forward cancel", "cancel label shp_o2", "refund pay_o2", "release 2", "void pay_o2"}
+	want := []string{"cancel label shp_o2", "refund pay_o2", "release 2", "void pay_o2"}
 	if got := undo.get(); !slices.Equal(got, want) {
 		t.Fatalf("compensations %v, want %v", got, want)
+	}
+	if n := cancelRequests(tst, "o2"); n != 1 {
+		t.Fatalf("%d cancel requests to the shipment, want 1", n)
+	}
+}
+
+// cancelRequests counts the shipment cancels the order of orderID
+// requested (Future.RequestCancel) in its history.
+func cancelRequests(tst *flowtest.Tester, orderID string) int {
+	n := 0
+	for _, typ := range tst.EventTypes(InstanceID(orderID)) {
+		if typ == "ChildCancelRequested" {
+			n++
+		}
+	}
+	return n
+}
+
+// The customer cancels twice while the parcel waits: the shipment is
+// asked once, and every step is undone once.
+func TestFulfilDuplicateCancels(t *testing.T) {
+	tst, undo := newTester(t)
+	tst.SignalAfter(time.Hour, InstanceID("o10"), SignalCancel, CancelRequest{Reason: "changed my mind"})
+	tst.SignalAfter(time.Hour, InstanceID("o10"), SignalCancel, CancelRequest{Reason: "really"})
+
+	_, err := flowtest.Run(tst, fulfil, InstanceID("o10"), order("o10"))
+	if !errors.Is(err, ErrCanceledByCustomer) || !strings.Contains(err.Error(), "changed my mind") {
+		t.Fatalf("err = %v, want canceled by the customer (the first reason)", err)
+	}
+	want := []string{"cancel label shp_o10", "refund pay_o10", "release 2", "void pay_o10"}
+	if got := undo.get(); !slices.Equal(got, want) {
+		t.Fatalf("compensations %v, want %v", got, want)
+	}
+	if n := cancelRequests(tst, "o10"); n != 1 {
+		t.Fatalf("%d cancel requests to the shipment, want 1", n)
 	}
 }
 
@@ -229,10 +254,13 @@ func TestFulfilCancelAfterPickup(t *testing.T) {
 	if res.Tracking != "TRK-RACE" {
 		t.Fatalf("result %+v", res)
 	}
-	// The cancel was forwarded (the race happened), and the shipment, which
-	// had the pickup, refused it: nothing was compensated.
-	if got := undo.get(); !slices.Equal(got, []string{"forward cancel"}) {
-		t.Fatalf("steps %v, want only the forwarded cancel", got)
+	// The cancel was requested (the race happened), and the shipment, which
+	// had the pickup, completed anyway: nothing was compensated.
+	if n := cancelRequests(tst, "o6"); n != 1 {
+		t.Fatalf("%d cancel requests to the shipment, want 1 (the race did not happen)", n)
+	}
+	if got := undo.get(); len(got) != 0 {
+		t.Fatalf("compensations ran: %v", got)
 	}
 }
 

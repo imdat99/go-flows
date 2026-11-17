@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -175,6 +176,7 @@ func TestSplitDeployment(t *testing.T) {
 	t.Run("canceled", s.canceled)
 	t.Run("out of stock", s.outOfStock)
 	t.Run("cancel after pickup", s.cancelAfterPickup)
+	t.Run("after retention", s.afterRetention)
 
 	// The split held: each engine ran only its modules' activities and
 	// recorded the ends of its modules' workflows.
@@ -201,7 +203,7 @@ func TestSplitDeployment(t *testing.T) {
 		{backWfs, "shipping.ship"},
 		{backWfs, "inventory.adjust"},
 		{frontActs, "notifications.deliver"},
-		{frontActs, "orders.forward-cancel"},
+		{frontActs, "orders.record"},
 		{frontWfs, "orders.fulfil"},
 		{frontWfs, "notifications.send"},
 	} {
@@ -338,7 +340,8 @@ func (s split) cancelAfterPickup(t *testing.T) {
 	if code := call(t, s.api, "POST", "/shipments/o-race/pickup", shipment.Pickup{Tracking: "TRK2"}, nil); code != http.StatusAccepted {
 		t.Fatalf("pickup: %d", code)
 	}
-	// 202 (the order still runs: the cancel is forwarded and refused) or
+	// 202 (the order still runs: it requests the shipment's cancel, which
+	// the confirmed pickup wins) or
 	// 409 (it has completed already).
 	code := call(t, s.api, "POST", "/orders/o-race/cancel", fulfilment.CancelRequest{Reason: "too late"}, nil)
 	if code != http.StatusAccepted && code != http.StatusConflict {
@@ -352,4 +355,35 @@ func (s split) cancelAfterPickup(t *testing.T) {
 		t.Fatalf("stock %d, want 7", n)
 	}
 	s.sent(t, "o-race", "order_completed")
+}
+
+// The retention job purges the ended orders' workflows; placing an order
+// again is still a no-op (the orders table), other contents under its id
+// still a conflict, and nothing starts.
+func (s split) afterRetention(t *testing.T) {
+	s.front.cfg.Retention = time.Millisecond // the test's retention: everything ended
+	time.Sleep(10 * time.Millisecond)
+	if err := s.front.purgeOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"o-ship", "o-cancel", "o-big", "o-race"} {
+		if _, err := fulfilment.Status(t.Context(), s.front.engine, id); !errors.Is(err, flows.ErrNotFound) {
+			t.Fatalf("%s after the purge: %v, want not found", id, err)
+		}
+	}
+	s.place(t, "o-ship", 2)
+	other := orders.Order{ID: "o-cancel", Email: "x@example.com", Address: "Hue", Amount: 1, Lines: []orders.Line{{SKU: "sku-t", Qty: 1}}}
+	if code := call(t, s.api, "POST", "/orders", other, nil); code != http.StatusConflict {
+		t.Fatalf("place other contents after the purge: %d, want 409", code)
+	}
+	if _, err := fulfilment.Status(t.Context(), s.front.engine, "o-ship"); !errors.Is(err, flows.ErrNotFound) {
+		t.Fatalf("o-ship placed again after the purge: %v, want nothing started", err)
+	}
+	// The order's view survives its saga: the module's state is final.
+	if v := s.view(t, "o-ship"); v.State != "completed" || v.Status != "" || v.Shipment != "picked_up" {
+		t.Fatalf("order %+v, want still completed, no saga status", v)
+	}
+	if code := call(t, s.api, "GET", "/orders/o-none", nil, nil); code != http.StatusNotFound {
+		t.Fatalf("unknown order: %d, want 404", code)
+	}
 }

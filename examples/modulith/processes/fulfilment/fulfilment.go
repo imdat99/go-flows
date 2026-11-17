@@ -52,9 +52,6 @@ func init() {
 // settings.
 type Services struct {
 	Orders *orders.Service
-	// Engine is used by the activity that forwards a cancel to the shipment
-	// (any engine on the database works).
-	Engine *flows.Engine
 	// PickupWithin is how long an order waits for the carrier (default
 	// 48h). Place copies it into the saga's input.
 	PickupWithin time.Duration
@@ -65,8 +62,8 @@ var deps = adapt.NewRef[Services]("fulfilment")
 // Configure sets the services. Call it before the engine starts, in every
 // process.
 func Configure(s Services) error {
-	if s.Orders == nil || s.Engine == nil {
-		return errors.New("fulfilment: Configure: Orders and Engine are required")
+	if s.Orders == nil {
+		return errors.New("fulfilment: Configure: Orders is required")
 	}
 	if s.PickupWithin <= 0 {
 		s.PickupWithin = 48 * time.Hour
@@ -102,12 +99,6 @@ type CancelRequest struct {
 	Reason string `json:"reason"`
 }
 
-// ForwardedCancel is the input of forwardCancel.
-type ForwardedCancel struct {
-	OrderID string `json:"order_id"`
-	Reason  string `json:"reason"`
-}
-
 // InstanceID is the instance id of an order's saga. Instance ids are global:
 // each process prefixes its own with its module.
 func InstanceID(orderID string) string { return "orders-" + orderID }
@@ -117,14 +108,6 @@ var (
 	// the row's final state however the saga ends.
 	record = flows.DefineActivity("orders.record", recordOrder, nil,
 		flows.WithQueue(Queue), flows.WithTimeout(10*time.Second))
-
-	// forwardCancel passes the customer's cancel on to the shipment. A
-	// workflow cannot signal another workflow itself, so an activity does
-	// it (at least once: the shipment reads the first cancel and ignores
-	// the others).
-	forwardCancel = flows.DefineActivity("orders.forward-cancel", forwardCancelFn, nil,
-		flows.WithQueue(Queue), flows.WithTimeout(10*time.Second),
-		flows.WithRetry(flows.Exponential(20, 200*time.Millisecond, 10*time.Second)))
 
 	// fulfil is version 1 of the saga. To change its sequence of steps,
 	// define version 2 next to it and keep this one until its executions
@@ -146,9 +129,10 @@ var (
 //
 // The customer can cancel (SignalCancel) until the carrier picks the
 // parcel up. Before step 5 the saga stops by itself. During step 5 only
-// the shipment knows whether the pickup came first, so the cancel is
-// forwarded to it and the shipment's outcome decides: canceled, the order
-// is undone; picked up, the order completes and the cancel is ignored.
+// the shipment knows whether the pickup came first, so the saga requests
+// the shipment's cancel (Future.RequestCancel) and the shipment's outcome
+// decides: canceled, the order is undone; picked up, the order completes
+// and the cancel is ignored.
 func fulfilOrder(c flows.Ctx, o Order) (Result, error) {
 	// Signals sent before the saga listens are kept: a cancel that arrives
 	// during steps 1 to 4 is read below.
@@ -182,38 +166,36 @@ func fulfilOrder(c flows.Ctx, o Order) (Result, error) {
 		return Result{}, canceled(req, err)
 	}
 
-	// The shipment is not started with a cancelable context: canceling a
-	// child resolves its future at once with ErrCanceled, without its real
-	// outcome (it may have been picked up). The saga waits for the outcome
-	// instead.
+	// The shipment is not started with a cancelable context: canceling it
+	// would resolve its future at once with ErrCanceled, without its real
+	// outcome (it may have been picked up). A cancel is requested instead
+	// (RequestCancel), and the shipment's outcome decides.
 	shipped := shipment.Ship.Child(c, shipment.InstanceID(o.ID), shipment.Request{
 		OrderID: o.ID, Address: o.Address, PickupWithin: o.PickupWithin,
 	})
 	var (
-		res       shipment.Shipment
-		shipErr   error
-		done      bool
 		requested bool
 		req       CancelRequest
 	)
 	flows.Select(c,
-		flows.OnFuture(shipped, func(_ flows.Ctx, s shipment.Shipment, err error) { res, shipErr, done = s, err, true }),
+		flows.OnFuture(shipped, func(flows.Ctx, shipment.Shipment, error) {}),
+		// A malformed cancel is ignored; later cancels stay unread.
 		flows.OnSignal(cancels, func(_ flows.Ctx, r CancelRequest, err error) { req, requested = r, err == nil }),
 	)
 	if requested {
-		// If forwarding fails for good, the shipment still ends by itself
-		// (pickup or timeout): its outcome below is what counts.
-		_, _ = forwardCancel.Run(c, ForwardedCancel{OrderID: o.ID, Reason: req.Reason})
+		// Nothing if the shipment has ended meanwhile; the future below
+		// resolves with its real outcome either way.
+		shipped.RequestCancel(c)
 	}
-	if !done {
-		res, shipErr = shipped.Get(c)
-	}
+	res, shipErr := shipped.Get(c)
 	switch {
 	case shipErr == nil:
 		// Picked up: the order completes, even if a cancel arrived after
 		// the pickup.
 		return Result{PaymentID: auth.PaymentID, ShipmentID: res.ID, Tracking: res.Tracking}, nil
-	case requested && errors.Is(shipErr, shipment.ErrCanceled):
+	case requested && (errors.Is(shipErr, shipment.ErrCanceled) || errors.Is(shipErr, flows.ErrCanceled)):
+		// Canceled on the row, or (flows.ErrCanceled) never started: the
+		// request was recorded in the task that started it.
 		return Result{}, canceled(req, nil) // refund, release, void
 	default:
 		return Result{}, shipErr // the same
@@ -221,9 +203,9 @@ func fulfilOrder(c flows.Ctx, o Order) (Result, error) {
 }
 
 // canceled is the error that ends a canceled order: the customer's reason
-// (the saga ends compensated), or the error of the signal channel: the saga
-// itself was canceled with Engine.Cancel, and returning that error ends it
-// with status canceled. Either way its completed activities are compensated
+// (the saga ends compensated), or err, the decode error of a malformed
+// cancel signal read before the shipment (the order stops all the same,
+// compensated). Either way its completed activities are compensated
 // (refund, release, void).
 func canceled(req CancelRequest, err error) error {
 	if err != nil {
@@ -243,27 +225,24 @@ func recordOrder(ctx context.Context, _ flows.Key, o Order) (struct{}, struct{},
 	return struct{}{}, struct{}{}, adapt.Error(s.Orders.Record(ctx, o.domain()), orders.IsRejection)
 }
 
-func forwardCancelFn(ctx context.Context, _ flows.Key, f ForwardedCancel) (struct{}, struct{}, error) {
-	s, err := deps.Get()
-	if err != nil {
-		return struct{}{}, struct{}{}, err
-	}
-	err = shipment.Cancel(ctx, s.Engine, f.OrderID, f.Reason)
-	if errors.Is(err, flows.ErrNotActive) {
-		err = nil // the shipment has ended: its outcome stands
-	}
-	return struct{}{}, struct{}{}, err
-}
-
 // Place starts the saga of an order. The order id is the idempotency key:
 // placing the same order again starts nothing, placing other contents
 // under a used id fails with orders.ErrOrderConflict.
 //
-// The engine's own idempotency (Start returns the existing execution) lasts
-// only until retention purges the execution, so Place asks the orders
-// module first, which keeps orders for good. Two different orders racing
-// for a new id both get nil here; the second one's contents are dropped
-// (its Start finds the first execution).
+// Two layers keep it:
+//
+//   - the orders module, for good and by contents: Place asks it first
+//     (orders.Service.Placed), so the same order is a no-op and other
+//     contents a conflict, however old the order;
+//   - the engine, by instance id: Start returns the running or ended
+//     execution, and with Options.KeepPurgedIDs a purged id fails with
+//     flows.ErrInstancePurged for that window after retention. That covers
+//     an order id whose saga ended without recording the order (its first
+//     step failed for good): it is not run again, Place reports a
+//     conflict.
+//
+// Two different orders racing for a new id both get nil here; the second
+// one's contents are dropped (its Start finds the first execution).
 func Place(ctx context.Context, e *flows.Engine, o orders.Order) error {
 	s, err := deps.Get()
 	if err != nil {
@@ -282,16 +261,33 @@ func Place(ctx context.Context, e *flows.Engine, o orders.Order) error {
 		ID: o.ID, Email: o.Email, Address: o.Address, Amount: o.Amount, Lines: o.Lines,
 		PickupWithin: s.PickupWithin,
 	})
+	if errors.Is(err, flows.ErrInstancePurged) {
+		return purged(ctx, s.Orders, o, err)
+	}
 	if err != nil {
 		return fmt.Errorf("place %s: %w", o.ID, err)
 	}
 	return nil
 }
 
+// purged is Place's answer for an order id whose saga retention purged:
+// the id was used. The order recorded with these contents (it was recorded
+// since Placed looked): already placed, nil. Otherwise a conflict.
+func purged(ctx context.Context, svc *orders.Service, o orders.Order, err error) error {
+	placed, perr := svc.Placed(ctx, o)
+	switch {
+	case perr != nil:
+		return perr // a conflict, or the module's error
+	case placed:
+		return nil
+	}
+	return fmt.Errorf("place %s: %w (%w)", o.ID, orders.ErrOrderConflict, err)
+}
+
 // Cancel asks for the cancellation of an order. It is honored until the
 // carrier picks the parcel up; after that the order completes anyway (the
-// saga forwards the cancel to the shipment, which decides). It fails with
-// flows.ErrNotActive once the order has ended.
+// saga requests the shipment's cancel, and the shipment decides). It fails
+// with flows.ErrNotActive once the order has ended.
 //
 // Use it, not Engine.Cancel, for customers. Engine.Cancel is an operator's
 // tool: it cancels the saga's context, so the shipment child's future

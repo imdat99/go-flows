@@ -89,7 +89,7 @@ examples/modulith/
     payment/                    activity Authorize, Capture (void, refund)          queue payments
     reservation/                child workflow Reserve (trả hàng theo tên)          queue inventory
     replenishment/              vòng lặp mỗi SKU (ContinueAsNew, Lock), Adjust      queue inventory
-    shipment/                   child workflow Ship, pivot, WakeOnPickup, Cancel    queue shipping
+    shipment/                   child workflow Ship, pivot, WakeOnPickup            queue shipping
     notify/                     event orders -> notifications, mỗi event một workflow   queue notifications
 ```
 
@@ -149,11 +149,11 @@ HTTP POST /orders ──> fulfilment.Place ──> workflow orders.fulfil (queue
    3. inventory.reserve            child         inventory     Inventory.Reserve     hoàn tác: Release (từng dòng)
    4. payments.capture             activity      payments      Payments.Capture      hoàn tác: Refund
    5. shipping.ship                child         shipping      Shipping.CreateLabel  hoàn tác: CancelLabel
-        tạo nhãn, rồi Select { signal picked-up | signal shipping.cancel | timer PickupWithin }
+        tạo nhãn, rồi Select { signal picked-up | bị huỷ (timer trả về ngay) | timer PickupWithin }
         rồi Shipping.Decide trên dòng shipment (quyết định đầu tiên thắng, hãng hay workflow)
         đã lấy hàng: Shipping.MarkPickedUp, retry đến khi thành công
-      đơn hàng: Select { giao hàng xong | signal orders.cancel -> chuyển tiếp cho shipment }
-                rồi chờ kết quả thật của shipment
+      đơn hàng: Select { giao hàng xong | signal orders.cancel -> shipped.RequestCancel(c) }
+                rồi chờ kết quả thật của shipment (shipped.Get)
  kết thúc ──> RunHook (cùng transaction): Orders.End -> orders.orders.state + event outbox
           ──> relay ──> bus ──> consumer notify ──> workflow notifications.send ──> Notifications.Deliver
 ```
@@ -178,10 +178,11 @@ HTTP POST /orders ──> fulfilment.Place ──> workflow orders.fulfil (queue
     nhận 409 `ErrPickupRefused` (trả lại kiện hàng); trước khi có nhãn,
     404 `ErrNoShipment` (thử lại). Không có chuyện nhận lấy hàng rồi bỏ
     rơi.
-  - Workflow, được đánh thức bởi signal đầu tiên hoặc timer, xin kết quả
-    nó muốn (`Shipping.Decide`) và nhận trạng thái của dòng. Signal chỉ
-    để đánh thức: nếu signal của hãng bị mất, timer đánh thức workflow và
-    dòng vẫn ghi `pickup_confirmed`.
+  - Workflow, được đánh thức bởi signal của hãng, lệnh huỷ hoặc timer,
+    xin kết quả nó muốn (`Shipping.Decide`) và nhận trạng thái của dòng.
+    Signal và lệnh huỷ chỉ để đánh thức: nếu signal của hãng bị mất,
+    timer hoặc lệnh huỷ đánh thức workflow và dòng vẫn ghi
+    `pickup_confirmed`.
   - Từ lúc quyết định, shipment không thể fail vào saga: activity decide
     và mark-picked-up chạy trên `flows.Disconnected` và được retry đến khi
     thành công (từng đợt attempt, ngủ durable 5 phút giữa các đợt; các
@@ -195,25 +196,43 @@ HTTP POST /orders ──> fulfilment.Place ──> workflow orders.fulfil (queue
   hàng. Gửi trong bước 1 đến 4 thì signal chờ trong channel và đơn tự
   dừng trước khi capture hoặc trước khi khởi shipment. Trong bước 5 chỉ
   shipment biết việc lấy hàng có đến trước hay không, nên đơn không huỷ
-  child (trong go-flows, huỷ một child làm future của nó trả về
-  `ErrCanceled` ngay, không có kết quả thật). Đơn chuyển tiếp lệnh huỷ cho
-  shipment (một activity gọi `shipment.Cancel`, vì workflow không gửi
-  signal cho workflow khác được) và chờ kết quả của shipment: bị huỷ thì
-  đơn được hoàn tác; đã lấy hàng thì đơn hoàn tất và lệnh huỷ bị bỏ qua.
+  context của child (như thế future của nó trả về `ErrCanceled` ngay,
+  không có kết quả thật). Đơn yêu cầu huỷ (`shipped.RequestCancel(c)`,
+  ghi vào history của đơn và gửi đi cùng checkpoint) rồi chờ kết quả của
+  shipment:
+  - shipment thấy root context bị huỷ (timer của nó trả về ngay), xin
+    dòng chuyển sang `canceled`, huỷ nhãn và fail với
+    `shipment.ErrCanceled`: đơn được hoàn tác (refund, release, void);
+  - dòng ghi `pickup_confirmed` (hãng đến trước, signal của hãng mất hay
+    không), hoặc quyết định đã có rồi: shipment hoàn tất, đơn cũng vậy;
+    lệnh huỷ bị bỏ qua.
+
+  Các lệnh huỷ sau nằm lại chưa đọc trong channel của đơn (shipment chỉ
+  bị yêu cầu một lần). Tạo nhãn, quyết định và ghi lấy hàng chạy trên
+  `flows.Disconnected`, nên lệnh huỷ đến lúc đang tạo nhãn sẽ chờ nhãn
+  xong rồi được quyết định trên dòng như mọi lệnh khác. Shipment không
+  còn signal huỷ riêng: người vận hành cần dừng một shipment dùng
+  `Engine.Cancel` trên nó, cũng là huỷ root context (đơn vẫn nhận kết
+  quả thật).
 - **Test cho các đường này.**
   - Tầng process (flowtest, activity được mock): `TestFulfilShipped`,
-    `TestFulfilCanceledByCustomer`, `TestFulfilPickupTimeout`,
+    `TestFulfilCanceledByCustomer` (huỷ khi kiện hàng đang chờ),
+    `TestFulfilDuplicateCancels`, `TestFulfilPickupTimeout`,
     `TestFulfilOutOfStock`, `TestFulfilCancelAfterPickup` (lệnh huỷ tới
-    đơn sau khi việc lấy hàng đã tới shipment),
-    `TestFulfilCancelBeforeShipping`, `TestFulfilCancelDuringCapture`,
-    `TestFulfilPickupRecordFailsForLong`, `TestShipPickupBeatsCancel`,
-    `TestShipConfirmedPickupBeatsCancelSignal`,
-    `TestShipPickupRecordedDespiteFailures`, `TestShipUnserviceable`,
+    đơn sau khi việc lấy hàng đã tới shipment: có yêu cầu huỷ, và đơn hoàn
+    tất), `TestFulfilCancelBeforeShipping`, `TestFulfilCancelDuringCapture`,
+    `TestFulfilPickupRecordFailsForLong`; riêng shipment:
+    `TestShipCanceled` (`RequestCancel` của workflow cha),
+    `TestShipCanceledDuringLabel`, `TestShipPickupBeatsCancel`,
+    `TestShipConfirmedPickupBeatsCancel` (huỷ root context đua với việc
+    lấy hàng), `TestShipCancelAfterPickupDecision`,
+    `TestShipPickupRecordedDespiteFailures`, `TestShipUnserviceable`;
     `TestReserveReleasesOnFailure`, các test vòng bổ sung hàng,
-    `TestAdjustWaitsForTheLock`, `TestSendRetriesTheMailServer`. Chính các
-    adapter chạy trên module thật trong `TestAdaptersCompensateByKey`,
-    `TestDeclineIsPermanent` (payment) và `TestAdaptersOnTheModule`
-    (reservation).
+    `TestAdjustWaitsForTheLock`, `TestSendRetriesTheMailServer`,
+    `TestRedeliveryAfterPurge`. Chính các adapter chạy trên module thật
+    trong `TestAdaptersCompensateByKey`, `TestDeclineIsPermanent`
+    (payment) và `TestAdaptersOnTheModule` (reservation), và
+    `TestPlaceAfterPurge` chạy `Place` trên Postgres sau `PurgeEnded`.
   - Nghiệp vụ (Postgres, không engine): `TestPickupAfterCancelIsRefused`,
     `TestCancelAfterPickupKeepsThePickup`, `TestDecisionRace` (hãng và
     workflow quyết định cùng lúc, 20 lần: luôn thống nhất),
@@ -223,8 +242,10 @@ HTTP POST /orders ──> fulfilment.Place ──> workflow orders.fulfil (queue
   - Test tích hợp chạy hai engine (front: orders, notifications; back:
     payments, inventory, shipping) và kiểm tra engine nào chạy workflow và
     activity nào. Nó xác nhận lấy hàng rồi huỷ qua API (đơn hoàn tất dù
-    thời điểm thế nào, vì 202 của việc lấy hàng là cuối cùng), và gửi xác
-    nhận lấy hàng sau khi huỷ (409).
+    thời điểm thế nào, vì 202 của việc lấy hàng là cuối cùng), gửi xác
+    nhận lấy hàng sau khi huỷ (409), rồi chạy job retention và đặt lại các
+    đơn đã bị purge (không làm gì, hoặc 409 nếu nội dung khác; không khởi
+    gì; `GET /orders/{id}` vẫn trả lời từ bảng orders).
 - **`Engine.Cancel` là công cụ của người vận hành, không phải lệnh huỷ
   của khách.** Nó huỷ context của đơn: future của child shipment trả về
   `ErrCanceled` ngay, và đơn compensate mà không chờ kết quả của shipment.
@@ -240,8 +261,9 @@ Các tính năng khác, nằm ở đâu:
 | Hiệu ứng đúng một lần trong transaction của module, hoàn tác không chắc chắn có fence key | `modules/inventory/requests.go`, `SettleReservation` |
 | Lỗi nghiệp vụ do module phân loại, adapter chuyển thành `flows.Permanent` | `modules/*/IsRejection`, `processes/internal/adapt` |
 | Child workflow giữa các module, được compensate bằng cách mở lại | `processes/fulfilment`, `processes/reservation`, `processes/shipment` |
-| `Select` giữa hai signal và một timer timeout; quyết định một lần trong một dòng của bảng; các bước retry đến khi thành công trên `Disconnected` | `processes/shipment`, `modules/shipping` |
-| `Select` giữa child và signal; chuyển tiếp signal cho child qua một activity | `processes/fulfilment` |
+| `Select` giữa một signal và một timer timeout mà lệnh huỷ làm trả về ngay; quyết định một lần trong một dòng của bảng; các bước retry đến khi thành công trên `Disconnected` | `processes/shipment`, `modules/shipping` |
+| `Select` giữa child và signal; `Future.RequestCancel`: huỷ child mà vẫn nhận kết quả thật | `processes/fulfilment` |
+| Giữ instance id sau retention (`Options.KeepPurgedIDs`, `ErrInstancePurged`); job retention | `internal/app` (`purgeOnce`), `fulfilment.Place`, `replenishment.Adjust`, `processes/notify` |
 | Vòng lặp dài hạn với `ContinueAsNew` và signal dừng | `processes/replenishment` (`cycle`) |
 | `flows.Lock` với `LockWait` trên khoá nghiệp vụ | `processes/replenishment` (`checkAndOrder`, `adjustStock`) |
 | RunHook kết thúc đơn (read model và event) trong transaction kết thúc | `processes/fulfilment` (`Hook`), `modules/orders` (`End`) |
@@ -336,6 +358,36 @@ Chạy `flowsvet` (module `analyzer/`) trong CI để bắt lỗi.
   retry.
 - Giữ input và output nhỏ (id, không phải tài liệu).
 
+### Idempotency sau retention
+
+Một request quay lại (client thử lại "đặt đơn 42", relay giao lại một
+event) gặp hai tầng:
+
+| Tầng | Trả lời | Trong bao lâu |
+| --- | --- | --- |
+| Bảng của module (`orders.Service.Placed`, `inventory.Service.Applied`, cờ ngừng kinh doanh) | cùng nội dung: đã xong (không làm gì); nội dung khác dưới id đó: xung đột | mãi mãi |
+| Instance id của engine (`Start` thấy execution; sau đó, với `KeepPurgedIDs`, một tombstone: `flows.ErrInstancePurged`) | id này đã dùng: không chạy lại | khi execution còn, rồi thêm `KeepPurgedIDs` |
+
+Hỏi module trước; chuyển `ErrInstancePurged` thành điều module sẽ nói:
+
+- `fulfilment.Place`: bảng orders trả lời cho mọi đơn nó đã ghi. Id đã
+  purge mà không có dòng (saga có bước đầu fail hẳn) là
+  `orders.ErrOrderConflict` (409); dòng được ghi trong lúc đó thì không
+  làm gì.
+- `replenishment.Adjust`: tương tự với `inventory.adjustments` và
+  `ErrRequestConflict`.
+- `processes/notify`: event có workflow đã bị purge là đã xử lý: nil.
+  Trả lỗi về thì relay sẽ thử lại event đó, và chặn key của nó, mãi mãi.
+- `replenishment.Start` lúc khởi động: id vòng lặp đã purge (vòng bị người
+  vận hành terminate) được bỏ qua, không phải lỗi; `Engine.ForgetInstance`
+  khởi lại nó.
+
+Không có `KeepPurgedIDs`, riêng kiểm tra của module vẫn giữ đúng đơn hàng
+và điều chỉnh tồn kho, nhưng id của đơn fail sẽ chạy lại, và event giao
+lại sẽ khởi một workflow mới (module notifications vẫn chỉ gửi một lần mỗi
+event id). Một khi bật nó, mọi chỗ gọi `Start` phải xử lý
+`ErrInstancePurged`.
+
 ### Đăng ký trong mọi binary
 
 Định nghĩa là giá trị cấp package trong một registry toàn cục: process
@@ -357,7 +409,7 @@ go run ./examples/modulith/cmd/modulith
 
 # tách: cùng binary, hai deployment
 go run ./examples/modulith/cmd/modulith -modules=orders,notifications -http=:8080 -id=front-1
-go run ./examples/modulith/cmd/modulith -modules=payments,inventory,shipping -http= -id=back-1
+go run ./examples/modulith/cmd/modulith -modules=payments,inventory,shipping -http= -id=back-1 -purge-every=0
 ```
 
 Scale từng nhóm độc lập bằng cách chạy thêm replica. Quy tắc:
@@ -423,11 +475,17 @@ var (
   orchestrator.
 - Cảnh báo khi có execution `needs_attention` (observer log ở mức error),
   khi số `compensating` tăng, và khi dòng outbox có `attempts` cao.
-- Job định kỳ trên một process: `engine.PurgeEnded`,
-  `inventory.Service.PurgeRequests` cho `inventory.processed_requests`, xoá
-  dòng outbox đã gửi lâu. Purge giải phóng các instance id nó xoá: thứ gì
-  phải giữ idempotent sau đó thì được kiểm tra trong bảng của module (xem
-  "Điểm vướng của API").
+- Job retention (`App.purgeOnce`, mỗi `-purge-every`, mặc định 1h; một
+  process là đủ, đặt `-purge-every=0` ở các process khác; chạy đồng thời
+  vẫn an toàn): `engine.PurgeEnded` các workflow đã kết thúc quá
+  `-retention` (mặc định 30 ngày), và `inventory.Service.PurgeRequests`
+  cho `inventory.processed_requests` cũ hơn retention cộng
+  `-keep-purged-ids`. Chưa làm: xoá các dòng outbox đã gửi lâu (tự thêm
+  job).
+- `-keep-purged-ids` (mặc định 90 ngày, giống nhau trên mọi process): các
+  instance id bị purge vẫn được coi là đã dùng trong khoảng đó (xem
+  "Idempotency sau retention"). `engine.ForgetInstance` giải phóng một id
+  bằng tay.
 - Giới hạn kích thước request ở API (`maxBody`): engine lưu input và
   signal nguyên như nhận.
 - Execution bị park: sửa nguyên nhân, rồi `engine.Resume` (code) hoặc
@@ -446,23 +504,12 @@ Những gì go-flows làm khó ở đây, và cách ví dụ xoay xở:
   state cấp package có thể thay đổi duy nhất của ví dụ. Hai engine trong
   một process dùng chung định nghĩa và các chỗ giữ này (test tích hợp
   cấu hình hai lần; lần thứ hai thắng, ở đó không có gì khác đi).
-- **Không có "huỷ child và nhận kết quả thật của nó".** Huỷ context của
-  child làm future của nó trả về `ErrCanceled` ngay; child có thể vẫn đã
-  hoàn tất (ở đây: đã được lấy hàng). Gửi lệnh huỷ cho child dưới dạng
-  signal và để child quyết định (`processes/fulfilment`).
-- **Không có signal từ workflow sang workflow.** Workflow không gọi được
-  `Engine.Signal`. Đơn hàng chuyển tiếp lệnh huỷ bằng một activity
-  (`orders.forward-cancel`), activity này cần một engine trong service của
-  process và chạy ít nhất một lần (shipment bỏ qua các bản lặp).
-- **Idempotency theo instance id hết hạn khi retention xoá.** `Start` với
-  id đã dùng chỉ trả về execution cũ cho đến khi `PurgeEnded` xoá nó; sau
-  đó cùng id sẽ khởi execution mới. Giữ idempotency lâu dài trong bảng
-  của module: `fulfilment.Place` hỏi `orders.Service.Placed` (nội dung
-  khác dưới id đã dùng: `ErrOrderConflict`, 409), `replenishment.Adjust`
-  hỏi `inventory.Service.Applied` (`inventory.adjustments.request_id`,
-  `ErrRequestConflict`), và SKU ngừng kinh doanh là một cột, nên vòng bổ
-  sung hàng của nó không bị khởi lại sau purge. Hai đơn khác nhau tranh
-  cùng một id mới đều nhận 202; nội dung của đơn thứ hai bị bỏ.
+- **Idempotency theo instance id có hạn và không nhìn nội dung.** Với
+  `KeepPurgedIDs`, id đã purge chỉ được giữ trong khoảng đó, và engine so
+  id chứ không so input: thứ gì phải giữ mãi, hoặc phải phân biệt nội dung
+  khác, vẫn nằm trong bảng của module (xem "Idempotency sau retention").
+  Hai đơn khác nhau tranh cùng một id mới đều nhận 202; nội dung của đơn
+  thứ hai bị bỏ.
 - **`idem` sẽ buộc nghiệp vụ vào go-flows.** Package `idem` cho hiệu ứng
   đúng một lần theo `flows.Key`, nhưng module import nó sẽ phụ thuộc
   go-flows. Module inventory giữ một bản nhỏ của riêng nó (`requests.go`:

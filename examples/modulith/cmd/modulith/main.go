@@ -7,7 +7,8 @@
 //	go run ./examples/modulith/cmd/modulith -modules=payments,inventory,shipping -http=
 //
 // Flags fall back to the environment: MODULITH_MODULES, MODULITH_HTTP,
-// FLOWS_DSN. See examples/modulith/README.md.
+// MODULITH_ID, MODULITH_PURGE_EVERY, MODULITH_RETENTION,
+// MODULITH_KEEP_PURGED_IDS, FLOWS_DSN. See examples/modulith/README.md.
 package main
 
 import (
@@ -47,11 +48,40 @@ func env(key, def string) string {
 	return def
 }
 
+func envDuration(key string, def time.Duration) (time.Duration, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	return d, nil
+}
+
 func run(log *slog.Logger) error {
 	modules := flag.String("modules", env("MODULITH_MODULES", strings.Join(app.ModuleNames(), ",")),
 		"comma-separated modules this process runs (empty: API only)")
 	addr := flag.String("http", env("MODULITH_HTTP", ":8080"), "HTTP API address (empty: no API)")
 	engineID := flag.String("id", env("MODULITH_ID", ""), "engine instance id, unique per process (default: hostname + random)")
+	purgeEvery, err := envDuration("MODULITH_PURGE_EVERY", time.Hour)
+	if err != nil {
+		return err
+	}
+	retention, err := envDuration("MODULITH_RETENTION", 30*24*time.Hour)
+	if err != nil {
+		return err
+	}
+	keepIDs, err := envDuration("MODULITH_KEEP_PURGED_IDS", 90*24*time.Hour)
+	if err != nil {
+		return err
+	}
+	flag.DurationVar(&purgeEvery, "purge-every", purgeEvery,
+		"period of the retention job (0: not in this process; one process is enough)")
+	flag.DurationVar(&retention, "retention", retention, "how long ended workflows are kept")
+	flag.DurationVar(&keepIDs, "keep-purged-ids", keepIDs,
+		"how long a purged instance id stays used (negative: none); the same on every process")
 	flag.Parse()
 	dsn := env("FLOWS_DSN", "postgres://flows:flows@localhost:5433/flows?sslmode=disable") // the docker compose database of the repository
 
@@ -70,7 +100,10 @@ func run(log *slog.Logger) error {
 			names = append(names, n)
 		}
 	}
-	a, err := app.New(ctx, pool, app.Config{Modules: names, EngineID: *engineID, Logger: log})
+	a, err := app.New(ctx, pool, app.Config{
+		Modules: names, EngineID: *engineID, Logger: log,
+		PurgeEvery: purgeEvery, Retention: retention, KeepPurgedIDs: keepIDs,
+	})
 	if err != nil {
 		return err
 	}

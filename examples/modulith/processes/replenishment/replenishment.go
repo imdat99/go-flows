@@ -238,6 +238,13 @@ func startLoop(ctx context.Context, e *flows.Engine, s *Services, sku string) er
 	_, err = loop.Start(ctx, e, loopID(sku), State{
 		SKU: sku, Every: s.Every, ReorderPoint: s.ReorderPoint, ReorderQty: s.ReorderQty,
 	})
+	if errors.Is(err, flows.ErrInstancePurged) {
+		// The loop ended without the flag (an operator terminated it) and
+		// retention purged it: it stays stopped until its tombstone
+		// expires, or an operator calls Engine.ForgetInstance. Startup
+		// must not fail for it.
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("start replenishment of %s: %w", sku, err)
 	}
@@ -282,6 +289,18 @@ func Adjust(ctx context.Context, e *flows.Engine, requestID, sku string, delta i
 		return s.Inventory.Level(ctx, sku)
 	}
 	n, err := adjust.Run(ctx, e, adjustID(requestID), a)
+	if errors.Is(err, flows.ErrInstancePurged) {
+		// Retention purged the run of this request id. Applied since the
+		// check above: done. Otherwise the id was used by an adjustment
+		// that failed: a conflict, not a new run.
+		switch applied, aerr := s.Inventory.Applied(ctx, a); {
+		case aerr != nil:
+			return 0, aerr
+		case applied:
+			return s.Inventory.Level(ctx, sku)
+		}
+		return 0, fmt.Errorf("adjust %s: %w (%w)", requestID, inventory.ErrRequestConflict, err)
+	}
 	if err != nil {
 		return 0, err
 	}

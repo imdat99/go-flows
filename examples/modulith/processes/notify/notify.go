@@ -91,6 +91,9 @@ func Subscribe(bus Subscriber, e *flows.Engine) {
 		_, err := send.Start(ctx, e, "notifications-"+m.EventID, notifications.Message{
 			EventID: m.EventID, OrderID: ev.OrderID, Email: ev.Email, Template: "order_" + ev.State,
 		})
+		if errors.Is(err, flows.ErrInstancePurged) {
+			return nil // an event redelivered after retention: handled long ago
+		}
 		return err
 	}
 	for _, topic := range []string{orders.TopicCompleted, orders.TopicCanceled, orders.TopicFailed} {

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -101,7 +102,29 @@ type Config struct {
 	// ReplenishEvery is the period of the stock replenishment loops
 	// (default 1m).
 	ReplenishEvery time.Duration
+
+	// PurgeEvery is the period of the retention job (purgeOnce): ended
+	// workflows and old inventory request records are deleted. 0: this
+	// process does not run it. One process is enough; concurrent runs are
+	// safe, only wasted work.
+	PurgeEvery time.Duration
+	// Retention is how long ended workflows are kept (default 30 days).
+	Retention time.Duration
+	// KeepPurgedIDs is how long an instance id stays used after its
+	// workflow was purged (flows.Options.KeepPurgedIDs; default 90 days,
+	// negative: none). Every process gets the same value. Starting a purged
+	// id fails with flows.ErrInstancePurged: an order or a request id
+	// replayed after retention is not run again.
+	KeepPurgedIDs time.Duration
 }
+
+// Defaults of the retention settings.
+const (
+	defaultRetention     = 30 * 24 * time.Hour
+	defaultKeepPurgedIDs = 90 * 24 * time.Hour
+	// purgeBatch bounds each delete of the retention job.
+	purgeBatch = 1000
+)
 
 // App is one process of the monolith.
 type App struct {
@@ -111,9 +134,9 @@ type App struct {
 	log    *slog.Logger
 	svc    services
 
-	started   bool
-	stopRelay context.CancelFunc
-	relayDone chan struct{}
+	started bool
+	stopBg  context.CancelFunc // stops the relay and the retention job
+	bg      sync.WaitGroup
 }
 
 // New migrates the database, constructs the modules' services, builds the
@@ -123,6 +146,15 @@ func New(ctx context.Context, pool *pgxpool.Pool, cfg Config) (*App, error) {
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
+	}
+	if cfg.Retention <= 0 {
+		cfg.Retention = defaultRetention
+	}
+	switch {
+	case cfg.KeepPurgedIDs == 0:
+		cfg.KeepPurgedIDs = defaultKeepPurgedIDs
+	case cfg.KeepPurgedIDs < 0:
+		cfg.KeepPurgedIDs = 0
 	}
 	queues := make([]string, 0, len(cfg.Modules))
 	for _, name := range cfg.Modules {
@@ -165,6 +197,10 @@ func New(ctx context.Context, pool *pgxpool.Pool, cfg Config) (*App, error) {
 		// (or performs a Terminate) runs them.
 		Hook:     runHooks{fulfilment.Hook(svc.orders)},
 		Observer: obs,
+		// Instance ids stay idempotency keys past retention (Place,
+		// Adjust, the notify consumer). Set on every engine, client-only
+		// ones included: they start workflows too.
+		KeepPurgedIDs: cfg.KeepPurgedIDs,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("new engine: %w", err)
@@ -178,7 +214,7 @@ func New(ctx context.Context, pool *pgxpool.Pool, cfg Config) (*App, error) {
 	// startup, rather than as activities retrying adapt.ErrNotConfigured on
 	// a live replica.
 	err = errors.Join(
-		fulfilment.Configure(fulfilment.Services{Orders: svc.orders, Engine: engine, PickupWithin: cfg.PickupWithin}),
+		fulfilment.Configure(fulfilment.Services{Orders: svc.orders, PickupWithin: cfg.PickupWithin}),
 		payment.Configure(payment.Services{Payments: svc.payments}),
 		reservation.Configure(reservation.Services{Inventory: svc.inventory}),
 		replenishment.Configure(replenishment.Services{Inventory: svc.inventory, Every: cfg.ReplenishEvery}),
@@ -210,6 +246,9 @@ func (a *App) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	// Background work lives until Stop, not until ctx.
+	bgCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
+	a.stopBg = stop
 	if a.runs("notifications") {
 		// With a real broker the relay is a role of its own (any process)
 		// and the consumers subscribe to the broker. The in-process bus
@@ -217,30 +256,87 @@ func (a *App) Start(ctx context.Context) error {
 		bus := &outbox.LocalBus{}
 		notify.Subscribe(bus, a.engine)
 		relay := &outbox.Relay{Pool: a.pool, Bus: bus, Logger: a.log}
-		var relayCtx context.Context
-		relayCtx, a.stopRelay = context.WithCancel(context.WithoutCancel(ctx))
-		a.relayDone = make(chan struct{})
-		go func() {
-			defer close(a.relayDone)
-			relay.Run(relayCtx)
-		}()
+		a.bg.Go(func() { relay.Run(bgCtx) })
+	}
+	if a.cfg.PurgeEvery > 0 {
+		a.bg.Go(func() { a.purgeLoop(bgCtx) })
 	}
 	a.log.LogAttrs(ctx, slog.LevelInfo, "modulith: started", slog.Any("modules", a.cfg.Modules))
 	return nil
 }
 
-// Stop stops the relay, then drains the engine until ctx is done (running
-// tasks are then canceled, and resumed by another process).
+// Stop stops the relay and the retention job, then drains the engine until
+// ctx is done (running tasks are then canceled, and resumed by another
+// process).
 func (a *App) Stop(ctx context.Context) error {
-	if a.stopRelay != nil {
-		a.stopRelay()
-		<-a.relayDone
+	if a.stopBg != nil {
+		a.stopBg()
+		a.bg.Wait()
 	}
 	if !a.started {
 		return nil
 	}
 	if err := a.engine.Stop(ctx); err != nil {
 		return fmt.Errorf("stop engine: %w", err)
+	}
+	return nil
+}
+
+// purgeLoop runs purgeOnce every PurgeEvery until ctx is done. A failed run
+// is logged and retried at the next tick.
+func (a *App) purgeLoop(ctx context.Context) {
+	t := time.NewTicker(a.cfg.PurgeEvery)
+	defer t.Stop()
+	for {
+		if err := a.purgeOnce(ctx); err != nil && ctx.Err() == nil {
+			a.log.LogAttrs(ctx, slog.LevelWarn, "modulith: retention job failed", slog.Any("error", err))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// purgeOnce is the retention job, in batches of purgeBatch:
+//
+//   - the workflows ended more than Retention ago (Engine.PurgeEnded); with
+//     KeepPurgedIDs their instance ids stay used, as tombstones, which the
+//     same call expires;
+//   - the inventory module's records of processed requests older than
+//     Retention plus KeepPurgedIDs: an activity repeats its key only while
+//     its workflow runs (a workflow parked for longer than that must be
+//     resolved first: alert on needs_attention).
+//
+// The modules' own tables (orders, payments, shipments, adjustments) are
+// kept: they are the lasting idempotency of their ids. Old sent outbox rows
+// are not deleted here (see README, "Operations checklist").
+func (a *App) purgeOnce(ctx context.Context) error {
+	var runs, requests int64
+	for {
+		n, err := a.engine.PurgeEnded(ctx, a.cfg.Retention, purgeBatch)
+		if err != nil {
+			return fmt.Errorf("purge ended workflows: %w", err)
+		}
+		runs += int64(n)
+		if n < purgeBatch {
+			break
+		}
+	}
+	for {
+		n, err := a.svc.inventory.PurgeRequests(ctx, a.cfg.Retention+a.cfg.KeepPurgedIDs, purgeBatch)
+		if err != nil {
+			return err
+		}
+		requests += n
+		if n < purgeBatch {
+			break
+		}
+	}
+	if runs+requests > 0 {
+		a.log.LogAttrs(ctx, slog.LevelInfo, "modulith: retention job",
+			slog.Int64("workflows", runs), slog.Int64("inventory_requests", requests))
 	}
 	return nil
 }

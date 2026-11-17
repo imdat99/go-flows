@@ -66,3 +66,37 @@ func TestSubscribeTranslatesOrdersEvents(t *testing.T) {
 		t.Fatalf("delivered %+v (%d more), want %+v once", m, len(got), want)
 	}
 }
+
+// An event redelivered after retention purged its workflow is handled
+// (nil, so the relay moves on) and not sent again: the engine keeps the
+// purged instance id (Options.KeepPurgedIDs).
+func TestRedeliveryAfterPurge(t *testing.T) {
+	tst := flowtest.New(t, flowtest.WithOptions(flows.Options{Queues: []string{Queue}, KeepPurgedIDs: time.Hour}))
+	var sent atomic.Int32
+	flowtest.OnActivity(tst, deliver, func(context.Context, flows.Key, notifications.Message) (struct{}, struct{}, error) {
+		sent.Add(1)
+		return struct{}{}, struct{}{}, nil
+	})
+	var bus outbox.LocalBus
+	Subscribe(&bus, tst.Engine())
+	payload, err := json.Marshal(orders.Event{OrderID: "o1", Email: "a@example.com", State: orders.StateCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := outbox.Message{EventID: "e1", Topic: orders.TopicCompleted, Key: "o1", Payload: payload}
+	if err := bus.Publish(t.Context(), msg); err != nil {
+		t.Fatal(err)
+	}
+	tst.Settle()
+	tst.Advance(time.Minute)
+	if n, err := tst.Engine().PurgeEnded(t.Context(), 0, 10); err != nil || n != 1 {
+		t.Fatalf("purged %d, %v; want 1", n, err)
+	}
+	if err := bus.Publish(t.Context(), msg); err != nil {
+		t.Fatalf("redelivery after the purge: %v", err)
+	}
+	tst.Settle()
+	if sent.Load() != 1 {
+		t.Fatalf("sent %d times, want once", sent.Load())
+	}
+}
