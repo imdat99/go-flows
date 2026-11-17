@@ -110,7 +110,7 @@ func (p *freezeProxy) close() {
 // longer be trusted, before another engine claims the expired lease and
 // runs the next attempt, so the attempts do not overlap.
 func TestBlackholedDatabaseGivesUpLeases(t *testing.T) {
-	const ttl = 3 * time.Second
+	const ttl = 6 * time.Second // margin ttl/3 = 2s between giving up and the lease expiring
 	pool := testdb.New(t)
 	ctx := context.Background()
 	if err := flows.Migrate(ctx, pool); err != nil {

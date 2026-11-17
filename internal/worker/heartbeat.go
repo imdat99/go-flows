@@ -143,10 +143,10 @@ func (h *heartbeat) run(ctx context.Context) {
 	}
 }
 
-// renew runs a renewal per kick until ctx is done, each with a deadline of
-// an interval: deadline, armed here, has run cancel it. The renewals'
-// context is made again only after such a cancel (no allocation per
-// renewal).
+// renew runs a renewal per kick until ctx is done. Each renewal arms
+// deadline for one interval; when it fires, run cancels the renewal. The
+// renewals' context is made again only after such a cancel (no allocation
+// per renewal).
 func (h *heartbeat) renew(ctx context.Context, kick <-chan struct{}, deadline *time.Timer) {
 	var rctx context.Context
 	defer func() {
@@ -192,6 +192,9 @@ func (h *heartbeat) tick(ctx context.Context) {
 		return
 	}
 	sent := time.Now()
+	// A renewal cut by its deadline may still reach the database and extend
+	// leases already given up here: the work was canceled, so this only
+	// delays another engine's claim (by up to a ttl); fencing is unchanged.
 	r, err := h.st.RenewLeases(ctx, h.owner, wf, act, h.ttl)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) || errors.Is(context.Cause(ctx), errRenewalTimeout) {
