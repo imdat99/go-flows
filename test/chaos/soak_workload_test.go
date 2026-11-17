@@ -32,6 +32,7 @@ const (
 	envAppDSN   = "FLOWS_CHAOS_APP_DSN"  // the activities' pool, not proxied
 	envInstance = "FLOWS_CHAOS_INSTANCE" // the child engine's InstanceID
 	envSlow     = "FLOWS_CHAOS_SLOW"     // soak.step lasts longer than the lease
+	envSoak     = "FLOWS_CHAOS_SOAK"     // the soak's retry policy and MaxTaskClaims
 	// soakStopDeadline is the deadline of the Stop a child runs on SIGTERM.
 	soakStopDeadline = 2 * time.Second
 	soakRounds       = 2
@@ -57,7 +58,8 @@ const soakSchema = `
 		started  timestamptz NOT NULL,
 		ended    timestamptz,
 		outcome  text NOT NULL DEFAULT '',
-		dup      boolean NOT NULL DEFAULT false
+		dup      boolean NOT NULL DEFAULT false,
+		attempt  int NOT NULL DEFAULT 0 -- the engine's attempt number (ActivityInfo)
 	);
 	CREATE INDEX ON soak_attempt (pid) WHERE ended IS NULL;
 	CREATE TABLE soak_effect (key text PRIMARY KEY, step text NOT NULL);`
@@ -66,15 +68,15 @@ const soakSchema = `
 // random with probability fail before its effect, applying its effect
 // (once per key) in the middle of its work, which honors ctx.
 func soakAttempt(ctx context.Context, step, k, lock string, fail float64) (err error) {
-	app := soakApp.Load()
 	// The id is chosen here: an insert committed whose answer was lost (a
 	// connection cut) still gets its end recorded.
 	id := rand.Int64()
 	dup := false
 	defer func() { endAttempt(id, attemptOutcome(ctx, err), dup) }()
-	if _, err := app.Exec(ctx, `
-		INSERT INTO soak_attempt (id, key, step, lock_key, pid, started) VALUES ($1, $2, $3, $4, $5, $6)`,
-		id, k, step, lock, os.Getpid(), time.Now()); err != nil {
+	if _, err := appExec(ctx, `
+		INSERT INTO soak_attempt (id, key, step, lock_key, pid, started, attempt) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (id) DO NOTHING`,
+		id, k, step, lock, os.Getpid(), time.Now(), attemptNumber(ctx)); err != nil {
 		return err
 	}
 	if rand.Float64() < fail {
@@ -88,12 +90,29 @@ func soakAttempt(ctx context.Context, step, k, lock string, fail float64) (err e
 	if err := sleepCtx(ctx, d/2); err != nil {
 		return err
 	}
-	tag, err := app.Exec(ctx, `INSERT INTO soak_effect (key, step) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`, k, step)
+	n, err := appExec(ctx, `INSERT INTO soak_effect (key, step) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`, k, step)
 	if err != nil {
 		return err
 	}
-	dup = tag.RowsAffected() == 0
+	dup = n == 0 // or an insert whose answer was lost, retried
 	return sleepCtx(ctx, d-d/2)
+}
+
+// appExec runs an idempotent statement of the module, retrying through
+// connection cuts: the pool's idle connections all die at once when the
+// backends are terminated, and the attempts of an activity failing on
+// them one after another would exhaust its retry policy (the module's own
+// fault, not the engine's). It returns the rows affected.
+func appExec(ctx context.Context, sql string, args ...any) (int64, error) {
+	for try := 1; ; try++ {
+		tag, err := soakApp.Load().Exec(ctx, sql, args...)
+		if err == nil || ctx.Err() != nil || try == 10 {
+			return tag.RowsAffected(), err
+		}
+		if err := sleepCtx(ctx, 50*time.Millisecond); err != nil {
+			return 0, err
+		}
+	}
 }
 
 func attemptOutcome(ctx context.Context, err error) string {
@@ -141,12 +160,38 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// soakRetry: attempts lost to faults count toward the limit (T11.3,
-// ErrAttemptsExhausted), on top of the random failures (p <= 0.15).
-var soakRetry = flows.Exponential(40, 20*time.Millisecond, 500*time.Millisecond)
+// soakRetry is the activities' retry policy. Attempts lost to faults
+// count toward its limit (T11.3, ErrAttemptsExhausted), on top of the
+// random failures (p <= 0.15): the short tests lose an attempt or two per
+// activity at most; the soak's faults, one after another, could hit one
+// activity's engines many times.
+var soakRetry = flows.Exponential(soakRetryAttempts(), 20*time.Millisecond, 500*time.Millisecond)
 
-// soakMaxTaskClaims is the children's MaxTaskClaims (default 10).
-const soakMaxTaskClaims = 50
+func soakRetryAttempts() int {
+	if os.Getenv(envSoak) != "" {
+		return 40
+	}
+	return 15
+}
+
+// soakMaxTaskClaims is the children's MaxTaskClaims: the default (10) in
+// the short tests; in the soak, a task loses its claim to each fault that
+// hits its engine, and the faults could hit one execution's engines ten
+// times in a row (the bound stays).
+func soakMaxTaskClaims() int {
+	if os.Getenv(envSoak) != "" {
+		return 50
+	}
+	return 0
+}
+
+type attemptKey struct{}
+
+// attemptNumber is the attempt number soakTracer put in ctx.
+func attemptNumber(ctx context.Context) int {
+	n, _ := ctx.Value(attemptKey{}).(int)
+	return n
+}
 
 var (
 	soakStep = flows.DefineActivity("soak.step", func(ctx context.Context, k flows.Key, v int) (int, string, error) {
@@ -264,7 +309,7 @@ func (soakTracer) StartWorkflow(context.Context, flows.StartInfo) ([]byte, func(
 }
 
 func (soakTracer) StartActivity(ctx context.Context, a flows.ActivityInfo) (context.Context, func(error)) {
-	return ctx, func(err error) {
+	return context.WithValue(ctx, attemptKey{}, a.Attempt), func(err error) {
 		if errors.Is(err, flows.ErrLeaseLost) {
 			fmt.Printf("LOST activity %s %s\n", a.InstanceID, a.Activity)
 		}
@@ -311,10 +356,7 @@ func childSoak() int {
 	}
 	eng, err := flows.New(pool, flows.Options{
 		InstanceID: os.Getenv(envInstance), LeaseTTL: ttl, PollMax: 100 * time.Millisecond,
-		// A task loses its claim to each fault that hits its engine
-		// (T11.3 counts them): the soak's faults, one after another, could
-		// hit one execution's engines ten times in a row. The bound stays.
-		MaxTaskClaims: soakMaxTaskClaims,
+		MaxTaskClaims: soakMaxTaskClaims(),
 		Logger:        quietLogger(os.Stderr), Tracer: soakTracer{},
 	})
 	if err != nil {

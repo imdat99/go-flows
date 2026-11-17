@@ -3,7 +3,6 @@ package testdb
 import (
 	"context"
 	"net"
-	"net/url"
 	"strconv"
 	"sync"
 	"testing"
@@ -220,12 +219,5 @@ func NewProxy(tb testing.TB, pool *pgxpool.Pool) (*Proxy, string) {
 	c := pool.Config().ConnConfig
 	p := newProxy(tb, c.Host, c.Port)
 	tb.Cleanup(p.Close)
-	u := url.URL{
-		Scheme:   "postgres",
-		User:     url.UserPassword(c.User, c.Password),
-		Host:     net.JoinHostPort("127.0.0.1", strconv.Itoa(int(p.Port()))),
-		Path:     "/" + c.Database,
-		RawQuery: "sslmode=disable",
-	}
-	return p, u.String()
+	return p, dsn(c, "127.0.0.1", p.Port())
 }

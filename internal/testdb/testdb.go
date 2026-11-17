@@ -129,10 +129,15 @@ func UniqueName(tb testing.TB, suffix string) string {
 // child process.
 func DSN(pool *pgxpool.Pool) string {
 	c := pool.Config().ConnConfig
+	return dsn(c, c.Host, c.Port)
+}
+
+// dsn is DSN for the database of c, on host and port.
+func dsn(c *pgx.ConnConfig, host string, port uint16) string {
 	u := url.URL{
 		Scheme:   "postgres",
 		User:     url.UserPassword(c.User, c.Password),
-		Host:     net.JoinHostPort(c.Host, strconv.Itoa(int(c.Port))),
+		Host:     net.JoinHostPort(host, strconv.Itoa(int(port))),
 		Path:     "/" + c.Database,
 		RawQuery: "sslmode=disable",
 	}

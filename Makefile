@@ -34,7 +34,8 @@ chaos:
 # (CHAOS_DURATION=30m make chaos-soak; CHAOS_SEED=<seed> replays a mix).
 chaos-soak:
 	@test -n "$(CHAOS_DURATION)" || { echo "usage: CHAOS_DURATION=30m make chaos-soak"; exit 1; }
-	CHAOS_DURATION=$(CHAOS_DURATION) go test -race -count=1 -timeout 0 -tags chaos -run '^TestSoak$$' -v ./test/chaos/...
+	@# -timeout CHAOS_DURATION + 20m (a Go duration adds its parts: 30m20m is 50m).
+	CHAOS_DURATION=$(CHAOS_DURATION) go test -race -count=1 -timeout $(CHAOS_DURATION)20m -tags chaos -run '^TestSoak$$' -v ./test/chaos/...
 
 test-chaos: chaos
 

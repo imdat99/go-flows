@@ -58,12 +58,24 @@ func TestDBBlackhole(t *testing.T) {
 			SELECT count(*) FROM soak_attempt a JOIN soak_attempt l ON l.key = a.key
 			WHERE l.id = ANY($1) AND l.outcome = 'lease-lost' AND a.pid = $2`, running, b.proc.pid()) > 0
 	})
+	// T11.3: the lost attempt counted toward the retry policy, the
+	// takeover's attempt number is higher.
+	var lostAt, takeoverAt int
+	if err := cl.check.QueryRow(context.Background(), `
+		SELECT l.attempt, a.attempt FROM soak_attempt a JOIN soak_attempt l ON l.key = a.key
+		WHERE l.id = ANY($1) AND l.outcome = 'lease-lost' AND a.pid = $2
+		ORDER BY a.started LIMIT 1`, running, b.proc.pid()).Scan(&lostAt, &takeoverAt); err != nil {
+		t.Fatal(err)
+	}
+	if lostAt < 1 || takeoverAt <= lostAt {
+		t.Errorf("lost attempt %d taken over as attempt %d: the lost attempt was not counted", lostAt, takeoverAt)
+	}
 	if !strings.Contains(frozenProc.out.String(), "LOST activity") {
 		t.Error("the frozen engine reported no activity attempt ended with ErrLeaseLost")
 	}
 	took := cl.frozenStop(a, 0) // still frozen
-	t.Logf("attempts running at the freeze: %d, canceled with ErrLeaseLost: %d, all ended after %v; Stop of the frozen engine took %v",
-		len(running), lost, gaveUp.Round(time.Millisecond), took)
+	t.Logf("attempts running at the freeze: %d, canceled with ErrLeaseLost: %d, all ended after %v; lost attempt %d taken over as attempt %d; Stop of the frozen engine took %v",
+		len(running), lost, gaveUp.Round(time.Millisecond), lostAt, takeoverAt, took)
 	cl.waitEnded(4 * time.Minute)
 	cl.verify()
 }
@@ -98,13 +110,13 @@ func TestDBConnectionCuts(t *testing.T) {
 	cl.verify()
 }
 
-// I3: a DBA sets a low statement_timeout (200ms, or
-// CHAOS_STATEMENT_TIMEOUT) on the database (ALTER DATABASE, the pools
-// reconnecting with it) while the engines run: every workflow still
-// completes as it should. (At 5ms every kind of statement times out now and
-// then, claims mostly; the retries still complete everything, slower.)
+// I3: a DBA sets a low statement_timeout (5ms, or CHAOS_STATEMENT_TIMEOUT)
+// on the database (ALTER DATABASE, the pools reconnecting with it) while
+// the engines run: statements time out (every kind now and then, claims
+// mostly), and every workflow still completes as it should, retried. (At
+// 200ms none times out on an idle machine.)
 func TestDBStatementTimeout(t *testing.T) {
-	timeout := 200 * time.Millisecond
+	timeout := 5 * time.Millisecond
 	if v := os.Getenv("CHAOS_STATEMENT_TIMEOUT"); v != "" {
 		var err error
 		if timeout, err = time.ParseDuration(v); err != nil || timeout < time.Millisecond {
@@ -126,6 +138,9 @@ func TestDBStatementTimeout(t *testing.T) {
 		s.proc.out.addTimeouts(timeouts)
 	}
 	t.Logf("statement timeouts logged by the engines, by message: %v", timeouts)
+	if len(timeouts) == 0 {
+		t.Errorf("no statement timed out at %v: the fault was not exercised", timeout)
+	}
 }
 
 // ---- J: the soak ----
@@ -154,7 +169,7 @@ func TestSoak(t *testing.T) {
 	rng := rand.New(rand.NewPCG(seed, seed))
 	between := func(lo, hi time.Duration) time.Duration { return lo + time.Duration(rng.Int64N(int64(hi-lo))) }
 
-	cl := newCluster(t, 3, soakTTL)
+	cl := newCluster(t, 3, soakTTL, envSoak+"=1")
 	const inFlight = 24
 	stopLoad := make(chan struct{})
 	var load sync.WaitGroup

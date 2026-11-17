@@ -294,7 +294,9 @@ func (cl *cluster) frozenStop(s *slot, after time.Duration) time.Duration {
 	}
 	t0 := time.Now()
 	var took time.Duration
-	const slack = 5 * time.Second // T11.2: deadline + stopGrace (1s) + unstick (250ms); -race, a loaded machine
+	// T11.2: Stop returns by the deadline + stopGrace (1s) + unstickWait
+	// (250ms); 2s more for -race on a loaded machine.
+	const slack = 1250*time.Millisecond + 2*time.Second
 	waitFor(cl.t, "the frozen engine's Stop", soakStopDeadline+slack+10*time.Second, func() bool {
 		o := p.out.String()
 		i := strings.LastIndex(o, "STOPPED ")
@@ -608,22 +610,32 @@ type attemptRow struct {
 // verifyOverlaps checks that no two attempts of one activity (one key),
 // and no two critical sections under one lock, overlapped in time. An
 // attempt without a recorded end ended at the latest when its process
-// exited. Overlaps involving an attempt whose process was frozen with
-// SIGSTOP meanwhile are expected (a paused process cannot be fenced off
-// its side effects) and only counted.
+// exited; after waitEnded every attempt has an end.
+//
+// An overlap of an attempt a by a later one b is expected only when a's
+// process was frozen with SIGSTOP (a paused process cannot be fenced off
+// its side effects): before b started, and while a held its lease (from
+// up to a ttl before its recorded start, its claim, to its end). Such
+// overlaps are only counted. A pause of b's process, or of a's after b
+// started, excuses nothing: b may start only once a's lease lapsed.
 func (cl *cluster) verifyOverlaps() {
 	cl.t.Helper()
 	t := cl.t
+	// An attempt records its end as it returns: wait for the last ones.
 	all, unknown, stats := cl.attempts()
+	for deadline := time.Now().Add(30 * time.Second); unknown > 0 && time.Now().Before(deadline); {
+		time.Sleep(200 * time.Millisecond)
+		all, unknown, stats = cl.attempts()
+	}
 	cl.mu.Lock()
 	stops := make(map[int][]window, len(cl.stops))
 	for pid, ws := range cl.stops {
 		stops[pid] = slices.Clone(ws)
 	}
 	cl.mu.Unlock()
-	excused := func(a attemptRow) bool {
+	excused := func(a, b attemptRow) bool {
 		for _, w := range stops[a.pid] {
-			if w.from.Before(a.end) && (w.to.IsZero() || w.to.After(a.start)) {
+			if w.from.Before(b.start) && w.from.Before(a.end) && (w.to.IsZero() || w.to.After(a.start.Add(-cl.ttl))) {
 				return true
 			}
 		}
@@ -647,7 +659,7 @@ func (cl *cluster) verifyOverlaps() {
 				if strings.HasPrefix(g, "lock ") && a.key == b.key {
 					continue // one activity's attempts: checked by its key
 				}
-				if excused(a) || excused(b) {
+				if excused(a, b) {
 					excusedN++
 					continue
 				}
@@ -660,6 +672,9 @@ func (cl *cluster) verifyOverlaps() {
 	dups := count(t, cl.check, `SELECT count(*) FROM soak_attempt WHERE dup`)
 	t.Logf("attempts: %d by outcome %v, %d with an unknown end, %d repeated an applied effect (deduplicated), %d overlaps excused by SIGSTOP",
 		len(all), stats, unknown, dups, excusedN)
+	if unknown > 0 {
+		t.Errorf("%d attempts of live processes without an end, after every execution ended", unknown)
+	}
 	if len(bad) > 0 {
 		t.Errorf("%d overlapping attempts:\n%s", len(bad), strings.Join(bad, "\n"))
 	}
@@ -717,6 +732,10 @@ func (cl *cluster) dump() {
 	dumpQuery(t, cl.check, "soak attempts (step outcome count)",
 		`SELECT step, split_part(outcome, ':', 1), count(*) FROM soak_attempt GROUP BY 1, 2 ORDER BY 1, 2`)
 	dumpQuery(t, cl.check, "locks", `SELECT key, execution_id, until > now() FROM flows.lock`)
+	dumpQuery(t, cl.check, "histories of failed executions (execution instance seq type schedule attempt name err)", `
+		SELECT h.execution_id, e.instance_id, h.seq, h.type, h.schedule_id, h.attempt, h.name, h.err
+		FROM flows.history h JOIN flows.execution e ON e.id = h.execution_id
+		WHERE e.status = 'failed' ORDER BY h.execution_id, h.seq LIMIT 200`)
 }
 
 func dumpQuery(t *testing.T, pool *pgxpool.Pool, title, query string) {
