@@ -36,7 +36,6 @@ import (
 type driver struct {
 	w        *Worker
 	ctx      context.Context       // canceled when the workflow lease is lost or at the stop deadline
-	detached context.Context       // context.WithoutCancel(ctx), made once (recordResult)
 	resumed  [2]store.WorkflowTask // reused for the tasks resumed with an activity's result
 	taskAt   time.Time             // sent the current task's claim or resume (stickyTimer)
 	eagerBuf []int                 // reused by eager
@@ -174,7 +173,7 @@ func (d *driver) detach() {
 		defer w.detached.Add(-1)
 		for range n {
 			r := <-results
-			if _, _, err := w.record(context.WithoutCancel(w.taskCtx()), &r.task, r.outcome, nil, nil); err != nil {
+			if _, _, err := w.record(w.writeCtx(), &r.task, r.outcome, nil, nil); err != nil {
 				w.log.LogAttrs(w.taskCtx(), slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
 					slog.String("activity", r.task.Name), slog.Any("error", err))
 			}
@@ -207,14 +206,11 @@ func (d *driver) recordResult(r eagerResult, resume bool) *store.WorkflowTask {
 	if resume && d.held && d.ctx.Err() == nil {
 		lease = &d.lease
 	}
-	if d.detached == nil {
-		d.detached = d.w.detachedCtx // d.ctx's values (none of its own), never canceled
-	}
 	into := d.nextResumeBuffer()
 	if lease != nil {
 		d.taskAt = time.Now()
 	}
-	next, resumeLost, err := d.w.record(d.detached, &r.task, r.outcome, lease, into)
+	next, resumeLost, err := d.w.record(d.w.writeCtx(), &r.task, r.outcome, lease, into)
 	if err != nil {
 		d.w.log.LogAttrs(d.ctx, slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
 			slog.String("activity", r.task.Name), slog.Any("error", err))
@@ -766,7 +762,7 @@ func (d *driver) release(delay time.Duration) {
 		return
 	}
 	d.held = false
-	err := d.w.st.ReleaseWorkflowTask(context.WithoutCancel(d.ctx), d.lease, delay)
+	err := d.w.st.ReleaseWorkflowTask(d.w.writeCtx(), d.lease, delay) // not canceled with d.ctx, yet bounded
 	if err != nil && !errors.Is(err, store.ErrLeaseLost) {
 		d.w.log.LogAttrs(d.ctx, slog.LevelWarn, "flows: release workflow task", slog.Any("error", err))
 	}

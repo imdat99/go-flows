@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/imdat99/go-flows/internal/history"
 	"github.com/imdat99/go-flows/internal/store"
 	"github.com/imdat99/go-flows/internal/testdb"
@@ -147,6 +149,74 @@ func TestCreateWatchesItsContextPerCall(t *testing.T) {
 	_, _, err = s.CreateExecution(cctx, store.NewExecution{InstanceID: "b", Workflow: "w", Version: 1, Queue: "q"})
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 3*time.Second {
 		t.Fatalf("got %v after %v", err, time.Since(start))
+	}
+}
+
+// T11.2: a database that stops answering (a failover, a partition without
+// RST) does not hold a fast-path exchange past its context's deadline,
+// for a context detached from a canceled parent too (the worker's
+// detached writes): the exchange is cut, and the cancel request that
+// cannot reach the server delays it by cancelWait at most.
+func TestFastPathHonorsDeadlineOnFrozenServer(t *testing.T) {
+	pool, px := testdb.NewProxied(t, func(c *pgxpool.Config) { c.MaxConns = 3 }) // Migrate's minimum
+	ctx := context.Background()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	// One connection left to the store: the completion below runs on the
+	// connection that prepared its statements (no Prepare through pgx).
+	for range 2 {
+		held, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer held.Release()
+	}
+	s := New(pool)
+	if !s.fast {
+		t.Skip("fast path disabled")
+	}
+	if _, _, err := s.CreateExecution(ctx, store.NewExecution{InstanceID: "i", Workflow: "w", Version: 1, Queue: "q"}); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := s.ClaimWorkflowTasks(ctx, "o", []string{"q"}, 1, time.Minute)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("claim: %v %v", tasks, err)
+	}
+	task := tasks[0]
+	c := func() *store.Completion {
+		return &store.Completion{
+			History:  []history.Event{{Seq: 1, Type: history.ExecutionStarted}},
+			Consumed: []int64{task.Pending[0].ID},
+		}
+	}
+	// Prepared (a stale lease is refused by the fence).
+	stale := task.Lease
+	stale.Version--
+	if _, err := s.CompleteWorkflowTask(ctx, stale, c()); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("stale lease: %v", err)
+	}
+	parent, cancelParent := context.WithCancel(ctx)
+	cancelParent()
+	const deadline = 300 * time.Millisecond
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(parent), deadline)
+	defer cancel()
+	px.Freeze()
+	start := time.Now()
+	_, err = s.CompleteWorkflowTask(cctx, task.Lease, c())
+	d := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v after %v", err, d)
+	}
+	if d > deadline+cancelWait+2*time.Second {
+		t.Fatalf("returned after %v (deadline %v)", d, deadline)
+	}
+	t.Logf("returned after %v: %v", d, err)
+	px.Thaw()
+	// The store still works (the interrupted connection was dropped). The
+	// cut completion may have committed meanwhile: the lease is then gone.
+	if _, err := s.CompleteWorkflowTask(ctx, task.Lease, c()); err != nil && !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("after the interruption: %v", err)
 	}
 }
 

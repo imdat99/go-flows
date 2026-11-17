@@ -223,8 +223,11 @@ type Worker struct {
 	// timers and eagerSets are reused by drivers: their eager window timer,
 	// and the channel of eager results with the map of activities in
 	// flight (a channel of MaxActivities results is ~24 KiB).
-	// detachedCtx is context.WithoutCancel(tasksCtx), made once.
+	// detachedCtx is context.WithoutCancel(tasksCtx), made once; writes
+	// detached from their task get a bounded context derived from it
+	// (writeCtx).
 	detachedCtx context.Context //nolint:containedctx // the worker's lifetime
+	writes      atomic.Pointer[boundedCtx]
 	// wfJobs hands claimed workflow tasks to idle runners (runTask).
 	wfJobs chan wfJob
 	// droppedHook, if set (SetDroppedHook), is told what an ending workflow
@@ -364,6 +367,40 @@ func (w *Worker) Start(ctx context.Context) error {
 
 func (w *Worker) taskCtx() context.Context { return w.tasksCtx }
 
+// boundedCtx is a context of detached writes (writeCtx): it ends at its
+// deadline only; the next one is made from renew on.
+type boundedCtx struct {
+	ctx    context.Context //nolint:containedctx // shared by the writes of LeaseTTL/4
+	cancel context.CancelFunc
+	renew  time.Time
+}
+
+// writeCtx returns the context of a write detached from its task's (the
+// outcome of an activity, the release of a lease): Stop's deadline does not
+// cancel it, so that what is done is recorded, but it ends between
+// 3/4 LeaseTTL and LeaseTTL from now (T11.2). Past LeaseTTL the lease is
+// lost and the write would be fenced anyway, and a database that stopped
+// answering (no RST) would otherwise hold it, and its task, forever.
+//
+// The context is shared by the writes of a quarter of LeaseTTL, renewed by the
+// first write after that: no allocation per write, and the store watches
+// it once (pg's fast path watches a context, not each call).
+func (w *Worker) writeCtx() context.Context {
+	now := time.Now()
+	b := w.writes.Load()
+	if b != nil && now.Before(b.renew) {
+		return b.ctx
+	}
+	ctx, cancel := context.WithDeadline(w.detachedCtx, now.Add(w.opts.LeaseTTL))
+	nb := &boundedCtx{ctx: ctx, cancel: cancel, renew: now.Add(w.opts.LeaseTTL / 4)}
+	if !w.writes.CompareAndSwap(b, nb) {
+		cancel() // another write renewed it first
+		return w.writes.Load().ctx
+	}
+	// The one replaced ends at its deadline: writes may still use it.
+	return ctx
+}
+
 // claimCtx is the context of the claims, not the polls' (Stop cancels
 // those first). A claim in flight when Stop begins may commit in the
 // store anyway; canceled, its tasks were lost to this worker yet stayed
@@ -389,6 +426,14 @@ var errStopping = errors.New("worker stopping")
 // return ctx's error (an idle worker whose deadline passes returns nil). Workflow leases kept for eager
 // execution are released as their tasks end, so another instance can
 // continue at once.
+//
+// Once ctx is done, Stop waits stopGrace at most for the canceled tasks
+// and the rest of the shutdown: a task blocked on a database that stopped
+// answering (a failover, a partition without RST) is abandoned (T11.2). It
+// ends by itself within about LeaseTTL (writes detached from their task are
+// bounded, writeCtx; the others were canceled), and its leases expire
+// meanwhile, so another instance takes its work over. Until it ends it
+// holds its pool connection: closing the pool waits for it.
 func (w *Worker) Stop(ctx context.Context) error {
 	w.mu.Lock()
 	pollCancel, taskCancel := w.pollCancel, w.taskCancel
@@ -398,31 +443,52 @@ func (w *Worker) Stop(ctx context.Context) error {
 	}
 	w.stopping.Store(true) // no claim starts from now on
 	pollCancel()
+	// over ends stopGrace after ctx: what Stop still waits for once ctx is
+	// done.
+	over, overCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer overCancel()
+	stopOver := context.AfterFunc(ctx, func() { time.AfterFunc(stopGrace, overCancel) })
+	defer stopOver()
 	// A claim in flight completes (claimCtx), within stopGrace and the
 	// deadline; canceled after, it returns promptly.
 	gctx, gcancel := context.WithTimeout(ctx, stopGrace)
 	if !waitUntilDone(gctx, w.pollers.Wait) {
 		w.claimsCancel()
-		w.pollers.Wait()
+		waitUntilDone(over, w.pollers.Wait)
 	}
 	gcancel()
 	w.claimsCancel()
 	var err error
-	if !waitUntilDone(ctx, w.tasks.Wait) {
+	tasksDone := make(chan struct{})
+	go func() {
+		w.pollers.Wait() // abandoned above, a poller may still start tasks
+		w.tasks.Wait()
+		close(tasksDone)
+	}()
+	select {
+	case <-tasksDone:
+	case <-ctx.Done():
 		if w.Busy() { // not an idle worker whose deadline came first
 			err = fmt.Errorf("worker: stop: %w", ctx.Err())
 		}
-		taskCancel(errStopping)
-		w.tasks.Wait() // canceled tasks return promptly
 	}
-	taskCancel(errStopping)
-	w.runnersOnce.Do(func() { close(w.runnersStop) }) // the tasks drained: no job is in flight
-	w.runners.Wait()
-	w.beat.Wait()
+	taskCancel(errStopping) // canceled tasks return promptly, unless blocked on a store that does not answer
+	drained := waitUntilDone(over, func() {
+		<-tasksDone
+		w.runnersOnce.Do(func() { close(w.runnersStop) }) // the tasks drained: no job is in flight
+		w.runners.Wait()
+		w.beat.Wait()
+	})
+	if !drained {
+		w.log.LogAttrs(ctx, slog.LevelWarn, "flows: stop: tasks abandoned, blocked on the store (their leases expire)",
+			slog.Int("workflow_slots", len(w.wfSlots)), slog.Int("activity_slots", len(w.actSlots)))
+	} else if b := w.writes.Load(); b != nil {
+		b.cancel() // no write is left: free its timer
+	}
 	// The cached executions are sticky to this worker: hand them over now,
 	// not when their stickiness expires.
 	w.cache.close()
-	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	uctx, cancel := context.WithTimeout(over, 5*time.Second)
 	if uerr := w.st.Unstick(uctx, w.opts.Owner); uerr != nil {
 		w.log.LogAttrs(uctx, slog.LevelWarn, "flows: unstick on stop", slog.Any("error", uerr))
 	}

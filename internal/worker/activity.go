@@ -264,7 +264,7 @@ func (w *Worker) runPolledActivity(ctx context.Context, t *store.ActivityTask, c
 		return
 	}
 	o := w.attempt(tctx, a, t)
-	if _, _, err := w.record(context.WithoutCancel(tctx), t, o, nil, nil); err != nil {
+	if _, _, err := w.record(w.writeCtx(), t, o, nil, nil); err != nil {
 		w.log.LogAttrs(ctx, slog.LevelError, "flows: activity outcome not recorded (it runs again after its lease expires)",
 			slog.String("activity", t.Name), slog.Any("error", err))
 	}
@@ -279,7 +279,7 @@ func (w *Worker) record(ctx context.Context, t *store.ActivityTask, o attemptOut
 	delay := 20 * time.Millisecond
 	for attempt := 0; ; attempt++ {
 		next, resumeLost, err = w.recordOnce(ctx, t, o, resume, into)
-		if err == nil || attempt == 4 || !sleep(w.taskCtx(), delay) {
+		if err == nil || attempt == 4 || ctx.Err() != nil || !sleep(w.taskCtx(), delay) {
 			return next, resumeLost, err
 		}
 		delay *= 2

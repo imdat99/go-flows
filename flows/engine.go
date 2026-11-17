@@ -184,6 +184,13 @@ func (e *Engine) Start(ctx context.Context) error { return e.w.Start(ctx) }
 // within a short grace period, else it is canceled. Stop returns ctx's
 // error only if running tasks were canceled; an idle engine whose deadline
 // passes returns nil.
+//
+// Once ctx is done, Stop returns within about a second more even if tasks
+// are blocked on a database that stopped answering (a failover, a network
+// partition without RST): those tasks are abandoned, their leases expire
+// and another instance resumes their work. An abandoned task ends by
+// itself within about LeaseTTL (its writes are bounded by it); until then
+// it holds its pool connection, so closing the pool may wait that long.
 func (e *Engine) Stop(ctx context.Context) error { return e.w.Stop(ctx) }
 
 // Signal sends a signal called name with payload (JSON-encoded) to the

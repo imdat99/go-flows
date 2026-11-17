@@ -70,8 +70,27 @@ func New(tb testing.TB) *pgxpool.Pool {
 	if errInit != nil {
 		tb.Fatalf("testdb: %v", errInit)
 	}
-	ctx := context.Background()
+	name := createDB(tb)
+	cfg, err := pgxpool.ParseConfig(baseDSN)
+	if err != nil {
+		tb.Fatalf("testdb: parse dsn: %v", err)
+	}
+	cfg.ConnConfig.Database = name
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		tb.Fatalf("testdb: pool: %v", err)
+	}
+	tb.Cleanup(func() {
+		pool.Close()
+		dropDB(name)
+	})
+	return pool
+}
 
+// createDB creates a new empty database and returns its name.
+func createDB(tb testing.TB) string {
+	tb.Helper()
+	ctx := context.Background()
 	name := fmt.Sprintf("t_%d_%d", os.Getpid(), counter.Add(1))
 	admin, err := pgx.Connect(ctx, baseDSN)
 	if err != nil {
@@ -81,27 +100,18 @@ func New(tb testing.TB) *pgxpool.Pool {
 	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
 		tb.Fatalf("testdb: create database: %v", err)
 	}
+	return name
+}
 
-	cfg, err := pgxpool.ParseConfig(baseDSN)
+// dropDB drops database name (best effort).
+func dropDB(name string) {
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, baseDSN)
 	if err != nil {
-		tb.Fatalf("testdb: parse dsn: %v", err)
+		return
 	}
-	cfg.ConnConfig.Database = name
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		tb.Fatalf("testdb: pool: %v", err)
-	}
-
-	tb.Cleanup(func() {
-		pool.Close()
-		conn, err := pgx.Connect(ctx, baseDSN)
-		if err != nil {
-			return
-		}
-		defer conn.Close(ctx)
-		_, _ = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
-	})
-	return pool
+	defer conn.Close(ctx)
+	_, _ = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
 }
 
 var names atomic.Int64
