@@ -28,7 +28,11 @@ defer engine.Stop(shutdownCtx)
   EXISTS due_owner text NOT NULL DEFAULT ''`, không ghi lại bảng) rồi tạo
   index bằng `CREATE INDEX CONCURRENTLY IF NOT EXISTS` (cùng tên và định
   nghĩa trong `migrations/00013_due_owner.sql`); `Migrate` sau đó bỏ qua cả
-  hai. Migration mới
+  hai. Đặt `lock_timeout` cho lệnh `ALTER TABLE` (lệnh này giữ khoá độc
+  quyền trong chốc lát). Nếu tạo index `CONCURRENTLY` thất bại hoặc bị huỷ,
+  Postgres để lại một index không hợp lệ mà `IF NOT EXISTS` vẫn chấp nhận:
+  kiểm `pg_index.indisvalid`, nếu là false thì `DROP INDEX CONCURRENTLY` rồi
+  tạo lại. Migration mới
   tạo index trên bảng lớn dùng `-- +goose NO TRANSACTION` và
   `CONCURRENTLY`.
 - **Process chỉ làm client.** Engine không được start vẫn bắt đầu workflow,
@@ -90,7 +94,7 @@ defer engine.Stop(shutdownCtx)
 | --- | --- | --- |
 | `LeaseTTL` | 30s | Engine đã chết giữ việc của nó bao lâu. Lease được gia hạn mỗi một phần ba thời gian này. Ngắn hơn: khôi phục nhanh hơn, gia hạn nhiều hơn. |
 | `MaxWorkflowTasks`, `MaxActivities` | 64, 64 | Mức đồng thời của mỗi engine. |
-| `PollMax` | 1s | Khoảng poll dài nhất khi rảnh, tối đa `LeaseTTL`/3 (khôi phục việc của engine đã crash; giá trị lớn hơn bị hạ xuống và ghi log một lần khi start). Engine rảnh nhận việc của engine đã crash trong khoảng 4/3 `LeaseTTL`, với giả định mọi engine dùng cùng `LeaseTTL`. Notification và thời điểm đến hạn đánh thức poller sớm hơn. |
+| `PollMax` | 1s | Khoảng poll dài nhất khi rảnh, tối đa `LeaseTTL`/3 (khôi phục việc của engine đã crash; giá trị lớn hơn bị hạ xuống và ghi log một lần khi tạo engine). Engine rảnh nhận việc của engine đã crash trong khoảng 4/3 `LeaseTTL`, với giả định mọi engine dùng cùng `LeaseTTL`. Notification và thời điểm đến hạn đánh thức poller sớm hơn. |
 | `StickyFor`, `CacheSize`, `CacheBytes` | 10s, 1000, 256 MiB | Giữ execution đã replay trong bộ nhớ, cùng với task kế tiếp của nó trên engine này. `CacheSize: -1` tắt cache (task nào cũng replay). `CacheBytes` giới hạn bộ nhớ ước tính của cache (vài KiB cho mỗi execution và mỗi coroutine còn sống, cộng payload đã mã hoá trong lịch sử của nó); vượt giới hạn nào thì evict execution dùng lâu nhất trước. `CacheBytes: -1` chỉ giới hạn theo số lượng. |
 | `DisableEager` | false | Chạy mọi activity qua queue thay vì chạy ngay trong engine đã lên lịch nó. |
 | `ListenDSN` | (pool) | Connection string cho kết nối `LISTEN` của engine (một kết nối), cho pool đứng sau PgBouncer ở transaction mode. |

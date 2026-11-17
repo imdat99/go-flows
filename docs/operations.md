@@ -28,7 +28,11 @@ defer engine.Stop(shutdownCtx)
   COLUMN IF NOT EXISTS due_owner text NOT NULL DEFAULT ''`, no rewrite)
   and create the index with `CREATE INDEX CONCURRENTLY IF NOT EXISTS`
   (same name and definition as in `migrations/00013_due_owner.sql`);
-  `Migrate` then skips both. New migrations
+  `Migrate` then skips both. Set a `lock_timeout` for the `ALTER TABLE`
+  (it takes a brief exclusive lock). A failed or canceled `CONCURRENTLY`
+  build leaves an invalid index that `IF NOT EXISTS` accepts: check
+  `pg_index.indisvalid`, and if false, `DROP INDEX CONCURRENTLY` it and
+  build it again. New migrations
   that index a large table use `-- +goose NO TRANSACTION` and
   `CONCURRENTLY`.
 - **Client-only processes.** An engine that is not started can still start
@@ -90,7 +94,7 @@ defer engine.Stop(shutdownCtx)
 | --- | --- | --- |
 | `LeaseTTL` | 30s | How long a dead engine holds its work. Leases renew every third of it. Shorter: faster recovery, more renewals. |
 | `MaxWorkflowTasks`, `MaxActivities` | 64, 64 | Concurrency per engine. |
-| `PollMax` | 1s | The longest idle poll interval, at most `LeaseTTL`/3 (recovery of a crashed engine's work; a larger value is lowered, and logged once at start). An idle engine takes a crashed engine's work within about 4/3 `LeaseTTL`, assuming every engine uses the same `LeaseTTL`. Notifications and due times wake pollers earlier. |
+| `PollMax` | 1s | The longest idle poll interval, at most `LeaseTTL`/3 (recovery of a crashed engine's work; a larger value is lowered, and logged once when the engine is created). An idle engine takes a crashed engine's work within about 4/3 `LeaseTTL`, assuming every engine uses the same `LeaseTTL`. Notifications and due times wake pollers earlier. |
 | `StickyFor`, `CacheSize`, `CacheBytes` | 10s, 1000, 256 MiB | Keep a replayed execution in memory, with its next task on this engine. `CacheSize: -1` disables the cache (every task replays). `CacheBytes` bounds the estimated memory of the cache (a few KiB per execution and per live coroutine, plus the encoded payloads of its history); the least recently used are evicted beyond either bound. `CacheBytes: -1` bounds by count only. |
 | `DisableEager` | false | Run every activity through the queue instead of in the scheduling engine. |
 | `ListenDSN` | (pool) | Connection string for the engine's `LISTEN` connection (one connection), for pools behind PgBouncer in transaction mode. |

@@ -14,12 +14,16 @@ import (
 // T11.8: a PollMax above LeaseTTL/3 is lowered, and the engine says so once.
 func TestPollMaxLoweredIsLogged(t *testing.T) {
 	for _, tc := range []struct {
-		pollMax time.Duration
-		logged  bool
-	}{{30 * time.Second, true}, {time.Second, false}, {0, false}} {
+		pollMax, ttl time.Duration
+		logged       bool
+	}{
+		{30 * time.Second, 9 * time.Second, true},
+		{time.Second, 9 * time.Second, false},
+		{0, 2 * time.Second, false}, // the default (1s) lowered: the user asked for nothing
+	} {
 		var buf bytes.Buffer
 		_, err := worker.New(mem.New(nil), nil, nil, worker.Options{
-			Owner: "o", Queues: []string{"q"}, LeaseTTL: 9 * time.Second, PollMax: tc.pollMax,
+			Owner: "o", Queues: []string{"q"}, LeaseTTL: tc.ttl, PollMax: tc.pollMax,
 			Logger: slog.New(slog.NewTextHandler(&buf, nil)),
 		})
 		if err != nil {

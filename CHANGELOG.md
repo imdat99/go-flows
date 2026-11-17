@@ -20,7 +20,8 @@ must take care of.
 - `flows.InstanceID(c)` and `flows.ExecutionID(c)`: workflow code reads
   its own instance id (kept by continue-as-new) and execution id;
   deterministic under replay, no allocation (T11.9).
-- An engine logs once at start when it lowers `PollMax` to `LeaseTTL`/3
+- An engine logs once, when it is created, if it lowers `PollMax` to
+  `LeaseTTL`/3
   (T11.8).
 
 ### Changed
