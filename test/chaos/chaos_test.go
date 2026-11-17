@@ -34,7 +34,7 @@ import (
 
 // Child process protocol, passed through the environment.
 const (
-	envMode  = "FLOWS_CHAOS_CHILD" // hang | pause | many | comp-hang | lock-hang | wf-pause | wf-short | tree | exit
+	envMode  = "FLOWS_CHAOS_CHILD" // hang | pause | many | comp-hang | lock-hang | wf-pause | wf-short | tree | exit | soak
 	envDSN   = "FLOWS_CHAOS_DSN"
 	envRuns  = "FLOWS_CHAOS_RUNS"
 	envTTL   = "FLOWS_CHAOS_TTL" // the child's LeaseTTL (default leaseTTL)
@@ -178,6 +178,9 @@ func TestMain(m *testing.M) {
 // child starts its executions and runs them until killed; for "pause" it
 // reports how they ended on stdout.
 func child(mode string) int {
+	if mode == "soak" {
+		return childSoak()
+	}
 	hangMode = mode
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, os.Getenv(envDSN))

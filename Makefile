@@ -1,4 +1,4 @@
-.PHONY: up down test race race10 chaos test-chaos upgrade lint lint-fix fmt modcheck bench bench-goworkflows benchcmp benchgate
+.PHONY: up down test race race10 chaos chaos-soak test-chaos upgrade lint lint-fix fmt modcheck bench bench-goworkflows benchcmp benchgate
 
 BENCH ?= .
 BENCHPKG ?= ./...
@@ -23,10 +23,18 @@ race: test
 race10:
 	go test -race -count=10 -timeout 90m ./...
 
-# Multi-process chaos tests (build tag chaos), from task T8.1 on.
+# Multi-process chaos tests (build tag chaos), from task T8.1 on; database
+# faults (blackhole, connection cuts, statement_timeout) from T11.7.
 chaos:
-	@if [ -d test/chaos ]; then go test -race -count=1 -tags chaos ./test/chaos/...; \
+	@if [ -d test/chaos ]; then go test -race -count=1 -timeout 30m -tags chaos ./test/chaos/...; \
 	else echo "chaos: test/chaos does not exist yet (task T8.1)"; fi
+
+# Soak (T11.7): a continuous workload under a random mix of process and
+# database faults for CHAOS_DURATION, then integrity checks
+# (CHAOS_DURATION=30m make chaos-soak; CHAOS_SEED=<seed> replays a mix).
+chaos-soak:
+	@test -n "$(CHAOS_DURATION)" || { echo "usage: CHAOS_DURATION=30m make chaos-soak"; exit 1; }
+	CHAOS_DURATION=$(CHAOS_DURATION) go test -race -count=1 -timeout 0 -tags chaos -run '^TestSoak$$' -v ./test/chaos/...
 
 test-chaos: chaos
 

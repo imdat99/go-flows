@@ -3,6 +3,7 @@ package testdb
 import (
 	"context"
 	"net"
+	"net/url"
 	"strconv"
 	"sync"
 	"testing"
@@ -207,4 +208,24 @@ func NewProxied(tb testing.TB, configure ...func(*pgxpool.Config)) (*pgxpool.Poo
 		dropDB(name)
 	})
 	return pool, p
+}
+
+// NewProxy returns a Proxy in front of the server of pool (no new
+// database), and the connection string of pool's database through it: for
+// child processes whose connections the test freezes. The proxy closes
+// when the test ends (after the cleanups registered later, such as killing
+// those processes).
+func NewProxy(tb testing.TB, pool *pgxpool.Pool) (*Proxy, string) {
+	tb.Helper()
+	c := pool.Config().ConnConfig
+	p := newProxy(tb, c.Host, c.Port)
+	tb.Cleanup(p.Close)
+	u := url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(c.User, c.Password),
+		Host:     net.JoinHostPort("127.0.0.1", strconv.Itoa(int(p.Port()))),
+		Path:     "/" + c.Database,
+		RawQuery: "sslmode=disable",
+	}
+	return p, u.String()
 }
