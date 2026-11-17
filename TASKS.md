@@ -722,6 +722,16 @@ Lập từ hai phản biện độc lập (2026-11-17): đánh giá P11 bản đ
 
 **Hoãn (mở lại khi có số đo hoặc người dùng cần), lý do theo phản biện:** claim activity nhiều queue khoá dư; slot eager dự phòng; NOTIFY bầy đàn; chi phí ghi `execution_due_idx`; cột lock `COLLATE "C"`; cache size chỉ tăng (compact không chạm payload signal, premise sai); comp data zero value (đã có tài liệu); lock giữ tới `hold_us` khi có `LockLost`; phát hiện engine cũ (không có bảng engine); `RunInfo.Output`; `tracestate` (tách trace sau continue-as-new đã có từ T10.10); bỏ sót của analyzer (replay vẫn bắt và park); index của store mem; các refactor T11.19–T11.21 của bản đầu (vùng code từng cần 2–3 review, lợi ích thẩm mỹ). Khoảng trống API (từ example modulith, hoãn): huỷ child mà vẫn nhận kết quả thật; signal giữa các workflow; retry policy không giới hạn cho bước sau pivot; `Start` trong transaction của ứng dụng; flowtest mock child workflow; nhiều RunHook mỗi engine và `RunInfo` có input/output; signal tới instance chưa tồn tại. Rủi ro đã biết, chưa làm: history không giới hạn (dùng ContinueAsNew), `PurgeEnded` với cây con lớn, trần throughput của NOTIFY, fast path gắn với nội bộ pgx, `Start` trong transaction của ứng dụng.
 
+### P12 — Khoảng trống API thấy khi viết example modulith
+
+Quy trình như P11. Ba mục làm song song (worktree riêng), rồi T12.4 cập nhật example, cuối cùng soak dài.
+
+- [ ] **T12.1** Signal giữa các workflow: `flows.SignalWorkflow(c, instanceID, name, payload)` từ code workflow, là command ghi trong cùng transaction của checkpoint (không dual write), tất định khi replay (mismatch thì park). Instance chưa tồn tại hoặc đã kết thúc: trả lỗi về workflow (future), không im lặng. pg và mem, flowtest.
+- [ ] **T12.2** Huỷ child mà vẫn nhận kết quả thật: yêu cầu huỷ child (signal huỷ tới child, context của child bị huỷ phía child) mà future của cha chỉ resolve khi child thực sự kết thúc, với kết quả hoặc lỗi thật của nó (child có thể đã hoàn tất). Giữ hành vi cũ của `WithCancel` (tương thích), thêm API mới.
+- [ ] **T12.3** Idempotency theo instance id sau retention: tuỳ chọn giữ dấu (tombstone) của instance id đã bị `PurgeEnded` xoá, để `Start` với id đó trả lỗi rõ ràng (`ErrInstancePurged`) thay vì chạy lại; dấu có retention riêng. Mặc định giữ hành vi cũ.
+- [ ] **T12.4** Example modulith dùng T12.1–T12.3 (bỏ activity `forward-cancel`, dùng tombstone thay kiểm tra thủ công nếu hợp lý), cập nhật mục giới hạn đã biết.
+- [ ] **T12.5** Soak 30 phút trên `main` cuối cùng (`CHAOS_DURATION=30m make chaos-soak`), ghi số liệu.
+
 ## File và hàm tái sử dụng
 
 | Lấy từ | Dùng cho |
