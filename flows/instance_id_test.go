@@ -111,7 +111,7 @@ func TestInstanceAndExecutionIDAllocateNothing(t *testing.T) {
 		exs = testing.AllocsPerRun(100, func() { gotEx = ExecutionID(c) })
 		return nil, nil
 	}}
-	ex := executor.New(wf, 7, executor.Options{InstanceID: "alloc-1"})
+	ex := executor.New(wf, 7, executor.Options{WorkflowInstanceID: "alloc-1"})
 	defer ex.Close()
 	task := &store.WorkflowTask{Now: time.Unix(1000, 0), Pending: []store.PendingEvent{{ID: 1, Event: history.Event{
 		Type: history.ExecutionStarted, Name: wf.Name, Version: 1, Queue: "q",
@@ -130,6 +130,9 @@ func TestInstanceAndExecutionIDAllocateNothing(t *testing.T) {
 // T11.10: Terminate after continue-as-new to another workflow and version
 // tells the observer the workflow and version of the execution it ended
 // (the last one), on both stores.
+// The public API continues as new into the same definition only
+// (ContinueAsNew), so the completion is injected at the store level: the
+// observer must read the latest execution, whatever produced it.
 func TestTerminateAfterContinueAsNewObservesLastExecution(t *testing.T) {
 	t.Run("mem", func(t *testing.T) { testTerminateAfterContinueAsNew(t, mem.New(nil)) })
 	t.Run("pg", func(t *testing.T) {

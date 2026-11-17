@@ -661,7 +661,7 @@ func (d *driver) build(task *store.WorkflowTask) bool {
 		return false
 	}
 	opts := w.exOpts
-	opts.InstanceID = e.InstanceID
+	opts.WorkflowInstanceID = e.InstanceID
 	ex := executor.New(wf, e.ID, opts)
 	var err error
 	if task.LastSeq > 0 { // a new execution has no history yet
