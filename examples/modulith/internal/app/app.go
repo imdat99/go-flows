@@ -108,7 +108,8 @@ type Config struct {
 	// process does not run it. One process is enough; concurrent runs are
 	// safe, only wasted work.
 	PurgeEvery time.Duration
-	// Retention is how long ended workflows are kept (default 30 days).
+	// Retention is how long ended workflows are kept (0 or less: the
+	// default, 30 days; to keep them forever, set PurgeEvery to 0).
 	Retention time.Duration
 	// KeepPurgedIDs is how long an instance id stays used after its
 	// workflow was purged (flows.Options.KeepPurgedIDs; default 90 days,

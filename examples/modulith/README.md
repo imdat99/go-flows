@@ -504,6 +504,19 @@ var (
 
 What go-flows made hard here, and how the example works around it:
 
+- **Changing a workflow's steps needs a new version.** This revision
+  replaced the order's `orders.forward-cancel` activity and the
+  shipment's own cancel signal with `Future.RequestCancel`, keeping
+  version 1 because the example has no running executions. In a real
+  deployment, define version 2 next to version 1 (see "Versioning a
+  workflow") or drain version 1 first: an order recorded with the old
+  steps would otherwise be parked on replay.
+- **After retention, an order is still readable but no longer
+  cancelable.** `GET /orders/{id}` answers from the orders table, while a
+  cancel signal finds no instance (404). An id whose saga failed before
+  the order row was recorded, then was purged, gets 409 on a retry
+  (tombstone) where it got 202 before the purge.
+
 - **Definitions are global, so dependencies need a holder.** Activities
   are package-level values in a global registry and cannot take
   constructor arguments. Each process package has one explicit injection

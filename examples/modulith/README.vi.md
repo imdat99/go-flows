@@ -497,6 +497,16 @@ var (
 
 Những gì go-flows làm khó ở đây, và cách ví dụ xoay xở:
 
+- **Đổi các bước của workflow cần version mới.** Bản này thay activity
+  `orders.forward-cancel` của đơn hàng và signal huỷ riêng của shipment
+  bằng `Future.RequestCancel`, vẫn giữ version 1 vì example không có
+  execution nào đang chạy. Khi deploy thật, hãy định nghĩa version 2 cạnh
+  version 1 (xem "Đánh version workflow") hoặc chạy hết version 1 trước:
+  nếu không, đơn hàng đã ghi các bước cũ sẽ bị park khi replay.
+- **Sau retention, đơn hàng vẫn đọc được nhưng không huỷ được nữa.**
+  `GET /orders/{id}` trả lời từ bảng orders, còn signal huỷ không tìm thấy
+  instance (404). Một id mà saga thất bại trước khi ghi dòng đơn hàng rồi
+  bị xoá thì khi gửi lại nhận 409 (tombstone), trước khi xoá là 202.
 - **Định nghĩa là toàn cục, nên dependency cần chỗ giữ.** Activity là giá
   trị cấp package trong registry toàn cục và không nhận tham số
   constructor được. Mỗi package process có đúng một điểm inject tường
