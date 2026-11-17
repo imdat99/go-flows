@@ -15,6 +15,14 @@ must take care of.
 
 ## Unreleased
 
+### Added
+
+- `flows.InstanceID(c)` and `flows.ExecutionID(c)`: workflow code reads
+  its own instance id (kept by continue-as-new) and execution id;
+  deterministic under replay, no allocation (T11.9).
+- An engine logs once at start when it lowers `PollMax` to `LeaseTTL`/3
+  (T11.8).
+
 ### Changed
 
 - Releases are made by hand (release workflow, `workflow_dispatch` with an
@@ -26,6 +34,14 @@ must take care of.
 
 ### Fixed
 
+- When the database stopped responding without closing connections
+  (failover, network drop without RST), the lease heartbeat hung on the
+  renewal and never gave up leases, so a running activity kept going past
+  its lease while another engine ran the next attempt concurrently. Each
+  renewal now has a deadline of one heartbeat interval (`LeaseTTL`/3), and
+  leases not renewed for `LeaseTTL - LeaseTTL/3` are given up (their
+  context canceled with `ErrLeaseLost`) on a timer that does not wait for
+  the renewal to return (T11.1).
 - `Engine.Stop(ctx)` honours ctx's deadline when the database stops
   answering (a failover, a partition without RST) (T11.2). Once ctx is
   done, Stop waits at most about 1 second more; tasks still blocked are
