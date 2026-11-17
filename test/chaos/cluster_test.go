@@ -741,43 +741,62 @@ func (cl *cluster) pausedOverlap(stops, holes map[int][]window, a, b attemptRow)
 	// interval: about two intervals at worst, plus 1s for -race and a
 	// loaded machine.
 	resumeMargin := 2*cl.ttl/3 + time.Second
-	// The paused process's lease was renewed (or claimed) within an
-	// interval before its renewals stopped: when the pause began, or when
-	// a blackhole of that process began, if one was on within a ttl before
-	// the pause (renewals stalled before the SIGSTOP). It lapses no sooner
-	// than ttl - ttl/3 after that (renewed at most an interval before, for
-	// ttl): another engine starting the task sooner took a live lease, and
-	// the pause excuses nothing. lapseSlack covers the clocks of the
-	// processes (one machine) and the recording of the pause.
+	// The paused lease lapses no sooner than ttl - ttl/3 (less lapseSlack)
+	// after its renewals stopped (lapseBase): another engine starting the
+	// task sooner took a live lease, and the pause excuses nothing.
 	//
 	// Accepted, rare false failure: b's process paused between its
 	// engine's start check (the claim's age, T11.11) and the recording of
 	// its start, with b's renewals stalled by something other than a
 	// recorded blackhole; its lease lapsed earlier than the rule assumes.
-	const lapseSlack = 100 * time.Millisecond
 	lapse := cl.ttl - cl.ttl/3 - lapseSlack
-	stalled := func(pid int, w window) time.Time {
-		from := w.from
-		for _, h := range holes[pid] {
-			if h.from.Before(from) && h.to.After(w.from.Add(-cl.ttl)) {
-				from = h.from
-			}
-		}
-		return from
-	}
 	for _, w := range stops[a.pid] {
 		if w.from.Before(b.start) && w.to.After(a.start.Add(-cl.ttl)) && !a.end.After(w.to.Add(resumeMargin)) &&
-			!b.start.Before(stalled(a.pid, w).Add(lapse)) {
+			!b.start.Before(lapseBase(holes[a.pid], w, a.start, cl.ttl).Add(lapse)) {
 			return true
 		}
 	}
 	for _, w := range stops[b.pid] {
+		// b's start is recorded after the resume (its claim, before the
+		// pause, is not recorded): only a blackhole still on then counts.
 		if w.from.Before(a.start) && w.to.After(b.start.Add(-cl.ttl)) && !b.end.After(w.to.Add(resumeMargin)) &&
-			!a.start.Before(stalled(b.pid, w).Add(lapse)) {
+			!a.start.Before(lapseBase(holes[b.pid], w, b.start, cl.ttl).Add(lapse)) {
 			return true
 		}
 	}
 	return false
+}
+
+// lapseSlack covers, in pausedOverlap, the clocks of the processes (one
+// machine) and the recording of pauses and blackholes.
+const lapseSlack = 100 * time.Millisecond
+
+// lapseBase is when the renewals of a lease held by a process paused over
+// w stopped, for an attempt of that process recorded as started at
+// started: the lease was renewed (or claimed) at most an interval before
+// it, so it lapses no sooner than ttl - ttl/3 after it.
+//
+// It is the pause's start, or the start of one of the process's
+// blackholes (holes: its connections frozen both ways, so nothing is
+// claimed nor renewed during one) after which the lease cannot have been
+// renewed nor claimed: one that began before the pause, ended after the
+// attempt started (the attempt's lease was not claimed after it), and
+// either was still on when the pause began (within lapseSlack) or lasted
+// at least ttl - ttl/3 (the heartbeat had given the lease up, and it is
+// never renewed again). Any other blackhole, such as one that ended
+// before the attempt started or well before the pause with the lease
+// renewed since, does not count.
+func lapseBase(holes []window, w window, started time.Time, ttl time.Duration) time.Time {
+	base := w.from
+	for _, h := range holes {
+		if !h.from.Before(base) || !started.Before(h.to) {
+			continue
+		}
+		if !h.to.Before(w.from.Add(-lapseSlack)) || h.to.Sub(h.from) >= ttl-ttl/3 {
+			base = h.from
+		}
+	}
+	return base
 }
 
 // attempts returns the attempts recorded, by start, with their ends (an
