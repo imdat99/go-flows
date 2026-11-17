@@ -53,7 +53,27 @@ jobs:
       - name: postgres
         run: make up
       - run: make bench
-      - run: make benchgate
+      # The gate's table (medians against the budget) in the job summary:
+      # readable without a login, unlike the logs and the artifact.
+      - name: benchgate
+        run: |
+          set -o pipefail
+          make -s benchgate | tee benchgate.txt
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '## Perf gate'
+            echo
+            cat benchgate.txt 2>/dev/null || echo 'benchgate did not run'
+            echo
+            echo '<details><summary>bench.txt</summary>'
+            echo
+            echo '```'
+            cat bench.txt 2>/dev/null
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always() # most needed when the gate fails
         with:

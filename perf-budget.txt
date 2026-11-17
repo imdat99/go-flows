@@ -2,6 +2,9 @@
 # One rule per line: <benchmark> <unit> <op> <limit>; medians of -count runs.
 # Allocation counts are near deterministic: keep their limits tight and lower
 # them when a change improves them. A rule whose benchmark is missing fails.
+# Benchmarks that commit to Postgres get no ns/op or other time rule: their
+# time is the disk's fsync, which stalls for seconds on the development VM
+# and on shared CI runners alike (T10.16, docs/benchmarks.md).
 #
 # Targets (TASKS.md, Performance):
 #   BenchmarkActivityRun   allocs/op <= 80 (10 activities), B/op <= 8192

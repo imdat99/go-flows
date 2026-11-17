@@ -170,10 +170,39 @@ pid namespace), and the VM's disk (`iostat -x 1`). 21 runs took 0.9 to
   busy. No checkpoint, autovacuum or other Postgres `fsync` falls in the
   episodes (the checkpointer's `fsync` calls came at other times).
 
-The development machine is a VM whose virtual disk stalls for seconds at a
-time; durable commits (fsync on, as in production) expose it. It is not
-the engine, and nothing in it to fix. A shared CI runner can stall the same
-way: the end-to-end benchmarks therefore gate allocations only, never time.
+Postgres ran with its defaults, `fsync=on` and `synchronous_commit=on`
+(`wal_sync_method=fdatasync`): a commit returns after the WAL `fdatasync`,
+so a commit's latency is that call's. The development machine is a VM
+whose virtual disk stalls for seconds at a time, and durable commits expose
+it. It is not the engine, and there is nothing in it to fix. No Go
+execution trace (`-trace`) was taken: the store-call timings already cover
+the whole run time, so a trace could only show the goroutines blocked on
+the Postgres socket. The development VM stalls this way, and a shared CI
+runner can too: benchmarks that commit to Postgres gate allocations only,
+never time (`perf-budget.txt`).
+
+To reproduce (the Postgres of `make up`; the strace and libunwind of the
+host, mounted in a glibc image; `-p` every running postgres process, `-f`
+follows the backends forked later):
+
+```sh
+L=/lib/x86_64-linux-gnu
+docker run --rm --name flows-strace --pid=container:workflows-postgres-1 \
+  --cap-add SYS_PTRACE -v "$PWD":/out -v /usr/bin/strace:/usr/local/bin/strace:ro \
+  -v $L/libunwind-ptrace.so.0:$L/libunwind-ptrace.so.0:ro \
+  -v $L/libunwind-x86_64.so.8:$L/libunwind-x86_64.so.8:ro \
+  -v $L/libunwind.so.8:$L/libunwind.so.8:ro postgres:16 sh -c '
+    P=""; for d in /proc/[0-9]*; do [ "$(cat $d/comm 2>/dev/null)" = postgres ] && P="$P -p ${d#/proc/}"; done
+    exec strace -f $P -T -ttt -e trace=fdatasync,fsync -o /out/fsync.txt' &
+iostat -x -t -y vda 1 > iostat.txt &
+go test -run '^$' -bench '^BenchmarkActivityRun$' -benchtime 2000x ./internal/worker
+docker stop flows-strace; kill %2
+```
+
+The store-call timings came from throwaway test code (not kept): a store
+wrapping `pg.Store` that timed `CompleteWorkflowTask`,
+`CompleteActivityTask` and the two `Claim*Due` calls and printed the calls
+of every run longer than 3 times the median.
 
 ## Other benchmarks (perf gate)
 
@@ -199,8 +228,11 @@ issue #377) has no rule: it counts the allocations of the whole tester
 process.
 
 Headroom on a shared CI runner (T10.16): the CI's bench logs and its
-`bench.txt` artifact need a GitHub login, so they were not read; the bench
-job passed the gate in all 5 CI runs so far (2026-11-16). Emulating a
+`bench.txt` artifact need a GitHub login, so they were not read (the bench
+job now writes the gate's table to its step summary). The public runs API
+(`/repos/imdat99/go-flows/actions/runs` and each run's jobs) gave the bench
+job's conclusion: success in all 5 ci runs up to 2026-11-16 (the medians
+themselves unknown). Emulating a
 4-vCPU runner (the benchmarks pinned to 4 cores, two of them kept busy by a
 CPU hog) moved no allocation median: `BenchmarkActivityRun` 76 (samples
 72-77), `BenchmarkPublicActivityRun` 141 (136-145), `BenchmarkEagerActivity`
