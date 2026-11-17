@@ -15,6 +15,15 @@ must take care of.
 
 ## Unreleased
 
+## v0.2.0 (2026-11-17)
+
+Workflow-to-workflow signals, cancelling a child while keeping its real
+outcome, tombstones of purged instance ids, bounded retries of work that
+crashes its process, and fixes for a database that stops answering. A minor
+bump: lost activity attempts now count against `RetryPolicy`, and `Stop`
+gives up after its deadline (see Changed and Fixed). Two migrations
+(`00017`, `00018`) and new history events (31-33): read the upgrade notes.
+
 ### Added
 
 - `Future.RequestCancel(c)`: a parent asks a child workflow to cancel and
