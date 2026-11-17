@@ -59,12 +59,16 @@ var (
 	// ErrNoShipment is the error of ConfirmPickup for an order without a
 	// label yet: the carrier retries later.
 	ErrNoShipment = errors.New("shipping: no shipment for this order yet")
+	// ErrInvalidDecision is the error of Decide asked for an outcome other
+	// than StatePickupConfirmed or StateCanceled (a caller's bug).
+	ErrInvalidDecision = errors.New("shipping: a decision is pickup_confirmed or canceled")
 )
 
 // IsRejection reports whether err is a business rejection of the module.
 func IsRejection(err error) bool {
 	return errors.Is(err, ErrUnserviceable) || errors.Is(err, ErrShipmentExists) ||
-		errors.Is(err, ErrLabelCanceled) || errors.Is(err, ErrPickupRefused)
+		errors.Is(err, ErrLabelCanceled) || errors.Is(err, ErrPickupRefused) ||
+		errors.Is(err, ErrInvalidDecision)
 }
 
 //go:embed migrations/*.sql
@@ -190,6 +194,9 @@ func (s *Service) ConfirmPickup(ctx context.Context, orderID, tracking string) e
 // it has left it already (the carrier confirmed first), and returns the
 // state. Idempotent: a repeat returns the decided state.
 func (s *Service) Decide(ctx context.Context, d Decision) (Decided, error) {
+	if d.Want != StatePickupConfirmed && d.Want != StateCanceled {
+		return Decided{}, fmt.Errorf("%w: %q", ErrInvalidDecision, d.Want)
+	}
 	var out Decided
 	var tracking *string
 	// Lock the row, then decide on its latest state (see ConfirmPickup).

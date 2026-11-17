@@ -310,6 +310,9 @@ func (s *Service) Discontinue(ctx context.Context, sku string) error {
 // returns how many it deleted. Keep age well above the longest time a
 // caller can take to repeat or settle an effect: a purge reopens its key.
 func (s *Service) PurgeRequests(ctx context.Context, age time.Duration, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, errors.New("inventory: purge requests: limit must be positive")
+	}
 	tag, err := s.db.Exec(ctx, `
 		DELETE FROM inventory.processed_requests WHERE key IN (
 			SELECT key FROM inventory.processed_requests
