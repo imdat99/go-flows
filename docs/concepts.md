@@ -169,8 +169,11 @@ returned and its original `Key`:
   parent or a child included). It is a command recorded in the history and
   delivered in the transaction of the checkpoint that records it: sent
   once, never again on replay. Its future resolves with `nil`, or an error
-  matching `ErrNotFound` (unknown instance) or `ErrNotActive` (its execution
-  ended). A signal sent as the workflow returns, not awaited, is still sent.
+  matching `ErrSignalTargetNotFound` (unknown instance) or
+  `ErrSignalTargetEnded` (its execution ended). A signal sent as the
+  workflow returns, not awaited, is still sent. The sender's checkpoint
+  holds the target's row lock until it commits, so many workflows
+  signalling one coordinator serialise their checkpoints on its row.
 - **Children are workflows started from a workflow.** `wf.Child(c, id, in)`
   returns a `Future`. Canceling the parent cancels its running children,
   and so does its end. Canceling the context a child was started with

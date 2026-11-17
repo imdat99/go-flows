@@ -3,10 +3,11 @@ package flows
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
-	"github.com/imdat99/go-flows/internal/history"
+	"github.com/imdat99/go-flows/internal/store"
 	"github.com/imdat99/go-flows/internal/store/mem"
 )
 
@@ -27,11 +28,13 @@ var (
 		if _, err := SignalWorkflow(c, in.Target, "hello", "hi from "+InstanceID(c)).Get(c); err != nil {
 			return "", err
 		}
-		if _, err := SignalWorkflow(c, "sig-nobody", "hello", "x").Get(c); !errors.Is(err, ErrNotFound) {
+		_, err := SignalWorkflow(c, "sig-nobody", "hello", "x").Get(c)
+		if !errors.Is(err, ErrSignalTargetNotFound) || errors.Is(err, ErrNotFound) {
 			return "", fmt.Errorf("to an unknown instance: %w", err)
 		}
 		if in.Ended != "" {
-			if _, err := SignalWorkflow(c, in.Ended, "hello", "x").Get(c); !errors.Is(err, ErrNotActive) {
+			_, err := SignalWorkflow(c, in.Ended, "hello", "x").Get(c)
+			if !errors.Is(err, ErrSignalTargetEnded) || errors.Is(err, ErrNotActive) {
 				return "", fmt.Errorf("to an ended instance: %w", err)
 			}
 		}
@@ -54,6 +57,31 @@ var (
 		SignalWorkflow(c, target, "hello", "bye")
 		return struct{}{}, nil
 	})
+	// sigParent starts a child and signals it in the same task, then waits
+	// for the child's signal and its result.
+	sigParent = DefineWorkflow("test.sig.parent", 1, func(c Ctx, _ struct{}) (string, error) {
+		kid := InstanceID(c) + "-kid"
+		f := sigKid.Child(c, kid, InstanceID(c))
+		if _, err := SignalWorkflow(c, kid, "hello", "from parent").Get(c); err != nil {
+			return "", err
+		}
+		msg, err := Await[string](c, "from-kid", 0)
+		if err != nil {
+			return "", err
+		}
+		out, err := f.Get(c)
+		return msg + "|" + out, err
+	})
+	// sigKid waits for its parent's signal, and signals its parent as it
+	// ends (not awaited).
+	sigKid = DefineWorkflow("test.sig.kid", 1, func(c Ctx, parent string) (string, error) {
+		got, err := Await[string](c, "hello", 0)
+		if err != nil {
+			return "", err
+		}
+		SignalWorkflow(c, parent, "from-kid", "from kid")
+		return got, nil
+	})
 )
 
 type sigInput struct {
@@ -61,44 +89,35 @@ type sigInput struct {
 	Ended  string `json:"ended"`
 }
 
-func countSignalEvents(t *testing.T, st *mem.Store, instanceID string, typ history.Type) int {
+// sigStores are rcStores (memory, Postgres fast path, Postgres through
+// pgx) and memory with the cache off: every task replays.
+var sigStores = append(slices.Clip(rcStores), struct {
+	name   string
+	engine func(t *testing.T) *Engine
+}{"mem-nocache", func(t *testing.T) *Engine {
 	t.Helper()
-	n := 0
-	for _, ex := range st.Executions() {
-		if ex.InstanceID != instanceID {
-			continue
-		}
-		hist, err := st.LoadHistory(bg, ex.ID, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, ev := range hist {
-			if ev.Type == typ {
-				n++
-			}
-		}
+	e, err := newEngine(mem.New(nil), Options{InstanceID: "sig", PollMax: 20 * time.Millisecond, CacheSize: -1})
+	if err != nil {
+		t.Fatal(err)
 	}
-	return n
-}
+	if err := e.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Stop(bg) })
+	return e
+}})
 
 // T12.1: workflow A signals workflow B, which waits for it; errors for an
-// unknown or ended target come back to A; A signals itself. With the
-// cache off, every task of A replays its signals from the history: none is
-// sent twice (B records exactly one).
+// unknown or ended target come back to A (their own sentinels, not
+// ErrNotFound or ErrNotActive); A signals itself. With the cache off,
+// every task of A replays its signals from the history: none is sent twice
+// (B records exactly one).
 func TestSignalWorkflow(t *testing.T) {
-	for _, cache := range []int{0, -1} {
-		t.Run(fmt.Sprintf("cache=%d", cache), func(t *testing.T) {
-			st := mem.New(nil)
-			e, err := newEngine(st, Options{InstanceID: "sig", PollMax: 20 * time.Millisecond, CacheSize: cache})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := e.Start(bg); err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = e.Stop(bg) })
+	for _, s := range sigStores {
+		t.Run(s.name, func(t *testing.T) {
+			t.Parallel()
+			e := s.engine(t)
 			ctx := waitCtx(t)
-
 			if _, err := sigWaiter.Start(ctx, e, "sig-ended", struct{}{}); err != nil {
 				t.Fatal(err)
 			}
@@ -120,14 +139,32 @@ func TestSignalWorkflow(t *testing.T) {
 			if err != nil || got != "hi from sig-a" {
 				t.Fatalf("waiter: %q %v", got, err)
 			}
-			if n := countSignalEvents(t, st, "sig-b", history.SignalReceived); n != 1 {
+			if n := countEvents(t, e, "sig-b", "SignalReceived"); n != 1 {
 				t.Fatalf("b received %d signals, want 1", n)
 			}
-			if n := countSignalEvents(t, st, "sig-a", history.SignalSent); n != 4 {
+			if n := countEvents(t, e, "sig-a", "SignalSent"); n != 4 {
 				t.Fatalf("a sent %d signals, want 4", n)
 			}
-			if n := countSignalEvents(t, st, "sig-a", history.SignalReceived); n != 1 {
+			if n := countEvents(t, e, "sig-a", "SignalReceived"); n != 1 {
 				t.Fatalf("a received %d signals from itself, want 1", n)
+			}
+		})
+	}
+}
+
+// T12.1: a parent starts a child and signals it in the same task; the
+// child signals its parent in the task that ends it.
+func TestSignalWorkflowParentAndChild(t *testing.T) {
+	for _, s := range sigStores {
+		t.Run(s.name, func(t *testing.T) {
+			t.Parallel()
+			e := s.engine(t)
+			out, err := sigParent.Run(waitCtx(t), e, "sig-parent", struct{}{})
+			if err != nil || out != "from kid|from parent" {
+				t.Fatalf("parent: %q %v", out, err)
+			}
+			if n := countEvents(t, e, "sig-parent", "SignalReceived"); n != 1 {
+				t.Fatalf("parent received %d signals, want 1", n)
 			}
 		})
 	}
@@ -169,3 +206,21 @@ var sigInvalid = DefineWorkflow("test.sig.invalid", 1, func(c Ctx, _ struct{}) (
 	}
 	return "ok", nil
 })
+
+// T12.1: the errors of a signal's target have kinds of their own: a
+// workflow failing with ErrNotFound or ErrNotActive (an activity calling
+// Engine.Signal, say) records no kind that would make its error match them,
+// and theirs do not match ErrNotFound or ErrNotActive.
+func TestSignalWorkflowKindsAreDistinct(t *testing.T) {
+	for err, want := range map[error]string{
+		ErrSignalTargetNotFound: store.KindSignalTargetNotFound, ErrSignalTargetEnded: store.KindSignalTargetEnded,
+		ErrNotFound: "", ErrNotActive: "",
+	} {
+		if got := errorKinds(fmt.Errorf("x: %w", err)); got != want {
+			t.Errorf("kinds of %v: %q, want %q", err, got, want)
+		}
+	}
+	if errors.Is(ErrSignalTargetEnded, ErrNotActive) || errors.Is(ErrSignalTargetNotFound, ErrNotFound) {
+		t.Fatal("signal target errors match the engine's sentinels")
+	}
+}

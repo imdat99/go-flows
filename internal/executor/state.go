@@ -292,7 +292,7 @@ func (c *signalCall) resolve(ev *history.Event) error {
 // SignalWorkflow sends signal name with payload to the active execution of
 // instance instanceID (this one included); the future resolves once the
 // store answered (in the checkpoint that records it): an empty Result, or
-// a *RecordedError with kind store.KindNotFound or store.KindNotActive.
+// a *RecordedError with kind store.KindSignalTargetNotFound or store.KindSignalTargetEnded.
 // Not cancelable. Sent in the task that ends the workflow, it is still
 // sent (its answer is not awaited).
 func (st *State) SignalWorkflow(instanceID, name string, payload []byte) *coro.Future[Result] {

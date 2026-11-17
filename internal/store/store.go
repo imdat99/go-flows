@@ -97,17 +97,19 @@ const (
 	// (WorkflowTask.Claims: its engines crashed or lost the lease mid-task,
 	// T11.3); ReopenParked resumes those too.
 	KindCrashLoop = "crash_loop"
-	// KindNotFound and KindNotActive are the kinds of a SignalFailed answer
-	// (Completion.Signals): the target instance is unknown (ErrNotFound),
-	// or its latest execution ended (ErrNotActive).
-	KindNotFound  = "not_found"
-	KindNotActive = "not_active"
+	// KindSignalTargetNotFound and KindSignalTargetEnded are the kinds of a
+	// SignalFailed answer (Completion.Signals): the target instance is
+	// unknown, or its latest execution ended. They are distinct from any
+	// kind of ErrNotFound or ErrNotActive, so that a workflow failing with
+	// those is not mistaken for a signal's failure, nor the reverse.
+	KindSignalTargetNotFound = "signal_target_not_found"
+	KindSignalTargetEnded    = "signal_target_ended"
 )
 
 // The messages of a SignalFailed answer (Completion.Signals).
 const (
-	SignalNotFound  = "signal not delivered: instance not found"
-	SignalNotActive = "signal not delivered: instance not active"
+	SignalNotFound  = "signal not delivered: target instance not found"
+	SignalNotActive = "signal not delivered: target instance ended"
 )
 
 // Status of an execution. Values are stored: never change them.
@@ -302,8 +304,8 @@ type Completion struct {
 	// event for the active execution of the target instance id (this one
 	// included), made ready. Each gets a pending answer for this execution,
 	// visible at once, in order: SignalDelivered, or SignalFailed (Ref the
-	// target, Err SignalNotFound or SignalNotActive, ErrKinds KindNotFound
-	// or KindNotActive). An ending completion may send signals too (its
+	// target, Err SignalNotFound or SignalNotActive, ErrKinds KindSignalTargetNotFound
+	// or KindSignalTargetEnded). An ending completion may send signals too (its
 	// answers are dropped with its other pending events; a signal to itself
 	// then moves to the next execution of a continue-as-new). The store
 	// locks the targets' execution rows and its own in id order, so that

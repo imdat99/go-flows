@@ -15,7 +15,7 @@ var approver = flows.DefineWorkflow("ft.approver", 1, func(c flows.Ctx, target s
 		return false, err
 	}
 	_, err := flows.SignalWorkflow(c, "ft-nobody", "approved", true).Get(c)
-	return errors.Is(err, flows.ErrNotFound), nil
+	return errors.Is(err, flows.ErrSignalTargetNotFound), nil
 })
 
 // T12.1: SignalWorkflow under the tester (memory store, virtual time).

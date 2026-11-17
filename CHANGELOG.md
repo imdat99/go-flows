@@ -27,8 +27,11 @@ must take care of.
   signals another workflow (or itself) durably. The signal is a command
   (`SignalSent` in the history) delivered in the transaction of the
   checkpoint that records it, never sent again on replay; its future
-  resolves with `nil`, `ErrNotFound` or `ErrNotActive`. Mutual signals
-  lock execution rows in id order (no deadlock). No migration (T12.1).
+  resolves with `nil`, or the new `ErrSignalTargetNotFound` or
+  `ErrSignalTargetEnded` (kinds `signal_target_not_found`,
+  `signal_target_ended`). Mutual signals lock execution rows in id order
+  (no deadlock); signals to one target serialise the senders' checkpoints
+  on its row. No migration (T12.1).
 - `examples/modulith`: a modular monolith blueprint (five modules, cross-module sagas, split deployments by queue).
 - `flows.InstanceID(c)` and `flows.ExecutionID(c)`: workflow code reads
   its own instance id (kept by continue-as-new) and execution id;

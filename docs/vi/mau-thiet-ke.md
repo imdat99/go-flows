@@ -93,7 +93,7 @@ Workflow khác gửi bằng `flows.SignalWorkflow`, durable và đúng một l�
 
 ```go
 if _, err := flows.SignalWorkflow(c, orderID, "approval", true).Get(c); err != nil {
-	return err // ErrNotFound, hoặc ErrNotActive: đơn hàng đã kết thúc
+	return err // ErrSignalTargetNotFound, hoặc ErrSignalTargetEnded: đơn hàng đã kết thúc
 }
 ```
 

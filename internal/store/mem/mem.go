@@ -1007,9 +1007,9 @@ func (s *Store) sendSignals(e *execution, reqs []store.SignalRequest, now time.T
 		id, ok := s.latest[r.InstanceID]
 		switch target := s.executions[id]; {
 		case !ok:
-			answer.Type, answer.Err, answer.ErrKinds = history.SignalFailed, store.SignalNotFound, store.KindNotFound
+			answer.Type, answer.Err, answer.ErrKinds = history.SignalFailed, store.SignalNotFound, store.KindSignalTargetNotFound
 		case !target.Status.Active():
-			answer.Type, answer.Err, answer.ErrKinds = history.SignalFailed, store.SignalNotActive, store.KindNotActive
+			answer.Type, answer.Err, answer.ErrKinds = history.SignalFailed, store.SignalNotActive, store.KindSignalTargetEnded
 		default:
 			s.addPending(target, history.Event{Type: history.SignalReceived, Name: r.Name, Payload: clone(r.Payload)}, now)
 			if target != e {

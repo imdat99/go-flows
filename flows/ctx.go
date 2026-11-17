@@ -373,9 +373,15 @@ func Await[T any](c Ctx, name string, timeout time.Duration) (T, error) {
 // it is sent exactly once, never again on replay. The future resolves
 // once the store answered, in the next workflow task (without a poll: the
 // engine resumes the execution at once): nil when delivered, an error
-// matching ErrNotFound when the instance is unknown, or ErrNotActive when
-// its latest execution has ended. Invalid arguments or a payload that
-// cannot be encoded fail the call with a permanent error (nothing is sent).
+// matching ErrSignalTargetNotFound when the instance is unknown, or
+// ErrSignalTargetEnded when its latest execution has ended (an instance
+// that continued as new gets the signal in its new execution, as with
+// Engine.Signal). Invalid arguments or a payload that cannot be encoded
+// fail the call with a permanent error (nothing is sent).
+//
+// The sender's checkpoint holds the target's row lock until it commits:
+// many workflows signalling one coordinator at once serialise their
+// checkpoints on its row (and with the coordinator's own).
 //
 // Sent in the task that ends the workflow, without awaiting the future,
 // the signal is sent all the same. Replaying a different target, name or

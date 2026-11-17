@@ -93,7 +93,7 @@ Another workflow sends it with `flows.SignalWorkflow`, durably and once
 
 ```go
 if _, err := flows.SignalWorkflow(c, orderID, "approval", true).Get(c); err != nil {
-	return err // ErrNotFound, or ErrNotActive: the order has ended
+	return err // ErrSignalTargetNotFound, or ErrSignalTargetEnded: the order has ended
 }
 ```
 

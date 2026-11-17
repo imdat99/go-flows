@@ -21,7 +21,7 @@ func signalWF(target string, payload []byte) executor.Workflow {
 		}
 		r, _ := st.SignalWorkflow("missing", "go", nil).Get(ctx)
 		re, ok := errors.AsType[*executor.RecordedError](r.Err)
-		if !ok || !re.HasKind(store.KindNotFound) {
+		if !ok || !re.HasKind(store.KindSignalTargetNotFound) {
 			return nil, errors.New("unexpected answer")
 		}
 		_, err := st.NewTimer(ctx, time.Hour, "t").Get(ctx)
@@ -32,7 +32,7 @@ func signalWF(target string, payload []byte) executor.Workflow {
 var signalTasks = [][]history.Event{
 	{startEvent()},
 	{{Type: history.SignalDelivered, ScheduleID: 1, Ref: "b"}},
-	{{Type: history.SignalFailed, ScheduleID: 2, Ref: "missing", Err: store.ErrNotFound.Error(), ErrKinds: store.KindNotFound}},
+	{{Type: history.SignalFailed, ScheduleID: 2, Ref: "missing", Err: store.ErrNotFound.Error(), ErrKinds: store.KindSignalTargetNotFound}},
 }
 
 // T12.1: a signal to another workflow is a command: recorded (SignalSent),

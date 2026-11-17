@@ -31,7 +31,7 @@ var pgPinger = flows.DefineWorkflow("pgtest.pinger", 1, func(c flows.Ctx, in pin
 		}
 	}
 	_, err := flows.SignalWorkflow(c, "pg-nobody", "ping", 0).Get(c)
-	if !errors.Is(err, flows.ErrNotFound) {
+	if !errors.Is(err, flows.ErrSignalTargetNotFound) {
 		return 0, fmt.Errorf("to an unknown instance: %w", err)
 	}
 	return in.N, nil
@@ -44,7 +44,9 @@ type pingIn struct {
 
 // T12.1 on Postgres: pairs of workflows signalling each other back and
 // forth, on two engines (fast path, cache on and off): every signal is
-// delivered once, none deadlocks.
+// delivered once and every run ends. This shows liveness, not the lock
+// order (the store's retry absorbs a deadlock, 40P01): the NOWAIT tests of
+// internal/store/pg prove the order.
 func TestPostgresSignalWorkflow(t *testing.T) {
 	pool := testdb.New(t)
 	ctx := context.Background()

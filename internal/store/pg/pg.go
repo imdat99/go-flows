@@ -1287,10 +1287,20 @@ func latestExecOf(t string) string {
 // own $1 (targets $2), and its parent when it ends ($3). lockSignalsAfter,
 // right after the fence, locks those of a higher id with its children's
 // rows when it writes them ($3: child cancels, child compensation, or an
-// end), in one order. sendSignals then writes them. A target created or
-// continued as new after these statements ran is locked by sendSignals out
-// of order (a child started in the same checkpoint is this transaction's
-// own row): a cycle there is left to Postgres' detection (retry).
+// end), in one order. sendSignals then writes them.
+//
+// sendSignals resolves each target's latest execution again, in its own
+// snapshot, taken after the lock statements: a target that continued as
+// new while they waited for its row (its completion holds it) is seen in
+// its new execution and gets the signal there, as with Engine.Signal
+// (TestSignalFollowsContinueAsNewDuringLockWait). Once locked, a target
+// cannot continue as new before this transaction ends (its completion
+// needs its row). What is left: a target created (or continued as new from
+// an execution these statements did not see) after they ran is locked by
+// sendSignals out of order (a child started in the same checkpoint is this
+// transaction's own row): a cycle there is left to Postgres' detection
+// (retry); and one created after sendSignals' snapshot is not found, as an
+// Engine.Signal racing its Start.
 var (
 	lockSignalsBefore = `
 		SELECT 1 FROM flows.execution
@@ -1337,7 +1347,7 @@ var sendSignals = `
 			            THEN '` + store.SignalNotActive + `' ELSE '` + store.SignalNotFound + `' END,
 			       CASE WHEN t.id IS NOT NULL THEN ''
 			            WHEN EXISTS (SELECT 1 FROM flows.execution e WHERE e.instance_id = u.target)
-			            THEN '` + store.KindNotActive + `' ELSE '` + store.KindNotFound + `' END,
+			            THEN '` + store.KindSignalTargetEnded + `' ELSE '` + store.KindSignalTargetNotFound + `' END,
 			       u.ord, 1
 			FROM u LEFT JOIN t ON t.instance_id = u.target
 		) r

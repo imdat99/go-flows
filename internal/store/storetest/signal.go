@@ -103,8 +103,8 @@ func testSignalWorkflow(t *testing.T, h Harness) {
 	}
 	want := []answer{
 		{history.SignalDelivered, 1, "b", ""},
-		{history.SignalFailed, 2, "missing", store.KindNotFound},
-		{history.SignalFailed, 3, "c", store.KindNotActive},
+		{history.SignalFailed, 2, "missing", store.KindSignalTargetNotFound},
+		{history.SignalFailed, 3, "c", store.KindSignalTargetEnded},
 		{history.SignalReceived, 0, `me="p4"`, ""},
 		{history.SignalDelivered, 4, "a", ""},
 		{history.SignalDelivered, 5, "b", ""},
@@ -228,8 +228,10 @@ func testSignalWorkflowAtomic(t *testing.T, h Harness) {
 }
 
 // T12.1: two executions signalling each other in completions running at
-// the same time both succeed (no deadlock: the stores lock execution rows
-// in id order, pg's lockSignals), round after round.
+// the same time both succeed, round after round. This shows liveness, not
+// the lock order: on Postgres, retry absorbs a deadlock (40P01) and runs
+// the batch again. The order is proven by the NOWAIT tests of package pg
+// (TestSignalLocksRowsInIDOrder and the ones after it).
 func testSignalWorkflowMutual(t *testing.T, h Harness) {
 	s := h.New(t)
 	mustCreate(t, s, "a")

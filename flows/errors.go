@@ -93,6 +93,15 @@ var (
 	// matches ErrInstanceExists too), until the tombstone expires or
 	// Engine.ForgetInstance deletes it.
 	ErrInstancePurged = store.ErrInstancePurged
+	// ErrSignalTargetNotFound is the error of a SignalWorkflow whose target
+	// instance id is unknown (never started, or purged). It is not
+	// ErrNotFound, so that it cannot be confused with the error of a
+	// workflow or child that failed with ErrNotFound.
+	ErrSignalTargetNotFound = errors.New("flows: signal target not found")
+	// ErrSignalTargetEnded is the error of a SignalWorkflow whose target's
+	// latest execution has ended (it no longer accepts signals). It is not
+	// ErrNotActive, for the same reason.
+	ErrSignalTargetEnded = errors.New("flows: signal target ended")
 	// ErrNotInWorkflow reports a workflow API called outside a workflow.
 	ErrNotInWorkflow = errors.New("flows: called outside a workflow")
 	// ErrCompensated matches the error of a workflow that failed and whose
@@ -148,8 +157,8 @@ var kinds = struct {
 	{"lock_lost", ErrLockLost},
 	{"attempts_exhausted", ErrAttemptsExhausted},
 	{store.KindCrashLoop, ErrCrashLoop},
-	{store.KindNotFound, ErrNotFound},
-	{store.KindNotActive, ErrNotActive},
+	{store.KindSignalTargetNotFound, ErrSignalTargetNotFound},
+	{store.KindSignalTargetEnded, ErrSignalTargetEnded},
 }}
 
 type errorKind struct {

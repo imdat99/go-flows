@@ -164,9 +164,12 @@ trước, từng cái một**, với dữ liệu compensation mà mỗi activity
   payload)` gửi signal từ code workflow tới instance bất kỳ (kể cả chính
   nó, cha hoặc child). Đây là command ghi trong history và được giao trong
   cùng transaction với checkpoint ghi nó: gửi đúng một lần, không gửi lại
-  khi replay. Future của nó trả về `nil`, hoặc lỗi khớp `ErrNotFound`
-  (instance không tồn tại) hay `ErrNotActive` (execution đã kết thúc).
-  Signal gửi ngay lúc workflow return, không chờ future, vẫn được gửi.
+  khi replay. Future của nó trả về `nil`, hoặc lỗi khớp
+  `ErrSignalTargetNotFound` (instance không tồn tại) hay
+  `ErrSignalTargetEnded` (execution đã kết thúc). Signal gửi ngay lúc
+  workflow return, không chờ future, vẫn được gửi. Checkpoint của bên gửi
+  giữ khoá dòng của đích tới khi commit, nên nhiều workflow cùng gửi
+  signal cho một coordinator sẽ checkpoint lần lượt trên dòng đó.
 - **Child là workflow được bắt đầu từ một workflow.** `wf.Child(c, id, in)`
   trả về `Future`. Huỷ cha thì huỷ các child đang chạy, và cha kết thúc cũng
   vậy. Huỷ context mà child được bắt đầu với nó thì huỷ child và future

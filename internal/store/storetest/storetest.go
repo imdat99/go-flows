@@ -165,6 +165,9 @@ func Run(t *testing.T, h Harness) {
 		{"SignalWorkflowContinueAsNew", testSignalWorkflowContinueAsNew},
 		{"SignalWorkflowAtomic", testSignalWorkflowAtomic},
 		{"SignalWorkflowMutual", testSignalWorkflowMutual},
+		{"SignalWorkflowNewChild", testSignalWorkflowNewChild},
+		{"SignalWorkflowCancelChild", testSignalWorkflowCancelChild},
+		{"SignalWorkflowChildEnds", testSignalWorkflowChildEnds},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
