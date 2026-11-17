@@ -139,7 +139,9 @@ must take care of.
   runs this release, and on all of them: an engine without it (an earlier
   release, or this one with it unset) neither writes tombstones when it
   purges nor reads them when it starts, so it would start a purged id
-  again.
+  again. During the rolling restart that turns it on, ids purged by an
+  engine without it get no tombstone: turn it on first on the engine that
+  runs the `PurgeEnded` job, or pause that job until every engine has it.
 
 ## v0.1.2 (2026-11-17)
 

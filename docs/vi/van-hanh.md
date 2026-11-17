@@ -177,7 +177,9 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // kết thúc hơn 30 n
   khi bị xoá, `Workflow.Start` với id đó trả về execution cũ. Client retry
   "đặt đơn X" sau retention sẽ chạy lại workflow: khi id phải còn là khoá
   idempotency sau retention, hãy đặt `Options.KeepPurgedIDs` (trên mọi
-  engine dùng chung database).
+  engine dùng chung database; trong lúc restart cuốn chiếu để bật nó, hãy
+  tạm dừng job `PurgeEnded` hoặc bật trước ở engine chạy job đó, để không
+  id nào bị xoá mà không có tombstone).
 - **Tombstone (`Options.KeepPurgedIDs`).** Khi đó `PurgeEnded` ghi lại mỗi
   instance id mà nó xoá execution cuối cùng (id, workflow, status, thời điểm
   kết thúc và thời điểm xoá, bảng `flows.purged_instance`) trong cùng

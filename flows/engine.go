@@ -328,8 +328,10 @@ func (e *Engine) PurgeEnded(ctx context.Context, olderThan time.Duration, limit 
 // ForgetInstance deletes the tombstone of a purged instance id
 // (Options.KeepPurgedIDs), so that Start runs the workflow again with that
 // id: for an operator who means it. ErrNotFound when the id has none (it
-// was never purged with KeepPurgedIDs set, its tombstone expired, or it
-// has an execution). It works whatever KeepPurgedIDs is.
+// was never purged with KeepPurgedIDs set, or its tombstone expired). An
+// id that has both (restarted by an engine without KeepPurgedIDs) loses
+// its tombstone and keeps its execution. It works whatever KeepPurgedIDs
+// is.
 func (e *Engine) ForgetInstance(ctx context.Context, instanceID string) error {
 	if err := text.CheckName(ErrInvalidArgument, "instance id", instanceID); err != nil {
 		return err

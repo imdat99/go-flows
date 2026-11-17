@@ -69,8 +69,8 @@ type Store struct {
 	nextW    int
 
 	// keepPurged > 0 keeps a tombstone of each purged instance id for
-	// that long (store.PurgedKeeper); tombstones are kept regardless, for
-	// ForgetInstance.
+	// that long (store.PurgedKeeper). Tombstones are written only then;
+	// ForgetInstance deletes one whatever keepPurged is.
 	keepPurged time.Duration
 	purged     map[string]tombstone
 

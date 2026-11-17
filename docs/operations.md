@@ -180,7 +180,9 @@ n, err := engine.PurgeEnded(ctx, 30*24*time.Hour, 1000) // ended over 30 days ag
   then, `Workflow.Start` with that id returns the old execution. A client
   that retries "place order X" after retention would run the workflow
   again: when ids must stay idempotency keys past retention, set
-  `Options.KeepPurgedIDs` (on every engine of the database).
+  `Options.KeepPurgedIDs` (on every engine of the database; while a
+  rolling restart turns it on, pause the `PurgeEnded` job or turn it on
+  first where that job runs, so no id is purged without a tombstone).
 - **Tombstones (`Options.KeepPurgedIDs`).** `PurgeEnded` then records each
   instance id whose last execution it deletes (id, workflow, status, end
   and purge times, table `flows.purged_instance`) in the same transaction.
